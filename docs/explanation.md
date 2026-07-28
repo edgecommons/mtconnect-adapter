@@ -94,6 +94,36 @@ underneath it. `sb/signals` and `sb/browse` are both served straight from this c
 neither ever queues behind acquisition, and both keep answering while the agent link itself is down —
 the address space came from the last successful probe, not from a live round-trip.
 
+## Explicit signals, derived signals, and the served union
+
+An instance's published set has two halves. The **explicit** half is `signals[]`: hand-written
+entries, each pinning a stable EdgeCommons identity to one `dataItemId`. The **derived** half is
+the `selection` block: a description of *which* data items to publish (`mode: "include"` with
+matchers, or `mode: "all"`), from which the adapter derives one signal per selected item out of
+the cached probe model — id, name, channel, publish policy, and (by default) a `conditionBinding`
+to the CONDITION items of the signal's own component. The two merge into one **served union**:
+an explicit entry whose `dataItemId` the selection also matches overrides the derived entry, field
+by field — its set fields win, its unset fields take the derived values. One pure function
+computes this union, and the session, `sb/signals`, `sb/browse`, and `signalsSubscribed` all read
+it, so acquisition and every view of it always agree; `sb/signals` rows and browse entries carry
+a `provenance` field (`configured` vs `discovered`) saying which half serves each binding.
+
+### Derived identity is a trade
+
+A derived signal's id is the lower-kebab sanitization of the machine's own `dataItemId`, and its
+channel follows the machine's component path. That is what makes `selection: { "mode": "all" }` a
+one-line configuration — and it is also the trade: those identities are **protocol-derived**, so
+they follow the machine. Rewire the device, rename a component, replace the Devices.xml, and a
+derived signal's identity can change with it. The derived set also *follows the model* by design:
+when a re-probe shows a data item gone, its derived signal simply stops publishing (announced with
+counts as an `MtconnectSignalSetEvent`) rather than lingering as a permanent BAD — discovered
+signals track the machine, they do not hold a contract. For any signal whose history must survive
+a machine reconfiguration — the one the historian keys on, the one an SPC chart trends — pin an
+explicit `signals[]` entry: explicit identities never move, and an explicit binding whose data
+item disappears publishes a permanent BAD `MTC_NO_SUCH_DATAITEM`, because a configured promise
+that can no longer be kept must be *visible*, not absent. Use the derived set for breadth, and
+explicit entries for the identities that matter.
+
 ## Quality is structural, not adapter discipline
 
 Every `Reading` carries a `quality` normalized to `GOOD | BAD | UNCERTAIN`, plus the protocol's

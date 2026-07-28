@@ -128,7 +128,8 @@ impl App {
         let needs_agents = devices.iter().any(|d| d.adapter == crate::device::KIND);
         let agent_configs =
             if needs_agents { parse_agents(config.global())? } else { Vec::new() };
-        let mtc_devices = compile_mtconnect(&mut devices, &agent_configs)?;
+        let batch_ms = crate::app::default_batch_ms_of(config.global());
+        let mtc_devices = compile_mtconnect(&mut devices, &agent_configs, batch_ms)?;
 
         // Vault references become values exactly once, here — the protocol client never sees a
         // reference, and never learns the credential service exists.

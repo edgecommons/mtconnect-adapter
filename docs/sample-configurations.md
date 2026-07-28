@@ -1,7 +1,8 @@
 # Sample Configurations
 
-Three configurations: the shipped simulator config, the shipped real-agent config explained
-option-by-option, and a non-trivial multi-device/secured variant. For the exhaustive option list see
+Four configurations: the shipped simulator config, the shipped real-agent config explained
+option-by-option, a non-trivial multi-device/secured variant, and the probe-derived selection
+shapes. For the exhaustive option list see
 [reference/configuration.md](reference/configuration.md); for message shapes see
 [reference/messaging-interface.md](reference/messaging-interface.md).
 
@@ -188,6 +189,70 @@ Two devices behind one TLS/authenticated agent, one polling and one streaming:
   them directly.
 
 Run it the same way, pointing `-c FILE` at this file instead.
+
+---
+
+## 4. Probe-derived selection: publish a device without naming its signals
+
+The smallest possible MTConnect instance — an identity, a binding, and "publish it all". Every
+data item the agent's `/probe` reports publishes with a derived id, name, and channel; each
+non-condition signal is automatically bound to its own component's CONDITION items:
+
+```jsonc
+{
+  "hierarchy": { "levels": ["site", "device"] },
+  "identity": { "site": "factory-1" },
+  "messaging": { "local": { "type": "mqtt", "host": "localhost", "port": 1883 } },
+  "component": {
+    "global": {
+      "agents": [ { "id": "line-a-agent", "url": "http://127.0.0.1:5000" } ]
+    },
+    "instances": [
+      {
+        "id": "cnc-1",
+        "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.123456" },
+        "selection": { "mode": "all" }
+      }
+    ]
+  }
+}
+```
+
+A data item `Xabs` on `Axes/Linear[X]` publishes as signal `xabs` on the channel
+`axes/linear-x/xabs`; the derived set is capped at `maxSignals` (500 by default) and truncation is
+announced, never silent.
+
+Matchers scope the selection instead of taking everything, and explicit `signals[]` entries pin
+the identities that matter — overriding the derived entry for the same `dataItemId`, field by
+field:
+
+```jsonc
+"instances": [
+  {
+    "id": "cnc-1",
+    "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.123456" },
+    "signals": [
+      // Pinned: a stable id and channel for the signal the historian keys on. Its unset fields
+      // (here: conditionBinding) still take the derived values.
+      { "id": "x-position", "channel": "machining/x", "dataItemId": "Xabs" }
+    ],
+    "selection": {
+      "mode": "include",
+      "include": [
+        { "category": "SAMPLE", "path": "Axes/**" },     // every axis sample ...
+        { "type": "EXECUTION|PROGRAM" }                  // ... plus the controller state events
+      ],
+      "exclude": [ { "idMatch": ".*-debug" } ],          // exclude wins over include
+      "maxSignals": 200
+    }
+  }
+]
+```
+
+Fields within one matcher are ANDed, matchers in the list are ORed, and regexes are anchored
+(`POSITION` does not match `PATH_POSITION`). Derived identities follow the machine's own model —
+pin an explicit entry for anything whose id must survive a machine reconfiguration; see
+[explanation.md](explanation.md#derived-identity-is-a-trade).
 
 ---
 

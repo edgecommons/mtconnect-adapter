@@ -54,8 +54,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::app::{DeviceConfig, DeviceControl, Health, LinkState, Writes};
 use crate::device::{BrowseError, Quality, Reading, SignalInfo, QUALITY_UNAVAILABLE, READ_ONLY_MESSAGE};
 use crate::metrics::DeviceMetrics;
-use crate::mtconnect::config::SignalConfig;
 use crate::mtconnect::model::{BrowseNode, Category, NodeKind, ProbeModel, ROOT_NODE_ID};
+use crate::mtconnect::selection::{served_set, Provenance, ServedSet};
 use crate::mtconnect::{AgentInfo, AgentRuntime};
 use crate::reload::{SignalRegistry, SignalSlot};
 
@@ -175,15 +175,27 @@ impl ProtocolView {
         })
     }
 
-    /// The `sb/signals` inventory: the configured signals with the §5.3 address, enriched from the
-    /// cached model when it is there and honestly null when it is not. No network I/O, ever.
+    /// The served set in force: the live explicit signals merged with the selection-derived half
+    /// against the cached model (R1.1). The same pure merge the session serves from, so this view
+    /// and acquisition can never disagree. With no model yet, only the explicit signals are known.
+    #[must_use]
+    pub fn served(&self) -> ServedSet {
+        let live = self.signals();
+        served_set(&live.signals, live.selection.as_ref(), self.model().as_deref())
+    }
+
+    /// The `sb/signals` inventory: the **served** signals — explicit and selection-derived alike —
+    /// with the §5.3 address, enriched from the cached model when it is there and honestly null
+    /// when it is not, and each row's `provenance` (`configured` vs `discovered`). No network I/O,
+    /// ever.
     #[must_use]
     pub fn signal_rows(&self, writes: &Writes) -> Vec<Value> {
         let model = self.model();
-        self.signals()
+        self.served()
             .signals
             .iter()
-            .map(|s| {
+            .map(|served| {
+                let s = &served.signal;
                 let meta = model.as_ref().and_then(|m| m.item(&s.data_item_id));
                 let address = model
                     .as_ref()
@@ -197,9 +209,12 @@ impl ProtocolView {
                     "writable": writes.permits(&s.id),
                     "address": address,
                     "units": meta.and_then(|m| m.units.clone()),
-                    "conditionBinding": s.condition_binding,
-                    // Whether the configured `dataItemId` exists in the current device model.
+                    "conditionBinding": s.condition_bindings(),
+                    // Whether the `dataItemId` exists in the current device model.
                     "bound": meta.is_some(),
+                    // Where the entry came from: an explicit `signals[]` entry, or the probe via
+                    // the `selection` block.
+                    "provenance": served.provenance.as_str(),
                 })
             })
             .collect()
@@ -220,9 +235,21 @@ impl ProtocolView {
         })
     }
 
-    /// The `dataItemId`s the configured signals bind — the browse `Configured` flag.
-    fn bound_data_items(signals: &[SignalConfig]) -> HashSet<&str> {
-        signals.iter().map(|s| s.data_item_id.as_str()).collect()
+    /// The `dataItemId`s the served set binds, each with the *strongest* provenance claiming it
+    /// (an item both configured and matched by the selection reads `configured`) — the browse
+    /// `configured` flag plus its `provenance` refinement.
+    fn served_provenance(served: &ServedSet) -> HashMap<&str, Provenance> {
+        let mut map: HashMap<&str, Provenance> = HashMap::new();
+        for s in &served.signals {
+            map.entry(s.signal.data_item_id.as_str())
+                .and_modify(|p| {
+                    if s.provenance == Provenance::Configured {
+                        *p = Provenance::Configured;
+                    }
+                })
+                .or_insert(s.provenance);
+        }
+        map
     }
 }
 
@@ -949,15 +976,15 @@ impl Commander {
             return Ok(id.to_string());
         }
         if let Some(name) = r.get("name").and_then(Value::as_str) {
-            // The MTConnect inventory is the configured signal set; the template inventory is the
-            // fallback for the simulator.
+            // The MTConnect inventory is the SERVED signal set (explicit + selection-derived);
+            // the template inventory is the fallback for the simulator.
             if let Some(p) = &h.protocol {
                 return p
-                    .signals()
+                    .served()
                     .signals
                     .iter()
-                    .find(|s| s.name.as_deref() == Some(name))
-                    .map(|s| s.id.clone())
+                    .find(|s| s.signal.name.as_deref() == Some(name))
+                    .map(|s| s.signal.id.clone())
                     .ok_or_else(|| name.to_string());
             }
             return h
@@ -981,13 +1008,18 @@ impl Commander {
 fn browse_model(instance_id: &str, p: &ProtocolView, model: &ProbeModel, body: &Value) -> Reply {
     let signals = p.signals();
     // BOTH generations: the entries come from the probe model, their `Configured` flags from the
-    // signal set, so a reload voids a cursor exactly as a re-probe does (LLD §8).
+    // signal configuration (explicit + selection), so a reload voids a cursor exactly as a
+    // re-probe does (LLD §8).
     let generation = crate::reload::view_generation(&model.digest_hex(), &signals.generation);
-    let bound = ProtocolView::bound_data_items(&signals.signals);
+    // The `configured` flag covers the served UNION; `provenance` distinguishes an explicitly
+    // configured binding from a selection-discovered one (R1.1).
+    let served = served_set(&signals.signals, signals.selection.as_ref(), Some(model));
+    let prov = ProtocolView::served_provenance(&served);
+    let bound: HashSet<&str> = prov.keys().copied().collect();
     let flags = configured_flags(model, &bound);
     match body.get("ref") {
-        Some(_) => browse_model_hierarchical(instance_id, model, &flags, &generation, body),
-        None => browse_model_paged(instance_id, model, &flags, &generation, body),
+        Some(_) => browse_model_hierarchical(instance_id, model, &flags, &prov, &generation, body),
+        None => browse_model_paged(instance_id, model, &flags, &prov, &generation, body),
     }
 }
 
@@ -997,6 +1029,7 @@ fn browse_model_paged(
     instance_id: &str,
     model: &ProbeModel,
     flags: &[bool],
+    prov: &HashMap<&str, Provenance>,
     generation: &str,
     body: &Value,
 ) -> Reply {
@@ -1012,7 +1045,7 @@ fn browse_model_paged(
         .enumerate()
         .skip(start)
         .take(max)
-        .map(|(i, node)| browse_entry(node, flags[i]))
+        .map(|(i, node)| browse_entry(node, flags[i], prov))
         .collect();
     let next = start + entries.len();
 
@@ -1035,6 +1068,7 @@ fn browse_model_hierarchical(
     instance_id: &str,
     model: &ProbeModel,
     flags: &[bool],
+    prov: &HashMap<&str, Provenance>,
     generation: &str,
     body: &Value,
 ) -> Reply {
@@ -1052,10 +1086,11 @@ fn browse_model_hierarchical(
     let children = children_by_parent(model);
     let mut budget = max_refs;
     let mut truncated = false;
-    let refs = refs_of(index, model, flags, &children, depth as usize, &mut budget, &mut truncated);
+    let refs =
+        refs_of(index, model, flags, prov, &children, depth as usize, &mut budget, &mut truncated);
     let ref_count = refs.len();
 
-    let mut root = browse_target(&model.tree[index], flags[index]);
+    let mut root = browse_target(&model.tree[index], flags[index], prov);
     root.insert("refs".to_string(), Value::Array(refs));
 
     Ok(Some(json!({
@@ -1124,10 +1159,12 @@ fn children_by_parent(model: &ProbeModel) -> HashMap<&str, Vec<usize>> {
 
 /// The `contains` refs of one node, expanded `depth` levels and drawing on a shared `budget` so
 /// `maxRefs` bounds the whole reply rather than each level.
+#[allow(clippy::too_many_arguments)]
 fn refs_of(
     index: usize,
     model: &ProbeModel,
     flags: &[bool],
+    prov: &HashMap<&str, Provenance>,
     children: &HashMap<&str, Vec<usize>>,
     depth: usize,
     budget: &mut usize,
@@ -1143,13 +1180,14 @@ fn refs_of(
             break;
         }
         *budget -= 1;
-        let mut target = browse_target(&model.tree[child], flags[child]);
+        let mut target = browse_target(&model.tree[child], flags[child], prov);
         let grandchildren = children.get(model.tree[child].id.as_str()).is_some();
         if !grandchildren {
             // A node known to be a leaf says so explicitly (panel contract §3.2).
             target.insert("refs".to_string(), Value::Array(Vec::new()));
         } else if depth > 1 {
-            let nested = refs_of(child, model, flags, children, depth - 1, budget, truncated);
+            let nested =
+                refs_of(child, model, flags, prov, children, depth - 1, budget, truncated);
             target.insert("refs".to_string(), Value::Array(nested));
         }
         // else: a node that MAY have children omits `refs` — the console expands it on demand.
@@ -1158,9 +1196,19 @@ fn refs_of(
     out
 }
 
+/// A data-item node's provenance token: how its binding came to be served (`configured` vs
+/// `discovered`), `null` for an unserved item and for component/device nodes.
+fn provenance_of(node: &BrowseNode, prov: &HashMap<&str, Provenance>) -> Value {
+    match data_item_id(node).and_then(|id| prov.get(id)) {
+        Some(p) => json!(p.as_str()),
+        None => Value::Null,
+    }
+}
+
 /// One paged browse entry: the node plus everything the Device Structure columns bind
-/// (Kind/Type/SubType/Category/DataItem/Configured — HLD §8).
-fn browse_entry(node: &BrowseNode, configured: bool) -> Value {
+/// (Kind/Type/SubType/Category/DataItem/Configured — HLD §8). `configured` covers the served
+/// union; `provenance` says which half serves a data item.
+fn browse_entry(node: &BrowseNode, configured: bool, prov: &HashMap<&str, Provenance>) -> Value {
     json!({
         "id": node.id,
         "name": node.name,
@@ -1173,12 +1221,17 @@ fn browse_entry(node: &BrowseNode, configured: bool) -> Value {
         "parentId": node.parent_id,
         "depth": node.depth,
         "configured": configured,
+        "provenance": provenance_of(node, prov),
     })
 }
 
 /// One hierarchical target: the panel contract's `{nodeId, name, nodeClass, dataType}` plus the same
 /// column data the paged entries carry.
-fn browse_target(node: &BrowseNode, configured: bool) -> Map<String, Value> {
+fn browse_target(
+    node: &BrowseNode,
+    configured: bool,
+    prov: &HashMap<&str, Provenance>,
+) -> Map<String, Value> {
     let mut t = Map::new();
     t.insert("nodeId".to_string(), json!(node.id));
     t.insert("name".to_string(), json!(node.name));
@@ -1197,6 +1250,7 @@ fn browse_target(node: &BrowseNode, configured: bool) -> Map<String, Value> {
     t.insert("units".to_string(), json!(node.units));
     t.insert("dataItemId".to_string(), json!(data_item_id(node)));
     t.insert("configured".to_string(), json!(configured));
+    t.insert("provenance".to_string(), provenance_of(node, prov));
     t
 }
 
@@ -1296,7 +1350,7 @@ mod tests {
 
     use crate::app::{set_paused, Health};
     use crate::device::{BrowsePage, BrowsedSignal};
-    use crate::mtconnect::config::{AgentCredentials, PublishCfg};
+    use crate::mtconnect::config::{AgentCredentials, SignalConfig};
     use crate::mtconnect::xml::parse_devices;
 
     const DEVICES_2_7: &str = include_str!("../tests/fixtures/devices_2.7.xml");
@@ -1415,8 +1469,9 @@ mod tests {
             name: Some(format!("{id} label")),
             channel: None,
             data_item_id: data_item_id.into(),
-            condition_binding: condition_binding.iter().map(|s| (*s).to_string()).collect(),
-            publish: PublishCfg::default(),
+            condition_binding: (!condition_binding.is_empty())
+                .then(|| condition_binding.iter().map(|s| (*s).to_string()).collect()),
+            publish: None,
         }
     }
 
@@ -1434,7 +1489,7 @@ mod tests {
             agent: Arc::new(FakeAgent { info: Arc::new(info), model }),
             agent_id: "line-a-agent".into(),
             device_uuid: DEVICE_UUID.into(),
-            signals: Arc::new(SignalSlot::new(mtc_signals())),
+            signals: Arc::new(SignalSlot::new(mtc_signals(), None)),
         }
     }
 
@@ -1763,6 +1818,98 @@ mod tests {
         assert_eq!(ghost["units"], Value::Null);
     }
 
+    /// A protocol view whose slot carries a `selection` block beside the explicit signals.
+    fn selecting_view(selection: Value, model: Option<Arc<ProbeModel>>) -> ProtocolView {
+        ProtocolView {
+            agent: Arc::new(FakeAgent { info: Arc::new(learned_info()), model }),
+            agent_id: "line-a-agent".into(),
+            device_uuid: DEVICE_UUID.into(),
+            signals: Arc::new(SignalSlot::new(
+                vec![mtc_signal("x-position", "Xabs", &["Xtravel"])],
+                Some(serde_json::from_value(selection).unwrap()),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn signals_serves_the_union_and_says_where_each_row_came_from() {
+        // One explicit signal plus `mode: "all"`: every data item is served, the explicit row reads
+        // `configured`, the derived rows `discovered` — and each derived row carries a full
+        // model-enriched address (R1.1 provenance surfacing).
+        let h = harness_with(
+            mtc_device(),
+            MockOpts::default(),
+            Some(selecting_view(json!({ "mode": "all" }), Some(probe_model()))),
+        );
+        let out = ok(h.commander.signals(None).await);
+        let sigs = out["signals"].as_array().unwrap();
+        assert_eq!(sigs.len(), 14, "1 explicit (merged over its item) + 13 derived");
+
+        let x = sigs.iter().find(|s| s["id"] == json!("x-position")).unwrap();
+        assert_eq!(x["provenance"], json!("configured"));
+        assert_eq!(x["conditionBinding"], json!(["Xtravel"]));
+        assert_eq!(x["bound"], json!(true));
+
+        let load = sigs.iter().find(|s| s["id"] == json!("xload")).unwrap();
+        assert_eq!(load["provenance"], json!("discovered"));
+        assert_eq!(load["address"]["dataItemId"], json!("Xload"));
+        assert_eq!(load["address"]["category"], json!("SAMPLE"));
+        assert_eq!(load["units"], json!("PERCENT"));
+        assert_eq!(load["bound"], json!(true), "a derived signal came FROM the model");
+        assert_eq!(load["conditionBinding"], json!(["Xtravel"]), "auto-bound to its component's condition");
+        assert_eq!(load["writable"], json!(false));
+
+        // Before the first probe the derived half honestly does not exist yet.
+        let h = harness_with(
+            mtc_device(),
+            MockOpts::default(),
+            Some(selecting_view(json!({ "mode": "all" }), None)),
+        );
+        let sigs = ok(h.commander.signals(None).await)["signals"].clone();
+        assert_eq!(sigs.as_array().unwrap().len(), 1, "explicit only until the model is known");
+        assert_eq!(sigs[0]["provenance"], json!("configured"));
+    }
+
+    #[tokio::test]
+    async fn browse_flags_the_served_union_and_distinguishes_its_provenance() {
+        let h = harness_with(
+            mtc_device(),
+            MockOpts::default(),
+            Some(selecting_view(
+                json!({ "mode": "include", "include": [{ "idMatch": "Xload" }] }),
+                Some(probe_model()),
+            )),
+        );
+        let out = ok(h.commander.browse(None, &json!({ "max": 1000 })).await);
+        let entries = out["entries"].as_array().unwrap();
+
+        // The explicit binding: configured, provenance `configured`.
+        let x = entries.iter().find(|e| e["id"] == json!("mtc:/item/Xabs")).unwrap();
+        assert_eq!(x["configured"], json!(true));
+        assert_eq!(x["provenance"], json!("configured"));
+        // The selection-derived binding: the union flags it, provenance says how it got there.
+        let load = entries.iter().find(|e| e["id"] == json!("mtc:/item/Xload")).unwrap();
+        assert_eq!(load["configured"], json!(true));
+        assert_eq!(load["provenance"], json!("discovered"));
+        // An unserved item is neither.
+        let estop = entries.iter().find(|e| e["id"] == json!("mtc:/item/estop")).unwrap();
+        assert_eq!(estop["configured"], json!(false));
+        assert_eq!(estop["provenance"], Value::Null);
+        // Components carry the union flag and no provenance (they are not data items).
+        let linear = entries.iter().find(|e| e["id"] == json!("mtc:/component/Axes/Linear[X]")).unwrap();
+        assert_eq!(linear["configured"], json!(true));
+        assert_eq!(linear["provenance"], Value::Null);
+
+        // The hierarchical mode carries the same fields on its targets.
+        let out = ok(h
+            .commander
+            .browse(None, &json!({ "ref": "mtc:/component/Axes/Linear[X]", "depth": 1 }))
+            .await);
+        let refs = out["root"]["refs"].as_array().unwrap();
+        let load = refs.iter().find(|r| r["target"]["nodeId"] == json!("mtc:/item/Xload")).unwrap();
+        assert_eq!(load["target"]["provenance"], json!("discovered"));
+    }
+
     #[tokio::test]
     async fn signals_answers_from_configuration_before_any_probe() {
         // No model cached (the agent has never answered): the inventory still lists every signal
@@ -1906,7 +2053,7 @@ mod tests {
         // entries come from, and the signal set their `Configured` flags come from (LLD §8).
         let generation = crate::reload::view_generation(
             &probe_model().digest_hex(),
-            &crate::reload::generation_of(&mtc_signals()),
+            &crate::reload::generation_of(&mtc_signals(), None),
         );
         assert_eq!(out["viewGeneration"], json!(generation));
         assert!(generation.starts_with(&probe_model().digest_hex()));
@@ -2001,7 +2148,7 @@ mod tests {
             out["viewGeneration"],
             json!(crate::reload::view_generation(
                 &probe_model().digest_hex(),
-                &crate::reload::generation_of(&mtc_signals())
+                &crate::reload::generation_of(&mtc_signals(), None)
             ))
         );
         let root = &out["root"];
@@ -2222,6 +2369,7 @@ mod tests {
             agent_id: "line-a-agent".into(),
             device_uuid: DEVICE_UUID.into(),
             signals: mtc_signals(),
+            selection: None,
         }]);
         let view =
             ProtocolView::of(&cfg, &agents, &registry).expect("an mtconnect device gets a view");
@@ -2417,7 +2565,7 @@ mod tests {
             agent: Arc::new(FakeAgent { info: Arc::new(learned_info()), model: Some(probe_model()) }),
             agent_id: "line-a-agent".into(),
             device_uuid: DEVICE_UUID.into(),
-            signals: Arc::new(SignalSlot::new(Vec::new())),
+            signals: Arc::new(SignalSlot::new(Vec::new(), None)),
         }
         .status_object();
         for field in status["fields"].as_array().unwrap() {
@@ -2476,7 +2624,7 @@ mod tests {
             agent: Arc::new(FakeAgent { info: Arc::new(learned_info()), model: Some(probe_model()) }),
             agent_id: "line-a-agent".into(),
             device_uuid: DEVICE_UUID.into(),
-            signals: Arc::new(SignalSlot::new(mtc_signals())),
+            signals: Arc::new(SignalSlot::new(mtc_signals(), None)),
         }
         .signal_rows(&Writes::default());
         for column in grid["columns"].as_array().unwrap() {

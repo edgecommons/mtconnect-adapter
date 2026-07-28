@@ -201,6 +201,70 @@
         "reconnect": { "$ref": "#/$defs/reconnect" }
       }
     },
+    "matcher": {
+      "title": "One data-item matcher",
+      "description": "Selects probe data items for `selection.include`/`selection.exclude`. Every field is optional; the fields that are present are ANDed, and a matcher list is ORed. An empty matcher matches every data item. Regexes are anchored: the pattern must match the whole field.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "type": "string",
+          "enum": ["SAMPLE", "EVENT", "CONDITION"],
+          "description": "The item's category, exactly."
+        },
+        "type": {
+          "type": "string",
+          "description": "Anchored regex on the item's `type` (`POSITION`, `EXECUTION`, ...). `POSITION` does not match `PATH_POSITION`."
+        },
+        "subType": {
+          "type": "string",
+          "description": "Anchored regex on the item's `subType`. An item with no subType never matches this field."
+        },
+        "idMatch": {
+          "type": "string",
+          "description": "Anchored regex on the `dataItemId`."
+        },
+        "path": {
+          "type": "string",
+          "description": "Glob on the component path (`Axes/Linear[X]`), matched segment-wise: `*` and `?` within a segment, `**` spans segments. The empty string is the device level."
+        }
+      }
+    },
+    "selection": {
+      "title": "Probe-derived signal selection",
+      "description": "Describes which of the device's data items to publish, deriving one signal per selected item from the probe model. Explicit `signals[]` entries override derived ones field-by-field (matched by `dataItemId`). Patterns are validated at config load; a bad regex is refused before anything commits.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["explicit", "include", "all"],
+          "default": "explicit",
+          "description": "`explicit` publishes only the explicit `signals[]` (the behavior of an absent `selection`); `include` publishes data items matching any `include` matcher; `all` publishes every data item. `exclude` applies to both selecting modes and always wins."
+        },
+        "include": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/matcher" },
+          "description": "The matchers that select data items (OR across the list). Required non-empty under `mode: \"include\"`; refused under the other modes, where it would be inert."
+        },
+        "exclude": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/matcher" },
+          "description": "Matchers that remove data items from the selection. Exclude wins over include and over `mode: \"all\"`."
+        },
+        "maxSignals": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 500,
+          "description": "Caps the DERIVED set only — explicit `signals[]` never count against it. Exceeding it truncates deterministically in browse-tree order, with a warning event (`MtconnectSignalSetEvent`) and a log line — never silently."
+        },
+        "autoConditionBinding": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether each derived non-condition signal binds the CONDITION data items of its own component, so a machine alarm degrades its component's values exactly as a hand-written `conditionBinding` would."
+        }
+      }
+    },
     "signal": {
       "title": "One published signal",
       "description": "A stable EdgeCommons identity bound to one MTConnect `dataItemId` within this instance's device. The `dataItemId` is unique per device by the standard, which is what makes the binding stable across agent restarts.",
@@ -296,7 +360,11 @@
           "type": "array",
           "default": [],
           "items": { "$ref": "#/$defs/signal" },
-          "description": "The signals this device publishes. Signals are explicit: a data item that is not configured is browsable but not published."
+          "description": "The explicit signals this device publishes. Without a `selection`, signals are explicit: a data item that is not configured is browsable but not published. Under a `selection`, an explicit entry overrides the derived entry for the same `dataItemId`, field by field."
+        },
+        "selection": {
+          "$ref": "#/$defs/selection",
+          "description": "Probe-derived signal selection: publish data items by matcher (or all of them) instead of naming each one. Only for the `mtconnect` adapter — the simulator has no probe."
         },
         "writes": {
           "type": "object",

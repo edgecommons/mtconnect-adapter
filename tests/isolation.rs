@@ -59,6 +59,7 @@ fn the_module_tree_is_the_one_the_design_names() {
         "xml.rs",
         "model.rs",
         "observations.rs",
+        "selection.rs",
         "sequence.rs",
         "error.rs",
     ] {

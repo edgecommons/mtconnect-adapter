@@ -39,6 +39,7 @@ use sha2::{Digest, Sha256};
 
 use crate::app::DeviceConfig;
 use crate::mtconnect::config::{DeviceConfig as MtcDeviceConfig, SignalConfig};
+use crate::mtconnect::SelectionConfig;
 
 /// The rejection code for a candidate that changes something only a restart can apply.
 pub const RESTART_REQUIRED: &str = "RESTART_REQUIRED";
@@ -129,11 +130,15 @@ pub fn compile(config: &Value) -> Result<Vec<MtcDeviceConfig>, String> {
     }
     let needs_agents = devices.iter().any(|d| d.adapter == crate::device::KIND);
     if !needs_agents {
+        // Still refuse a `sim` instance carrying a `selection` — there is no probe behind it.
+        crate::app::compile_mtconnect(&mut devices, &[], 0).map_err(|e| e.to_string())?;
         return Ok(Vec::new());
     }
-    let agents = crate::mtconnect::config::parse_agents(&agent_host(config))
-        .map_err(|e| e.to_string())?;
-    crate::app::compile_mtconnect(&mut devices, &agents).map_err(|e| e.to_string())
+    let global = agent_host(config);
+    let agents =
+        crate::mtconnect::config::parse_agents(&global).map_err(|e| e.to_string())?;
+    let batch_ms = crate::app::default_batch_ms_of(&global);
+    crate::app::compile_mtconnect(&mut devices, &agents, batch_ms).map_err(|e| e.to_string())
 }
 
 /// `parse_agents` reads `component.global`; hand it exactly that subtree.
@@ -145,44 +150,97 @@ fn agent_host(config: &Value) -> Value {
 // The live signal set
 // =================================================================================================
 
-/// One instance's compiled signal set plus the generation token that identifies it. A reader takes
-/// the whole thing at once, so a browse page and the signal list behind it always agree.
+/// One instance's compiled signal configuration — the explicit set **and** its `selection` block —
+/// plus the generation token that identifies it. A reader takes the whole thing at once, so a
+/// browse page and the signal list behind it always agree. The derived half of the served set is
+/// not stored here: it is a function of this configuration and the probe model, and the model's
+/// own digest is the other half of the browse `viewGeneration`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstanceSignals {
-    /// A stable content hash of the signal set — half of the browse `viewGeneration`.
+    /// A stable content hash of the signal configuration — half of the browse `viewGeneration`.
     pub generation: String,
     pub signals: Vec<SignalConfig>,
+    /// The probe-derived selection in force (R1.1), swapped with the signals as one unit.
+    pub selection: Option<SelectionConfig>,
 }
 
 impl InstanceSignals {
-    /// Build a generation from a signal set. Content-addressed, so an edit that changes nothing
-    /// observable does not invalidate a consumer's cursors.
+    /// Build a generation from a signal configuration. Content-addressed, so an edit that changes
+    /// nothing observable does not invalidate a consumer's cursors.
     #[must_use]
-    pub fn new(signals: Vec<SignalConfig>) -> Self {
-        let generation = generation_of(&signals);
-        Self { generation, signals }
+    pub fn new(signals: Vec<SignalConfig>, selection: Option<SelectionConfig>) -> Self {
+        let generation = generation_of(&signals, selection.as_ref());
+        Self { generation, signals, selection }
     }
 }
 
-/// The content hash of one signal set: the fields that change what is published or browsable, in
-/// configuration order.
+/// The content hash of one signal configuration: the fields that change what is published or
+/// browsable, in configuration order — the explicit entries (presence of an unset
+/// `conditionBinding`/`publish` is hashed too, because under a selection absence inherits the
+/// derived value) and the whole `selection` block.
 #[must_use]
-pub fn generation_of(signals: &[SignalConfig]) -> String {
+pub fn generation_of(signals: &[SignalConfig], selection: Option<&SelectionConfig>) -> String {
     let mut hasher = Sha256::new();
+    let opt = |hasher: &mut Sha256, v: Option<&str>| {
+        match v {
+            None => hasher.update([0x00]),
+            Some(v) => {
+                hasher.update([0x01]);
+                hasher.update(v.as_bytes());
+            }
+        }
+        hasher.update([0x1f]);
+    };
     for s in signals {
         hasher.update(s.id.as_bytes());
         hasher.update([0x1f]);
         hasher.update(s.data_item_id.as_bytes());
         hasher.update([0x1f]);
-        hasher.update(s.name.as_deref().unwrap_or_default().as_bytes());
+        opt(&mut hasher, s.name.as_deref());
+        opt(&mut hasher, s.channel.as_deref());
+        match &s.condition_binding {
+            None => hasher.update([0x00]),
+            Some(bindings) => {
+                hasher.update([0x01]);
+                for c in bindings {
+                    hasher.update(c.as_bytes());
+                    hasher.update([0x1e]);
+                }
+            }
+        }
         hasher.update([0x1f]);
-        hasher.update(s.channel.as_deref().unwrap_or_default().as_bytes());
-        hasher.update([0x1f]);
-        for c in &s.condition_binding {
-            hasher.update(c.as_bytes());
-            hasher.update([0x1e]);
+        match &s.publish {
+            None => hasher.update([0x00]),
+            Some(p) => {
+                hasher.update([0x01]);
+                hasher.update(format!("{:?}|{}|{:?}", p.mode, p.batch_ms, p.deadband).as_bytes());
+            }
         }
         hasher.update([0x1d]);
+    }
+    if let Some(sel) = selection {
+        hasher.update([0x02]);
+        hasher.update(sel.mode.as_str().as_bytes());
+        hasher.update([0x1f]);
+        let matcher = |hasher: &mut Sha256, m: &crate::mtconnect::Matcher| {
+            opt(hasher, m.category.as_deref());
+            opt(hasher, m.type_.as_deref());
+            opt(hasher, m.sub_type.as_deref());
+            opt(hasher, m.id_match.as_deref());
+            opt(hasher, m.path.as_deref());
+            hasher.update([0x1e]);
+        };
+        for m in &sel.include {
+            matcher(&mut hasher, m);
+        }
+        hasher.update([0x1d]);
+        for m in &sel.exclude {
+            matcher(&mut hasher, m);
+        }
+        hasher.update([0x1d]);
+        hasher.update(sel.max_signals.to_le_bytes());
+        hasher.update([u8::from(sel.auto_condition_binding)]);
+        hasher.update(sel.default_batch_ms.to_le_bytes());
     }
     let digest = hasher.finalize();
     digest[..8].iter().fold(String::with_capacity(16), |mut acc, b| {
@@ -206,8 +264,8 @@ pub struct SignalSlot(ArcSwap<InstanceSignals>);
 impl SignalSlot {
     /// The slot for one instance's starting configuration.
     #[must_use]
-    pub fn new(signals: Vec<SignalConfig>) -> Self {
-        Self(ArcSwap::from_pointee(InstanceSignals::new(signals)))
+    pub fn new(signals: Vec<SignalConfig>, selection: Option<SelectionConfig>) -> Self {
+        Self(ArcSwap::from_pointee(InstanceSignals::new(signals, selection)))
     }
 
     /// The generation in force — a whole, self-consistent snapshot.
@@ -235,7 +293,12 @@ impl SignalRegistry {
         Self {
             slots: devices
                 .iter()
-                .map(|d| (d.id.clone(), Arc::new(SignalSlot::new(d.signals.clone()))))
+                .map(|d| {
+                    (
+                        d.id.clone(),
+                        Arc::new(SignalSlot::new(d.signals.clone(), d.selection.clone())),
+                    )
+                })
                 .collect(),
         }
     }
@@ -262,7 +325,7 @@ impl SignalRegistry {
                 // A new instance has no supervisor task; `classify` already refuses that candidate.
                 continue;
             };
-            let next = Arc::new(InstanceSignals::new(device.signals));
+            let next = Arc::new(InstanceSignals::new(device.signals, device.selection));
             if slot.load().generation != next.generation {
                 staged.push((Arc::clone(slot), next, device.id));
             }
@@ -415,20 +478,114 @@ mod tests {
         };
         let a = compile_one(one_signal());
         let same = compile_one(json!([{ "id": "x-position", "dataItemId": "Xabs" }]));
-        assert_eq!(generation_of(&a), generation_of(&same), "the same set is the same generation");
+        assert_eq!(
+            generation_of(&a, None),
+            generation_of(&same, None),
+            "the same set is the same generation"
+        );
 
         let renamed = compile_one(json!([{ "id": "x-position", "dataItemId": "Xabs", "name": "X" }]));
-        assert_ne!(generation_of(&a), generation_of(&renamed), "a label change IS visible in sb/signals");
+        assert_ne!(
+            generation_of(&a, None),
+            generation_of(&renamed, None),
+            "a label change IS visible in sb/signals"
+        );
 
         let rebound = compile_one(json!([{ "id": "x-position", "dataItemId": "Sspeed" }]));
-        assert_ne!(generation_of(&a), generation_of(&rebound));
+        assert_ne!(generation_of(&a, None), generation_of(&rebound, None));
 
         let bound = compile_one(
             json!([{ "id": "x-position", "dataItemId": "Xabs", "conditionBinding": ["Xtravel"] }]),
         );
-        assert_ne!(generation_of(&a), generation_of(&bound));
+        assert_ne!(generation_of(&a, None), generation_of(&bound, None));
 
-        assert_eq!(generation_of(&[]).len(), 16, "a short, stable token");
+        // An EMPTY conditionBinding is a statement (it clears a derived auto binding), so it is a
+        // different generation than an absent one.
+        let cleared = compile_one(
+            json!([{ "id": "x-position", "dataItemId": "Xabs", "conditionBinding": [] }]),
+        );
+        assert_ne!(generation_of(&a, None), generation_of(&cleared, None));
+
+        // A publish-policy edit swaps too: the served policy is observable.
+        let policed = compile_one(
+            json!([{ "id": "x-position", "dataItemId": "Xabs",
+                     "publish": { "mode": "interval", "batchMs": 100 } }]),
+        );
+        assert_ne!(generation_of(&a, None), generation_of(&policed, None));
+
+        assert_eq!(generation_of(&[], None).len(), 16, "a short, stable token");
+    }
+
+    #[test]
+    fn the_selection_block_moves_the_generation_because_it_changes_the_served_set() {
+        let sel = |v: Value| -> Option<crate::mtconnect::SelectionConfig> {
+            Some(serde_json::from_value(v).unwrap())
+        };
+        let none = generation_of(&[], None);
+        let all = generation_of(&[], sel(json!({ "mode": "all" })).as_ref());
+        assert_ne!(none, all, "adding a selection is a new served set");
+        assert_eq!(
+            all,
+            generation_of(&[], sel(json!({ "mode": "all" })).as_ref()),
+            "content-addressed: the same block hashes the same"
+        );
+        let filtered = generation_of(
+            &[],
+            sel(json!({ "mode": "include", "include": [{ "type": "POSITION" }] })).as_ref(),
+        );
+        assert_ne!(all, filtered);
+        let capped = generation_of(&[], sel(json!({ "mode": "all", "maxSignals": 3 })).as_ref());
+        assert_ne!(all, capped);
+        let unbound =
+            generation_of(&[], sel(json!({ "mode": "all", "autoConditionBinding": false })).as_ref());
+        assert_ne!(all, unbound);
+    }
+
+    #[test]
+    fn a_selection_change_is_accepted_live_and_rides_the_atomic_swap() {
+        // Same agents, same instances — only the selection block changes: NOT restart-required.
+        let with_selection = |sel: Value| {
+            let mut inst = instance(json!([]));
+            inst["selection"] = sel;
+            config(agents(), json!([inst]))
+        };
+        let current = with_selection(json!({ "mode": "all" }));
+        let candidate = with_selection(json!({ "mode": "all", "maxSignals": 3 }));
+        assert_eq!(classify(&candidate, Some(&current)), Verdict::Accept);
+
+        // ... and the swap installs the new selection as one unit with the signals.
+        let devices = compile(&current).unwrap();
+        let registry = SignalRegistry::new(&devices);
+        let before = registry.slot("cnc-1").unwrap().load();
+        assert_eq!(before.selection.as_ref().unwrap().max_signals, 500);
+
+        let changed = registry.apply(&candidate).unwrap();
+        assert_eq!(changed, vec!["cnc-1".to_string()]);
+        let after = registry.slot("cnc-1").unwrap().load();
+        assert_eq!(after.selection.as_ref().unwrap().max_signals, 3);
+        assert_ne!(after.generation, before.generation, "browse cursors are void");
+
+        // A selection whose regex does not compile is refused BEFORE it commits.
+        let broken = with_selection(json!({ "mode": "include", "include": [{ "type": "(" }] }));
+        let Verdict::Reject { code, message } = classify(&broken, Some(&current)) else {
+            panic!("a bad regex must not commit")
+        };
+        assert_eq!(code, INVALID_CONFIG);
+        assert!(message.contains("regex"), "{message}");
+        assert!(registry.apply(&broken).is_err());
+        assert_eq!(
+            registry.slot("cnc-1").unwrap().load().generation,
+            after.generation,
+            "the live generation is untouched"
+        );
+
+        // A selection on a sim instance is refused: there is no probe behind it.
+        let sim = json!({ "component": { "global": {}, "instances": [{
+            "id": "plc-1", "adapter": "sim",
+            "connection": { "endpoint": "sim://plc-1" },
+            "selection": { "mode": "all" }
+        }] } });
+        assert!(matches!(classify(&sim, None), Verdict::Reject { code: INVALID_CONFIG, .. }));
     }
 
     #[test]

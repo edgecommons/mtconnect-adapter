@@ -164,12 +164,22 @@ pub struct DeviceConfig {
     pub agent_id: String,
     /// The MTConnect `Device/@uuid` this instance represents.
     pub device_uuid: String,
-    /// The configured signal set. Empty means "publish nothing" — signals are explicit.
+    /// The explicit signal set. With no `selection`, empty means "publish nothing" — signals are
+    /// explicit.
     pub signals: Vec<SignalConfig>,
+    /// The probe-derived selection, when the instance carries one (R1.1). `None` means only the
+    /// explicit `signals[]` publish.
+    pub selection: Option<super::selection::SelectionConfig>,
 }
 
 /// One configured signal: a stable EdgeCommons identity bound to one MTConnect `dataItemId`
 /// (HLD §5.3, D-MTC-5).
+///
+/// `condition_binding` and `publish` are `Option` because **absence is meaningful** under a
+/// `selection` block (R1.1): an explicit entry that overrides a derived one takes the derived
+/// value for every field it leaves unset, so `"conditionBinding": []` (clear the auto binding)
+/// and an omitted `conditionBinding` (inherit it) are different statements. Use
+/// [`Self::condition_bindings`]/[`Self::publish_policy`] to read the effective values.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SignalConfig {
@@ -185,10 +195,24 @@ pub struct SignalConfig {
     pub data_item_id: String,
     /// Condition data items whose state degrades this signal's quality (HLD §6, D-MTC-8).
     #[serde(default)]
-    pub condition_binding: Vec<String>,
+    pub condition_binding: Option<Vec<String>>,
     /// How this signal is published.
     #[serde(default)]
-    pub publish: PublishCfg,
+    pub publish: Option<PublishCfg>,
+}
+
+impl SignalConfig {
+    /// The effective condition binding (empty when unset).
+    #[must_use]
+    pub fn condition_bindings(&self) -> &[String] {
+        self.condition_binding.as_deref().unwrap_or_default()
+    }
+
+    /// The effective publish policy (the default when unset).
+    #[must_use]
+    pub fn publish_policy(&self) -> PublishCfg {
+        self.publish.clone().unwrap_or_default()
+    }
 }
 
 /// Per-signal publish policy.
@@ -300,8 +324,9 @@ pub fn validate_agent(a: &AgentConfig) -> Result<(), MtcError> {
 }
 
 /// The cross-object invariants of LLD §8: every device names a configured agent, device uuids are
-/// unique per agent, signal ids are unique per device, and a signal never binds its own data item
-/// as a condition.
+/// unique per agent, signal ids are unique per device, a signal never binds its own data item
+/// as a condition, and a `selection` block's patterns compile (R1.1 — validated side-effect-free,
+/// before anything commits).
 ///
 /// # Errors
 /// [`MtcError::Config`] naming the offending device/signal.
@@ -340,12 +365,16 @@ pub fn validate_bindings(agents: &[AgentConfig], devices: &[DeviceConfig]) -> Re
                     d.id, s.id
                 )));
             }
-            if s.condition_binding.iter().any(|c| c == &s.data_item_id) {
+            if s.condition_bindings().iter().any(|c| c == &s.data_item_id) {
                 return Err(MtcError::Config(format!(
                     "device `{}` signal `{}`: conditionBinding must not name its own dataItemId",
                     d.id, s.id
                 )));
             }
+        }
+
+        if let Some(selection) = &d.selection {
+            super::selection::validate_selection(&d.id, selection)?;
         }
     }
     Ok(())
@@ -514,13 +543,19 @@ mod tests {
             name: None,
             channel: None,
             data_item_id: item.into(),
-            condition_binding: Vec::new(),
-            publish: PublishCfg::default(),
+            condition_binding: None,
+            publish: None,
         }
     }
 
     fn device(id: &str, agent: &str, uuid: &str, signals: Vec<SignalConfig>) -> DeviceConfig {
-        DeviceConfig { id: id.into(), agent_id: agent.into(), device_uuid: uuid.into(), signals }
+        DeviceConfig {
+            id: id.into(),
+            agent_id: agent.into(),
+            device_uuid: uuid.into(),
+            signals,
+            selection: None,
+        }
     }
 
     #[test]
@@ -535,14 +570,27 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(s.data_item_id, "dcbc0570");
-        assert_eq!(s.condition_binding, vec!["e086dd60".to_string()]);
-        assert_eq!(s.publish.mode, PublishMode::Interval);
-        assert_eq!(s.publish.batch_ms, 250);
-        assert_eq!(s.publish.deadband, Some(0.5));
+        assert_eq!(s.condition_bindings(), ["e086dd60".to_string()]);
+        let p = s.publish_policy();
+        assert_eq!(p.mode, PublishMode::Interval);
+        assert_eq!(p.batch_ms, 250);
+        assert_eq!(p.deadband, Some(0.5));
 
-        // Defaults: publish on change, no batching, no deadband.
+        // Defaults: publish on change, no batching, no deadband — and an UNSET binding/policy is
+        // distinguishable from an empty one (that is what lets a selection-derived value fill it).
         let s = signal("a", "d1");
-        assert_eq!(s.publish, PublishCfg { mode: PublishMode::OnChange, batch_ms: 0, deadband: None });
+        assert_eq!(s.publish, None);
+        assert_eq!(s.condition_binding, None);
+        assert_eq!(
+            s.publish_policy(),
+            PublishCfg { mode: PublishMode::OnChange, batch_ms: 0, deadband: None }
+        );
+        assert!(s.condition_bindings().is_empty());
+        let cleared: SignalConfig = serde_json::from_value(json!({
+            "id": "a", "dataItemId": "d1", "conditionBinding": []
+        }))
+        .unwrap();
+        assert_eq!(cleared.condition_binding, Some(Vec::new()), "[] is a statement, not absence");
     }
 
     #[test]
@@ -581,9 +629,22 @@ mod tests {
 
         // A signal binding its own data item as a condition.
         let mut s = signal("a", "d1");
-        s.condition_binding = vec!["d1".into()];
+        s.condition_binding = Some(vec!["d1".into()]);
         let bad = vec![device("cnc-1", "line-a-agent", "OKUMA.1", vec![s])];
         assert!(validate_bindings(&agents, &bad).is_err());
+
+        // A selection block is validated here too: a bad regex never reaches a session.
+        let mut with_selection = device("cnc-1", "line-a-agent", "OKUMA.1", vec![]);
+        with_selection.selection = Some(
+            serde_json::from_value(json!({ "mode": "include", "include": [{ "type": "(" }] }))
+                .unwrap(),
+        );
+        let err = validate_bindings(&agents, &[with_selection]).unwrap_err();
+        assert!(err.to_string().contains("cnc-1"), "{err}");
+        let mut ok_selection = device("cnc-1", "line-a-agent", "OKUMA.1", vec![]);
+        ok_selection.selection =
+            Some(serde_json::from_value(json!({ "mode": "all" })).unwrap());
+        validate_bindings(&agents, &[ok_selection]).unwrap();
     }
 
     #[test]

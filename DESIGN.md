@@ -81,6 +81,40 @@ Local decisions, recorded so later sessions do not re-litigate them:
   multiply one shared document stream by its device count on every fleet dashboard.
   `MtconnectParse` keeps its HLD `instance` dimension, and because parsing happens at the document
   level — above the per-device split — instances sharing an agent report that agent's counters.
+- **D-MtconnectAdapter-L8 (R1.1 probe-derived selection).** An instance's published set is the
+  **served union**: the explicit `signals[]` plus the set derived from its `selection` block
+  against the cached probe model, computed by ONE pure function
+  (`mtconnect::selection::served_set`) that the session, `sb/signals`, `sb/browse` and the
+  inventory all consume — so acquisition and every view of it cannot disagree. Explicit entries
+  override derived ones **field-by-field**, matched by `dataItemId`; to realize that,
+  `SignalConfig.condition_binding`/`publish` are `Option` — absence inherits the derived value,
+  `[]`/a policy object overrides it. Explicit entries keep the permanent-BAD missing-item contract
+  (D-MTC-5); **derived entries follow the model** — on drift they are recomputed inside the same
+  generation bump, removed items stop publishing (no lingering BAD) and the change is announced as
+  `MtconnectSignalSetEvent` with counts. `maxSignals` (default 500) caps the derived half only,
+  truncating in browse-tree order with a warning event + log — never silently.
+- **D-MtconnectAdapter-L9.** The selection rides `InstanceSignals` (the reloadable slot) beside the
+  explicit signals, so a selection edit is a live, atomic signals-level swap — never
+  `RESTART_REQUIRED` — and the signal-set generation hashes the whole block (and, from R1.1 on, the
+  explicit `publish` policies and the Option-presence of `conditionBinding`/`publish`), which keeps
+  `viewGeneration = probeDigest.signalGeneration` sufficient: a model change moves the left half,
+  any selection/signals change moves the right. Selection patterns are validated side-effect-free
+  at config load (`validate_selection`, called from `validate_bindings`): a bad regex, an unknown
+  category, `maxSignals: 0`, an inert combination (matchers under `mode: "explicit"`, an empty
+  `include` under `mode: "include"`, `include` under `mode: "all"`), or a `selection` on a `sim`
+  instance is refused before anything commits.
+- **D-MtconnectAdapter-L10.** Derivation choices the R1.1 contract left open, decided here: matcher
+  regexes are **anchored** (whole-field; `POSITION` cannot creep into `PATH_POSITION`); the path
+  glob matches the raw probe component path (`Axes/Linear[X]`), case-sensitively; a nameless
+  item's derived name is `type` + `" "` + `subType`; the derived SAMPLE batch window comes from
+  `component.global.defaults.batchMs` (stamped into the compiled selection — there is no
+  instance-level batch default to prefer); **no units-aware deadband default is derived**, because
+  none is cleanly derivable from units alone (a millimeter on a micro-positioner and on a gantry
+  are different facts) — derived signals get no deadband and the docs say so; the served order is
+  explicit entries (configuration order) then discovered entries (browse-tree order); id
+  collisions get deterministic `-2`, `-3`, … suffixes in browse-tree order; provenance is
+  surfaced as `provenance: "configured" | "discovered"` on `sb/signals` rows and browse data-item
+  entries, with the browse `configured` flag covering the served union.
 
 ## Module layout
 
@@ -94,7 +128,7 @@ src/
   reload.rs      the pre-commit reload verdict + the live, swappable per-instance signal set
   mtconnect/     the owned client — NO edgecommons imports
     mod.rs config.rs client.rs xml.rs model.rs observations.rs sequence.rs stream.rs
-    multipart.rs error.rs stats.rs
+    multipart.rs error.rs stats.rs selection.rs
 ```
 
 ## Config
@@ -106,9 +140,13 @@ src/
   EdgeCommons vault at the `device.rs` boundary; the protocol client only ever sees values.
 - `instances[].connection` — `{agentId, deviceUuid}` and nothing else: the endpoint is derived.
   (`adapter: "sim"` uses `endpoint` instead, having no agent.)
-- `instances[].signals[]` — signals are explicit: a data item that is not configured is browsable
-  but not published. `conditionBinding` is what makes a value's quality reflect the machine's own
-  alarms.
+- `instances[].signals[]` — the explicit signals: without a `selection`, a data item that is not
+  configured is browsable but not published. `conditionBinding` is what makes a value's quality
+  reflect the machine's own alarms.
+- `instances[].selection` — probe-derived selection (R1.1, D-MtconnectAdapter-L8..L10): publish
+  data items by matcher (`mode: "include"`) or wholesale (`mode: "all"`) instead of naming each
+  one; matchers AND within, OR across, `exclude` wins; explicit entries override derived ones
+  field-by-field.
 - `writes.allow` — pinned empty; the protocol has no write path.
 
 Cross-object invariants JSON Schema cannot express (every `agentId` resolves, uuids unique per
@@ -161,8 +199,9 @@ monotonic totals (`src/mtconnect/stats.rs`, EdgeCommons-free like everything und
 
 Events go out through the `events()` facade: `MtconnectAgentEvent` (up / down / degraded-to-polling),
 `MtconnectDataLossEvent` (skipped count and sequence window), `MtconnectModelDriftEvent` (old and new
-digest), and `MtconnectConditionEvent` on a **transition into** `Fault`, rate-limited to one per
-data item per minute. Sequence numbers, device uuids and data-item ids are event fields, never metric
+digest), `MtconnectConditionEvent` on a **transition into** `Fault`, rate-limited to one per
+data item per minute, and `MtconnectSignalSetEvent` (the selection-derived set changed shape — info
+with added/removed counts — or `maxSignals` truncated it — warning). Sequence numbers, device uuids and data-item ids are event fields, never metric
 dimensions. The mapping from runtime event to operator event lives in `device.rs` (`Notice`), where
 it is unit-tested; `supervisor.rs` only carries it to the wire.
 
@@ -175,17 +214,22 @@ configuration. A candidate that does not compile is refused with `INVALID_MTCONN
 verdicts come from the pure `reload::classify`, registered as the library's configuration validator
 in `main.rs`.
 
-An existing instance's `signals[]` reloads live: `reload::SignalRegistry::apply` compiles every
-instance first and only then swaps the slots, so one bad instance cannot leave the others on a new
+An existing instance's `signals[]` — and its `selection` block, which rides the same
+`InstanceSignals` slot — reloads live: `reload::SignalRegistry::apply` compiles every instance
+first and only then swaps the slots, so one bad instance cannot leave the others on a new
 generation. A session recompiles against the **cached** probe model — no agent round-trip, so a
 reload lands while the agent is unreachable. Because an entry's `configured` flag comes from the
-signal set, the browse `viewGeneration` composes the probe digest **and** the signal-set generation,
-and a cursor minted before either changed is refused with `MTC_VIEW_CHANGED`.
+signal configuration (explicit + selection), the browse `viewGeneration` composes the probe digest
+**and** the signal-set generation, and a cursor minted before either changed is refused with
+`MTC_VIEW_CHANGED`.
 
 ## Validation
 
-- `cargo test` — the unit suite plus `tests/poll_acquisition.rs` (poll acquisition end to end
-  against a fake agent serving canned documents), `tests/config_schema.rs` (every shipped
+- `cargo test` — the unit suite (including `mtconnect::selection`'s matcher/derivation/precedence
+  tables) plus `tests/poll_acquisition.rs` (poll acquisition end to end against a fake agent
+  serving canned documents, including the R1.1 legs: the minimal `selection: {mode: "all"}`
+  instance, matcher scoping with explicit overrides, `maxSignals` truncation, drift add/remove of
+  derived signals, and the live selection reload), `tests/config_schema.rs` (every shipped
   configuration validated against `config.schema.json` and through the semantic validator) and
   `tests/isolation.rs` (the seam rule), `tests/stream_acquisition.rs` + `tests/stream_sequence.rs`
   (the streaming state machine and its three ladders on a virtual clock), `tests/fuzz_style.rs` (the multipart/XML

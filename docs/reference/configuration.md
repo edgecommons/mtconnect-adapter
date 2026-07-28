@@ -64,7 +64,8 @@ of `0`; `maxDocumentBytes` of `0`; `reconnect.maxMs` less than `reconnect.initia
 | `connection.deviceUuid` | string | required for `adapter: "mtconnect"` | The `Device/@uuid` this instance represents — verified against the agent's `/probe` at connect. |
 | `connection.endpoint` | string | required for `adapter: "sim"` | Only for the simulator, which has no agent to derive an endpoint from. An `mtconnect`-adapter instance's endpoint is **derived** — `mtconnect://<host>[:<port>]/<uuid>` — from `agentId` + `deviceUuid`, never configured, so the two can never disagree. |
 | `pollIntervalMs` | integer | `component.global.defaults.pollIntervalMs` | Per-device override of the read cadence. |
-| `signals[]` | array | `[]` | The signals this device publishes — see below. A configured `dataItemId` that is not in the signal set is browsable (`sb/browse`) but never published. |
+| `signals[]` | array | `[]` | The explicit signals this device publishes — see below. Without a `selection`, a `dataItemId` that is not in the signal set is browsable (`sb/browse`) but never published. |
+| `selection` | object | none | Probe-derived signal selection — publish data items by matcher (or all of them) instead of naming each one; see [`selection`](#componentinstancesselection) below. Only for the `mtconnect` adapter: a `sim` instance carrying a `selection` is refused (the simulator has no probe to derive from). |
 | `writes.allow` | array | `[]`, **pinned empty** | The schema caps this at `maxItems: 0`: MTConnect has no write path, so there is nothing to allow-list. `sb/write` is registered and always answers `WRITE_NOT_ALLOWED`, advertised `unsupported` on the command-availability surface. |
 
 ## `component.instances[].signals[]`
@@ -83,6 +84,74 @@ across agent restarts — even though the observation timestamps and sequence nu
 | `publish.mode` | `"on-change"` \| `"interval"` | `"on-change"` | How this signal is published. |
 | `publish.batchMs` | integer | `0` | Coalescing window for `interval` mode. |
 | `publish.deadband` | number | none | Absolute deadband, SAMPLE-category signals only: a change smaller than this is not published. |
+
+## `component.instances[].selection`
+
+A `selection` block describes **which** of the device's data items to publish, and the adapter
+derives one signal per selected item from the probe model — beside (not instead of) any explicit
+`signals[]`. The derived set is recomputed against the cached model, so it follows the machine: a
+data item that appears after a model change starts publishing, one that disappears stops (see
+[drift semantics](#how-the-derived-set-behaves) below).
+
+| Key | Type | Default | Definition |
+|-----|------|---------|-----------|
+| `mode` | `"explicit"` \| `"include"` \| `"all"` | `"explicit"` | `explicit` publishes only the explicit `signals[]` — the behavior of an absent `selection`. `include` publishes the data items matching any `include` matcher. `all` publishes every data item. `exclude` applies to both selecting modes and always wins. |
+| `include[]` | array of matcher | `[]` | The matchers that select data items — **OR across the list**. Required non-empty under `mode: "include"`; refused under the other modes, where it would be inert. |
+| `exclude[]` | array of matcher | `[]` | Matchers that remove data items from the selection. Exclude wins over include and over `mode: "all"`. |
+| `maxSignals` | integer ≥ 1 | `500` | Caps the **derived** set only — explicit `signals[]` never count against it. Exceeding it truncates deterministically in browse-tree order, with a warning event (`MtconnectSignalSetEvent`) and a log line — never silently. |
+| `autoConditionBinding` | boolean | `true` | Each derived non-condition signal binds the CONDITION data items of **its own component**, so a machine alarm degrades its component's values exactly as a hand-written `conditionBinding` would. Set `false` to derive no bindings. |
+
+### Matchers
+
+A matcher is a closed object; every field is optional, and the fields that are present are
+**AND**ed. An empty matcher `{}` matches every data item. Regex fields are **anchored**: the
+pattern must match the whole field, so `POSITION` does not match `PATH_POSITION`. All patterns are
+validated when the configuration loads — a bad regex is refused before anything commits.
+
+| Field | Matches against | Semantics |
+|-------|-----------------|-----------|
+| `category` | the item's category | Exactly `SAMPLE`, `EVENT`, or `CONDITION`. |
+| `type` | `DataItem/@type` | Anchored regex (`POSITION`, `POSITION\|LOAD`, `.*_VELOCITY`). |
+| `subType` | `DataItem/@subType` | Anchored regex. An item with **no** subType never matches this field. |
+| `idMatch` | `DataItem/@id` | Anchored regex. |
+| `path` | the component path (`Axes/Linear[X]`) | Glob, matched segment-wise: `*` and `?` within a segment, `**` spans zero or more whole segments (`Axes/**`, `**/Path[P1]`). The empty string is the device level. |
+
+### What a derived signal looks like
+
+For every selected data item the adapter derives:
+
+| Field | Derivation |
+|-------|------------|
+| `id` | The lower-kebab sanitization of the `dataItemId` (`Xabs` → `xabs`, `SpindleSpeed` → `spindle-speed`, `t1-Tpos` → `t1-tpos`). A collision with another id gets a deterministic `-2`, `-3`, … suffix in browse-tree order, with a warning log. |
+| `name` | The probe's own `DataItem/@name`; an item with none is named by its type plus subType (`POSITION ACTUAL`). |
+| `channel` | The UNS-sanitized component path, then the id: `Axes/Linear[X]` + `xabs` → `axes/linear-x/xabs`. A device-level item publishes on its id alone. |
+| `publish` | SAMPLE: `on-change` with `batchMs` from `component.global.defaults.batchMs`, and **no deadband** — a units-aware default is not cleanly derivable (a millimeter on a micro-positioner and on a gantry are different facts), so none is invented; set one on an explicit entry when you want it. EVENT/CONDITION: `on-change`, immediate. |
+| `conditionBinding` | Under `autoConditionBinding` (the default), the CONDITION data items of the signal's own component; a CONDITION signal itself binds nothing. |
+
+### Precedence: explicit entries win, field by field
+
+An explicit `signals[]` entry whose `dataItemId` the selection also matches **overrides** the
+derived entry, field by field: the fields it sets win, the fields it leaves out take the derived
+values. Absence and emptiness are different statements — `"conditionBinding": []` clears the auto
+binding, while omitting `conditionBinding` inherits it; the same holds for `publish`. Explicit
+entries keep the strict missing-item contract: a `dataItemId` the model does not have publishes a
+permanent BAD `MTC_NO_SUCH_DATAITEM`, exactly as without a selection.
+
+### How the derived set behaves
+
+- **The derived set follows the model.** On model drift (a re-probe after an agent restart, or a
+  `reconnect`), the derived set is recomputed against the new model inside the same generation
+  bump: newly matching items start publishing, removed derived items **stop** — they were
+  discovered, not configured, so they do not linger as BAD. Any change is announced as an
+  `MtconnectSignalSetEvent` naming the added/removed counts.
+- **Identity stability is a trade.** Derived ids, names and channels are protocol-derived: they are
+  deterministic, but they follow the machine's own `dataItemId`s and component names. Pin an
+  explicit `signals[]` entry for any signal whose identity must survive a machine reconfiguration —
+  see [explanation.md](../explanation.md#derived-identity-is-a-trade).
+- **`signalsSubscribed` counts the served union** — the explicit signals (minus permanently-BAD
+  unbound ones) plus the derived set.
+- **Before the first probe** there is no model to derive from: `sb/signals` lists only the explicit
+  entries, and the derived half appears with the first probe.
 
 ## Identity & the UNS device tree
 
@@ -148,6 +217,7 @@ and re-apply it. What happens then depends on what changed:
 | Change | Effect |
 |---|---|
 | `signals[]` of an existing instance | **Applied live.** The signal set is recompiled against the **cached** probe model and swapped atomically, so it lands even while the agent is unreachable, and no session reconnects or re-probes. `sb/signals` answers from the new set immediately, and `southbound_health.signalsSubscribed` follows on the next read. |
+| `selection` of an existing instance — added, removed, or edited | **Applied live**, riding the same atomic swap as a `signals[]` edit: the served union is recomputed against the cached model, with no restart, reconnect, or re-probe. A selection whose regex does not compile is refused with `INVALID_MTCONNECT_CONFIG` before it commits. |
 | `component.global.agents[]` — any field, or an entry added or removed | Refused with `RESTART_REQUIRED`. An agent owns live sockets, an open multipart stream, and a position in that agent's ring buffer. |
 | `component.instances[]` — an instance added, removed, or reordered | Refused with `RESTART_REQUIRED`. An instance owns a supervisor task and a session. |
 | Anything that does not compile — an unresolvable `connection.agentId`, two devices claiming one uuid on an agent, a `conditionBinding` naming its own `dataItemId`, an unknown key | Refused with `INVALID_MTCONNECT_CONFIG`. |

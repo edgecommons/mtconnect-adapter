@@ -60,24 +60,44 @@ pub struct DeviceConfig {
     /// The signals this device publishes, each binding one MTConnect `dataItemId` (HLD §5.3).
     #[serde(default)]
     pub signals: Vec<crate::mtconnect::config::SignalConfig>,
+    /// Probe-derived signal selection (R1.1): describe which data items to publish instead of (or
+    /// beside) naming each one. Absent = only the explicit `signals[]` publish.
+    #[serde(default)]
+    pub selection: Option<crate::mtconnect::SelectionConfig>,
 }
 
 /// Compile the configured instances against the configured agents: bind each MTConnect device to
-/// its agent and derive its published endpoint.
+/// its agent, derive its published endpoint, and stamp the resolved defaults into its `selection`.
 ///
 /// The endpoint is **derived, never configured** (HLD §5.1): an instance names an agent and a
 /// device uuid, and `mtconnect://<host>[:<port>]/<uuid>` follows from them, so the two can never
-/// disagree.
+/// disagree. `default_batch_ms` is `component.global.defaults.batchMs`, the coalescing window a
+/// selection-derived SAMPLE signal publishes with.
 ///
 /// # Errors
 /// [`MtcError::Config`] naming the offending instance when a binding is missing, an agent is
-/// unknown, or two devices claim the same uuid on one agent.
+/// unknown, two devices claim the same uuid on one agent, a selection pattern does not compile,
+/// or a `sim` instance carries a `selection` (the simulator has no probe to derive from).
 pub fn compile_mtconnect(
     devices: &mut [DeviceConfig],
     agents: &[crate::mtconnect::config::AgentConfig],
+    default_batch_ms: u32,
 ) -> std::result::Result<Vec<crate::mtconnect::config::DeviceConfig>, crate::mtconnect::MtcError>
 {
     use crate::mtconnect::MtcError;
+
+    if let Some(bad) = devices
+        .iter()
+        .find(|d| d.adapter != crate::device::KIND && d.selection.is_some())
+    {
+        return Err(MtcError::Config(format!(
+            "instance `{}`: `selection` requires the `{}` adapter - the `{}` backend has no probe \
+             to derive signals from",
+            bad.id,
+            crate::device::KIND,
+            bad.adapter
+        )));
+    }
 
     let mut compiled = Vec::new();
     for device in devices.iter_mut().filter(|d| d.adapter == crate::device::KIND) {
@@ -93,15 +113,32 @@ pub fn compile_mtconnect(
             device.connection.endpoint =
                 crate::device::endpoint_description(&agent.url, &device_uuid);
         }
+        let selection = device.selection.clone().map(|mut s| {
+            s.default_batch_ms = default_batch_ms;
+            s
+        });
         compiled.push(crate::mtconnect::config::DeviceConfig {
             id: device.id.clone(),
             agent_id,
             device_uuid,
             signals: device.signals.clone(),
+            selection,
         });
     }
     crate::mtconnect::config::validate_bindings(agents, &compiled)?;
     Ok(compiled)
+}
+
+/// The `component.global.defaults.batchMs` of a raw global object (`0` when unset) — the batch
+/// window selection-derived SAMPLE signals publish with.
+#[must_use]
+pub fn default_batch_ms_of(global: &serde_json::Value) -> u32 {
+    global
+        .get("defaults")
+        .and_then(|d| d.get("batchMs"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
