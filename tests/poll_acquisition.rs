@@ -26,6 +26,9 @@ use tokio::net::TcpListener;
 
 const PROBE: &str = include_str!("fixtures/devices_2.7.xml");
 const CURRENT: &str = include_str!("fixtures/current_2.7.xml");
+/// A device whose component paths run deeper than a UNS topic can carry (the demo Mazak shape).
+const PROBE_DEEP: &str = include_str!("fixtures/devices_deep_2.7.xml");
+const CURRENT_DEEP: &str = include_str!("fixtures/current_deep_2.7.xml");
 
 /// A fake MTConnect agent: it answers `/probe` and `/current` with whatever documents the test has
 /// installed, and counts the requests it served.
@@ -128,6 +131,15 @@ fn connection() -> ConnectionConfig {
 
 /// A runtime pointed at the fake agent, with the configured devices bound to it.
 fn wire(agent: &FakeAgent, devices: Vec<DeviceConfig>) -> (Arc<AgentRuntime>, MtcBackend) {
+    wire_with(agent, devices, mtconnect_adapter::app::ChannelBudgets::default())
+}
+
+/// [`wire`] with explicit per-instance UNS channel budgets — what shapes a deep path's channel.
+fn wire_with(
+    agent: &FakeAgent,
+    devices: Vec<DeviceConfig>,
+    budgets: mtconnect_adapter::app::ChannelBudgets,
+) -> (Arc<AgentRuntime>, MtcBackend) {
     let cfg = parse_agents(&json!({ "agents": [{
         "id": "line-a-agent",
         "url": agent.url(),
@@ -141,6 +153,7 @@ fn wire(agent: &FakeAgent, devices: Vec<DeviceConfig>) -> (Arc<AgentRuntime>, Mt
     let backend = MtcBackend::new(
         HashMap::from([("line-a-agent".to_string(), Arc::clone(&runtime))]),
         devices,
+        budgets,
     );
     (runtime, backend)
 }
@@ -851,5 +864,123 @@ async fn sb_read_resolves_derived_ids_like_configured_ones() {
     assert_eq!(readings.len(), 1, "a derived signal is readable by its derived id");
     assert_eq!(readings[0].signal_id, "sspeed");
     assert_eq!(readings[0].value, Some(json!(1200)));
+    session.close().await;
+}
+
+// =================================================================================================
+// Depth-aware channel derivation
+// =================================================================================================
+
+/// The deep-path device, bound to the same fake agent.
+fn deep_device(selection: serde_json::Value) -> DeviceConfig {
+    DeviceConfig {
+        id: "cnc-1".into(),
+        agent_id: "line-a-agent".into(),
+        device_uuid: "Mazak".into(),
+        signals: Vec::new(),
+        selection: Some(serde_json::from_value(selection).unwrap()),
+    }
+}
+
+fn deep_connection() -> ConnectionConfig {
+    serde_json::from_value(json!({ "agentId": "line-a-agent", "deviceUuid": "Mazak" })).unwrap()
+}
+
+/// The budget an ordinary instance really has: `ecv1/gw-01/mtconnect-adapter/cnc-1/data/` leaves
+/// three tokens and 216 bytes.
+fn realistic_budgets() -> mtconnect_adapter::app::ChannelBudgets {
+    let mut budgets = mtconnect_adapter::app::ChannelBudgets::default();
+    budgets.insert(
+        "cnc-1",
+        mtconnect_adapter::mtconnect::ChannelBudget { max_tokens: 3, max_bytes: 216 },
+    );
+    budgets
+}
+
+#[tokio::test]
+async fn a_deep_component_path_publishes_on_a_channel_that_fits_the_uns_topic() {
+    // The reported bug, end to end: under `mode: "all"` the demo Mazak's `stock` sits four
+    // channel tokens deep where three fit, so the library refused its topic (DEPTH_EXCEEDED) and
+    // it never published. The derived channel now keeps the leaf-most segments instead.
+    let agent = FakeAgent::start().await;
+    agent.set("probe", PROBE_DEEP.to_string());
+    agent.set("current", CURRENT_DEEP.to_string());
+    let (runtime, backend) =
+        wire_with(&agent, vec![deep_device(json!({ "mode": "all" }))], realistic_budgets());
+
+    let mut session = backend.connect(&deep_connection()).await.expect("connect");
+    runtime.poll_once().await.expect("poll");
+    let readings = session.read_signals().await.expect("read");
+
+    // `stock` publishes, and on a channel within the budget.
+    let stock = reading(&readings, "stock");
+    assert_eq!(stock.value, Some(json!("ALUMINUM-6061")));
+    assert_eq!(stock.channel.as_deref(), Some("materials-materials/stock-stock/stock"));
+
+    // Every published channel fits — that is the invariant, not just this one signal.
+    for r in &readings {
+        let channel = r.channel.as_deref().unwrap_or(&r.signal_id);
+        assert!(channel.split('/').count() <= 3, "{} -> {channel}", r.signal_id);
+        assert!(channel.len() <= 216, "{} -> {channel}", r.signal_id);
+    }
+
+    // The five-level signal keeps its two leaf-most segments; the shallow ones are untouched.
+    assert_eq!(
+        reading(&readings, "ptemp").channel.as_deref(),
+        Some("motor-motor/sensor-sensor/ptemp")
+    );
+    assert_eq!(reading(&readings, "avail").channel.as_deref(), Some("avail"));
+    assert_eq!(
+        reading(&readings, "estop").channel.as_deref(),
+        Some("controller-controller/estop")
+    );
+
+    // Ordinary shaping is NOT an event: it is normal derivation on a deep machine.
+    assert!(
+        session.take_notices().iter().all(|n| n.context["reason"] != json!("channelBudget")),
+        "a fitted channel raises no warning"
+    );
+
+    // Nothing is lost: the untruncated component path is still what `sb/signals` addresses with.
+    let model = runtime.model("Mazak").expect("the cached probe model");
+    assert_eq!(
+        model.address_of("line-a-agent", "stock").expect("an address")["componentPath"],
+        json!("Resources[resources]/Materials[materials]/Stock[stock]")
+    );
+    session.close().await;
+}
+
+#[tokio::test]
+async fn a_budget_that_cannot_fit_even_an_id_warns_rather_than_publishing_silence() {
+    // The pathological floor: an identity that has consumed the whole topic. There is nothing to
+    // derive that would publish, so it is a warning event — the one case that is NOT ordinary.
+    let agent = FakeAgent::start().await;
+    agent.set("probe", PROBE_DEEP.to_string());
+    agent.set("current", CURRENT_DEEP.to_string());
+    let mut budgets = mtconnect_adapter::app::ChannelBudgets::default();
+    budgets.insert(
+        "cnc-1",
+        mtconnect_adapter::mtconnect::ChannelBudget { max_tokens: 0, max_bytes: 0 },
+    );
+    let (_runtime, backend) =
+        wire_with(&agent, vec![deep_device(json!({ "mode": "all" }))], budgets);
+
+    let mut session = backend.connect(&deep_connection()).await.expect("connect");
+    let notices = session.take_notices();
+    let warned = notices
+        .iter()
+        .find(|n| n.context["reason"] == json!("channelBudget"))
+        .expect("the pathological-floor warning event");
+    assert_eq!(warned.event_type, "MtconnectSignalSetEvent");
+    assert_eq!(warned.context["unfit"], json!(6), "every signal of the device");
+    assert_eq!(warned.context["instance"], json!("cnc-1"));
+
+    // The channel is still the bare id: this adapter invents no name, so the library's own topic
+    // validation is what refuses it, loudly, on publish.
+    let inventory = backend.inventory(&deep_connection());
+    let ids: Vec<&str> = inventory.iter().map(|s| s.id.as_str()).collect();
+    assert!(ids.contains(&"stock"));
+
+    // A second recompile of the same shape does not repeat the warning.
     session.close().await;
 }

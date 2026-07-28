@@ -15,6 +15,9 @@
 //!   the inventory all consume this same function, so they can never disagree about what is served.
 //! * [`sanitize_token`] / [`glob_match`] — the derivation helpers: lower-kebab id sanitization and
 //!   the `**`-aware component-path glob.
+//! * [`ChannelBudget`] / [`derive_channel`] — the depth-aware channel rule: a derived channel is
+//!   the **last k** component-path segments plus the signal id, k chosen per signal as the largest
+//!   value that still fits the instance's real UNS topic budget.
 //!
 //! Matcher semantics: **AND within a matcher, OR across matchers**; `exclude` wins over `include`;
 //! `mode: "all"` includes everything (excludes still apply). Regexes are anchored (a pattern must
@@ -31,6 +34,63 @@ use super::model::{Category, DataItemMeta, ProbeModel};
 
 /// The default derived-set cap.
 pub const DEFAULT_MAX_SIGNALS: usize = 500;
+
+// =================================================================================================
+// The channel budget
+// =================================================================================================
+
+/// What is left of a UNS data topic for one instance's **channel**, after its
+/// `ecv1/…/{instance}/data/` prefix — the room a derived channel has to fit into.
+///
+/// A UNS topic is capped at 8 levels (7 `/` separators) and 256 UTF-8 bytes, so an
+/// instance-scoped data topic leaves only a few tokens for the channel. MTConnect component paths
+/// go deeper than that: the demo Mazak's `stock` sits on `Resources[resources]/
+/// Materials[materials]/Stock[stock]`, which with its id is four channel tokens where three fit.
+/// A budget is therefore resolved from the instance's **real** identity — device, component and
+/// instance token lengths included — and stamped into the compiled [`SelectionConfig`], the same
+/// way [`SelectionConfig::default_batch_ms`] is. It is plain arithmetic here: this module owns no
+/// topic grammar, it is handed the room it has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelBudget {
+    /// How many `/`-separated tokens the channel may have. `0` means not even a one-token channel
+    /// fits — the instance's own identity is already at the depth limit.
+    pub max_tokens: usize,
+    /// How many UTF-8 bytes the channel string itself may occupy (separators between its tokens
+    /// included, the separator before it excluded).
+    pub max_bytes: usize,
+}
+
+impl ChannelBudget {
+    /// The token budget of the rootless, instance-scoped data grammar
+    /// (`ecv1/{device}/{component}/{instance}/data/…`): the 8-level topic limit less its 5 fixed
+    /// levels.
+    pub const DEFAULT_MAX_TOKENS: usize = 3;
+    /// The whole-topic byte limit. A resolved budget subtracts the instance's own prefix from it;
+    /// this fallback subtracts nothing, so it constrains only the token count.
+    pub const DEFAULT_MAX_BYTES: usize = 256;
+}
+
+impl Default for ChannelBudget {
+    /// The fallback used when no identity has been resolved — configuration-shape validation and
+    /// unit tests. The live path always stamps the instance's exact budget instead.
+    fn default() -> Self {
+        Self { max_tokens: Self::DEFAULT_MAX_TOKENS, max_bytes: Self::DEFAULT_MAX_BYTES }
+    }
+}
+
+/// One derived channel and how it had to be shaped to fit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedChannel {
+    /// The channel to publish on.
+    pub channel: String,
+    /// How many **root-side** component-path segments were dropped to fit the budget. `0` is the
+    /// full path.
+    pub dropped: usize,
+    /// `false` only in the pathological case where not even the id alone fits the budget. The
+    /// channel is still the id, so the failure surfaces where it is loudest — the library refuses
+    /// the topic with `DEPTH_EXCEEDED`/`LENGTH_EXCEEDED` on publish.
+    pub fits: bool,
+}
 
 // =================================================================================================
 // Configuration shapes
@@ -110,6 +170,11 @@ pub struct SelectionConfig {
     /// EVENT/CONDITION signals are always `on-change`, immediate.
     #[serde(skip)]
     pub default_publish_mode: PublishMode,
+    /// The room this instance's UNS data topic leaves for a channel — resolved from its real
+    /// identity at compile time, like [`Self::default_batch_ms`], and never part of the
+    /// `selection` document. Every channel [`derive_channel`] produces fits it.
+    #[serde(skip)]
+    pub channel_budget: ChannelBudget,
 }
 
 fn default_max_signals() -> usize {
@@ -129,6 +194,7 @@ impl Default for SelectionConfig {
             auto_condition_binding: true,
             default_batch_ms: 0,
             default_publish_mode: PublishMode::OnChange,
+            channel_budget: ChannelBudget::default(),
         }
     }
 }
@@ -342,15 +408,52 @@ pub fn sanitize_token(raw: &str) -> String {
 /// The derived channel: the UNS-sanitized component path, then the signal id
 /// (`Axes/Linear[X]` + `xabs` → `axes/linear-x/xabs`). A device-level item publishes on its id
 /// alone.
+///
+/// **Depth-aware.** MTConnect component paths go deeper than a UNS topic can carry, so the channel
+/// is the **last k** path segments plus the id, where `k` is the largest value that still fits
+/// `budget`. The leaf-most segments are the informative ones — `Materials[materials]/Stock[stock]`
+/// says what a signal is, `Resources[resources]` above it barely narrows anything — so the
+/// root-side segments drop first. The id is the terminal segment and is never dropped: signal ids
+/// are unique per instance (enforced at config load for the explicit half, and by the `-2`/`-3`
+/// suffix chain for the derived half), which is what makes every derived channel unique however
+/// much path was dropped.
+///
+/// The rule is deterministic and per-signal: two signals of one instance can drop different
+/// numbers of segments, because a longer path or a longer id costs more. Nothing is lost — the
+/// full, untruncated component path stays in the probe model and is served as
+/// `signal.address.componentPath` on `sb/signals` and on `sb/browse`.
+///
+/// `k = 0` (the id alone) is the floor. Only if even that does not fit does
+/// [`DerivedChannel::fits`] come back `false`; the channel is still the id, so the library's own
+/// topic validation refuses it loudly on publish rather than this module inventing a name.
 #[must_use]
-pub fn derive_channel(component_path: &str, id: &str) -> String {
-    if component_path.is_empty() {
-        return id.to_string();
+pub fn derive_channel(component_path: &str, id: &str, budget: ChannelBudget) -> DerivedChannel {
+    let segments: Vec<String> = if component_path.is_empty() {
+        Vec::new()
+    } else {
+        component_path.split('/').map(sanitize_token).collect()
+    };
+    let total = segments.len();
+    // Bytes of the channel built from the last `k` segments plus the id: each kept segment costs
+    // its own length plus the `/` that follows it.
+    let bytes_of = |k: usize| -> usize {
+        segments[total - k..].iter().map(|s| s.len() + 1).sum::<usize>() + id.len()
+    };
+
+    // One token of the budget belongs to the id; the rest is what the path may claim.
+    let mut kept = total.min(budget.max_tokens.saturating_sub(1));
+    while kept > 0 && bytes_of(kept) > budget.max_bytes {
+        kept -= 1;
     }
-    let mut segments: Vec<String> =
-        component_path.split('/').map(sanitize_token).collect();
-    segments.push(id.to_string());
-    segments.join("/")
+    let fits = budget.max_tokens >= 1 && id.len() <= budget.max_bytes;
+
+    let mut channel = String::new();
+    for segment in &segments[total - kept..] {
+        channel.push_str(segment);
+        channel.push('/');
+    }
+    channel.push_str(id);
+    DerivedChannel { channel, dropped: total - kept, fits }
 }
 
 /// Where a served signal came from — surfaced on `sb/signals` rows and browse entries.
@@ -388,6 +491,14 @@ pub struct ServedSet {
     pub derived_matched: usize,
     /// How many candidates the cap dropped. Never silent: the caller raises a warning event.
     pub derived_truncated: usize,
+    /// How many served signals had root-side component-path segments dropped from their derived
+    /// channel to fit the UNS topic budget. Ordinary derivation on a deep machine, not a fault —
+    /// the caller logs it at debug.
+    pub channel_truncated: usize,
+    /// How many served signals could not fit the budget **even as their id alone** — the
+    /// pathological floor, where the instance's own identity has consumed the topic. The caller
+    /// raises a warning event: these signals will not publish.
+    pub channel_unfit: usize,
 }
 
 impl ServedSet {
@@ -413,6 +524,9 @@ impl ServedSet {
 /// * `maxSignals` caps the derived half only, truncating in browse-tree order.
 /// * Derived ids are the lower-kebab sanitization of the `dataItemId`; a collision gets a
 ///   deterministic `-2`, `-3`, … suffix (browse-tree order) and a warning log.
+/// * Every derived channel fits the instance's UNS topic budget ([`derive_channel`]): on a deep
+///   component path the root-side segments drop, and the counts land in
+///   [`ServedSet::channel_truncated`] / [`ServedSet::channel_unfit`].
 #[must_use]
 pub fn served_set(
     explicit: &[SignalConfig],
@@ -424,11 +538,18 @@ pub fn served_set(
         .map(|s| ServedSignal { signal: s.clone(), provenance: Provenance::Configured })
         .collect();
 
+    let bare = |signals: Vec<ServedSignal>| ServedSet {
+        signals,
+        derived_matched: 0,
+        derived_truncated: 0,
+        channel_truncated: 0,
+        channel_unfit: 0,
+    };
     let (Some(sel), Some(model)) = (selection, model) else {
-        return ServedSet { signals: out, derived_matched: 0, derived_truncated: 0 };
+        return bare(out);
     };
     if sel.mode == SelectionMode::Explicit {
-        return ServedSet { signals: out, derived_matched: 0, derived_truncated: 0 };
+        return bare(out);
     }
 
     let include: Vec<CompiledMatcher> =
@@ -460,6 +581,8 @@ pub fn served_set(
     let mut derived_matched = 0usize;
     let mut derived_kept = 0usize;
     let mut derived_truncated = 0usize;
+    let mut channel_truncated = 0usize;
+    let mut channel_unfit = 0usize;
 
     for item in items_in_tree_order(model) {
         let selected = (sel.mode == SelectionMode::All
@@ -519,8 +642,19 @@ pub fn served_set(
                         Some(item.name.clone().unwrap_or_else(|| derived_name(item)));
                 }
                 if served.channel.is_none() {
+                    // An explicit entry that names no channel takes the derived one — so it is
+                    // shaped to the same budget. A hand-set channel is never touched: it is the
+                    // operator's statement, and the library refuses it loudly if it does not fit.
                     let id = served.id.clone();
-                    served.channel = Some(derive_channel(&item.component_path, &id));
+                    let derived =
+                        derive_channel(&item.component_path, &id, sel.channel_budget);
+                    if derived.dropped > 0 {
+                        channel_truncated += 1;
+                    }
+                    if !derived.fits {
+                        channel_unfit += 1;
+                    }
+                    served.channel = Some(derived.channel);
                 }
                 if served.condition_binding.is_none() {
                     served.condition_binding = auto_binding();
@@ -541,12 +675,18 @@ pub fn served_set(
 
         let id = derived_id();
         used_ids.insert(id.clone());
-        let channel = derive_channel(&item.component_path, &id);
+        let channel = derive_channel(&item.component_path, &id, sel.channel_budget);
+        if channel.dropped > 0 {
+            channel_truncated += 1;
+        }
+        if !channel.fits {
+            channel_unfit += 1;
+        }
         out.push(ServedSignal {
             signal: SignalConfig {
                 id,
                 name: Some(item.name.clone().unwrap_or_else(|| derived_name(item))),
-                channel: Some(channel),
+                channel: Some(channel.channel),
                 data_item_id: item.id.clone(),
                 condition_binding: auto_binding(),
                 publish: Some(default_publish()),
@@ -555,7 +695,7 @@ pub fn served_set(
         });
     }
 
-    ServedSet { signals: out, derived_matched, derived_truncated }
+    ServedSet { signals: out, derived_matched, derived_truncated, channel_truncated, channel_unfit }
 }
 
 /// The fallback name when the probe declares none: the type, plus the subType when there is one
@@ -584,9 +724,23 @@ mod tests {
     use serde_json::json;
 
     const DEVICES_2_7: &str = include_str!("../../tests/fixtures/devices_2.7.xml");
+    /// The deep-path device: the demo Mazak's `stock` shape and worse.
+    const DEVICES_DEEP: &str = include_str!("../../tests/fixtures/devices_deep_2.7.xml");
 
     fn model() -> ProbeModel {
         ProbeModel::from_devices(&parse_devices(DEVICES_2_7).unwrap(), "OKUMA.123456").unwrap()
+    }
+
+    fn deep_model() -> ProbeModel {
+        ProbeModel::from_devices(&parse_devices(DEVICES_DEEP).unwrap(), "Mazak").unwrap()
+    }
+
+    /// The live demo Mazak's `stock` component path, verbatim from `demo.mtconnect.org/probe`.
+    const MAZAK_STOCK_PATH: &str = "Resources[resources]/Materials[materials]/Stock[stock]";
+
+    /// The budget of an ordinary rootless, instance-scoped adapter topic.
+    fn budget(tokens: usize, bytes: usize) -> ChannelBudget {
+        ChannelBudget { max_tokens: tokens, max_bytes: bytes }
     }
 
     fn sel(v: serde_json::Value) -> SelectionConfig {
@@ -904,6 +1058,281 @@ mod tests {
         let s = sel(json!({ "mode": "all", "autoConditionBinding": false }));
         let set = served_set(&[], Some(&s), Some(&m));
         assert!(set.signals.iter().all(|s| s.signal.condition_bindings().is_empty()));
+    }
+
+    // --- depth-aware channel derivation ---------------------------------------------------------
+
+    #[test]
+    fn a_deep_path_keeps_its_leaf_most_segments_and_always_the_id() {
+        // The acceptance case: the live demo Mazak's `stock`. Four channel tokens where three
+        // fit — today's rule produced an unpublishable topic (DEPTH_EXCEEDED).
+        let full = derive_channel(MAZAK_STOCK_PATH, "stock", budget(9, 256));
+        assert_eq!(
+            full.channel, "resources-resources/materials-materials/stock-stock/stock",
+            "with room to spare the whole path is still the channel"
+        );
+        assert_eq!(full.dropped, 0);
+
+        // Against the real budget of an instance-scoped topic the ROOT-side segment drops: what
+        // is left names the thing (`materials/stock`), which is the informative half.
+        let fitted = derive_channel(MAZAK_STOCK_PATH, "stock", budget(3, 256));
+        assert_eq!(fitted.channel, "materials-materials/stock-stock/stock");
+        assert_eq!(fitted.dropped, 1);
+        assert!(fitted.fits);
+        assert_eq!(fitted.channel.split('/').count(), 3, "exactly the budget, never over");
+
+        // Deeper paths drop more, and the id is never one of the casualties.
+        let six = "A/B/C/D/E/F";
+        for tokens in 1..=7 {
+            let d = derive_channel(six, "sig", budget(tokens, 256));
+            assert_eq!(d.channel.split('/').count(), tokens.min(7), "tokens={tokens}");
+            assert!(d.channel.ends_with("sig"), "the id is terminal: {}", d.channel);
+            assert_eq!(d.dropped, 6 - (tokens.min(7) - 1));
+            // The kept segments are a SUFFIX of the path, in order.
+            let kept: Vec<&str> = d.channel.split('/').collect();
+            let expected: Vec<&str> = "a/b/c/d/e/f".split('/').skip(d.dropped).collect();
+            assert_eq!(kept[..kept.len() - 1], expected[..]);
+        }
+
+        // A shallow path and a device-level item are untouched by the rule.
+        assert_eq!(derive_channel("Axes/Linear[X]", "xabs", budget(3, 256)).channel,
+            "axes/linear-x/xabs");
+        assert_eq!(derive_channel("", "avail", budget(3, 256)).channel, "avail");
+        assert_eq!(derive_channel("", "avail", budget(3, 256)).dropped, 0);
+    }
+
+    #[test]
+    fn k_is_the_largest_that_fits_and_the_choice_is_deterministic() {
+        // Same inputs, same answer — twice, and independently of what came before it.
+        let a = derive_channel(MAZAK_STOCK_PATH, "stock", budget(3, 256));
+        let b = derive_channel(MAZAK_STOCK_PATH, "stock", budget(3, 256));
+        assert_eq!(a, b);
+
+        // k grows monotonically with the budget and never overshoots the path.
+        let mut previous = 0usize;
+        for tokens in 1..=8 {
+            let kept = derive_channel(MAZAK_STOCK_PATH, "stock", budget(tokens, 256))
+                .channel
+                .split('/')
+                .count()
+                - 1;
+            assert!(kept >= previous, "k must not shrink as the budget grows");
+            assert!(kept <= 3, "there are only three path segments to keep");
+            previous = kept;
+        }
+        assert_eq!(previous, 3, "a big enough budget keeps the whole path");
+    }
+
+    #[test]
+    fn a_long_identity_squeezes_k_through_the_byte_budget() {
+        // `Systems[systems]/Hydraulic[hydraulic]/Pump[pump]/Motor[motor]/Sensor[sensor]` — five
+        // segments. With tokens to spare, BYTES decide how many survive.
+        let path = "Systems[systems]/Hydraulic[hydraulic]/Pump[pump]/Motor[motor]/Sensor[sensor]";
+        let whole = derive_channel(path, "ptemp", budget(9, 256));
+        assert_eq!(whole.dropped, 0);
+        let len = whole.channel.len();
+
+        // One byte short of the whole thing: the root-side segment goes, nothing else.
+        let squeezed = derive_channel(path, "ptemp", budget(9, len - 1));
+        assert_eq!(squeezed.dropped, 1);
+        assert!(squeezed.channel.len() < len);
+        assert!(squeezed.channel.starts_with("hydraulic-hydraulic/"));
+
+        // Squeezing harder keeps dropping, monotonically, down to the id alone.
+        let mut previous = 0usize;
+        for bytes in (5..=len).rev() {
+            let d = derive_channel(path, "ptemp", budget(9, bytes));
+            assert!(d.channel.len() <= bytes, "bytes={bytes}: {}", d.channel);
+            assert!(d.dropped >= previous, "k must not grow as the budget shrinks");
+            assert!(d.fits, "the id itself always fits five bytes");
+            previous = d.dropped;
+        }
+        assert_eq!(derive_channel(path, "ptemp", budget(9, 5)).channel, "ptemp");
+
+        // Both limits bind at once: the tighter of the two wins.
+        let by_tokens = derive_channel(path, "ptemp", budget(2, 256));
+        assert_eq!(by_tokens.channel, "sensor-sensor/ptemp");
+        let by_bytes = derive_channel(path, "ptemp", budget(9, "sensor-sensor/ptemp".len()));
+        assert_eq!(by_bytes.channel, "sensor-sensor/ptemp");
+    }
+
+    #[test]
+    fn the_floor_is_the_id_alone_and_says_so_when_even_that_does_not_fit() {
+        // k = 0 is the floor: the id publishes on its own, and that is a fit.
+        let floored = derive_channel(MAZAK_STOCK_PATH, "stock", budget(1, 256));
+        assert_eq!(floored.channel, "stock");
+        assert_eq!(floored.dropped, 3);
+        assert!(floored.fits);
+
+        // The pathological cases: no token budget at all, or an id longer than the bytes left.
+        // The channel is still the id — this module invents no name — and `fits` is the flag the
+        // caller turns into a warning, after which the library refuses the topic on publish.
+        let no_tokens = derive_channel(MAZAK_STOCK_PATH, "stock", budget(0, 256));
+        assert_eq!(no_tokens.channel, "stock");
+        assert!(!no_tokens.fits);
+
+        let no_bytes = derive_channel("", "a-very-long-signal-id", budget(3, 4));
+        assert_eq!(no_bytes.channel, "a-very-long-signal-id");
+        assert!(!no_bytes.fits);
+
+        // Exactly at the byte limit still fits.
+        assert!(derive_channel("", "stock", budget(1, 5)).fits);
+        assert!(!derive_channel("", "stock", budget(1, 4)).fits);
+    }
+
+    #[test]
+    fn the_mazak_stock_signal_publishes_under_mode_all() {
+        // The bug, end to end: `mode: "all"` over the deep device, at the budget an ordinary
+        // instance really has.
+        let m = deep_model();
+        assert_eq!(
+            m.item("stock").expect("the fixture reproduces the demo item").component_path,
+            MAZAK_STOCK_PATH,
+            "the fixture is the live shape, not an approximation"
+        );
+
+        let mut s = sel(json!({ "mode": "all" }));
+        s.channel_budget = budget(3, 210);
+        let set = served_set(&[], Some(&s), Some(&m));
+
+        // Every served channel fits — the whole point.
+        for served in &set.signals {
+            let channel = served.signal.channel.as_deref().expect("a derived channel");
+            assert!(channel.split('/').count() <= 3, "{channel}");
+            assert!(channel.len() <= 210, "{channel}");
+        }
+
+        // And `stock` in particular, which used to be dropped by the library as DEPTH_EXCEEDED.
+        assert_eq!(
+            find(&set, "stock").signal.channel.as_deref(),
+            Some("materials-materials/stock-stock/stock")
+        );
+        // Its five-level sibling keeps its two leaf-most segments.
+        assert_eq!(
+            find(&set, "ptemp").signal.channel.as_deref(),
+            Some("motor-motor/sensor-sensor/ptemp")
+        );
+        // Shallow signals on the same device are untouched.
+        assert_eq!(find(&set, "avail").signal.channel.as_deref(), Some("avail"));
+        assert_eq!(
+            find(&set, "estop").signal.channel.as_deref(),
+            Some("controller-controller/estop")
+        );
+        // A two-segment path with LONG tokens still fits whole - the byte budget is real room,
+        // not a guess: 114 of the 210 bytes an ordinary instance has left.
+        assert_eq!(
+            find(&set, "etemp").signal.channel.as_deref(),
+            Some(concat!(
+                "auxiliaries-auxiliary-equipment-subsystem-assembly/",
+                "work-envelope-work-envelope-conditioning-circuit-assembly/etemp"
+            ))
+        );
+
+        // The counts: the three deep signals were shaped, none hit the floor.
+        assert_eq!(set.channel_truncated, 3);
+        assert_eq!(set.channel_unfit, 0);
+    }
+
+    #[test]
+    fn the_terminal_id_keeps_every_derived_channel_unique() {
+        // The uniqueness claim the rule rests on: ids are unique per instance (validated at config
+        // load for the explicit half, suffixed `-2`/`-3` for the derived half), and the id is the
+        // terminal segment — so dropping ANY amount of path cannot collide two channels.
+        let m = deep_model();
+        for tokens in 1..=4 {
+            let mut s = sel(json!({ "mode": "all" }));
+            s.channel_budget = budget(tokens, 256);
+            let set = served_set(&[], Some(&s), Some(&m));
+            let channels: BTreeSet<&str> =
+                set.signals.iter().filter_map(|x| x.signal.channel.as_deref()).collect();
+            assert_eq!(channels.len(), set.signals.len(), "tokens={tokens}: channels collided");
+            let ids: BTreeSet<&str> = set.signals.iter().map(|x| x.signal.id.as_str()).collect();
+            assert_eq!(ids.len(), set.signals.len(), "ids are unique per instance");
+            for x in &set.signals {
+                let channel = x.signal.channel.as_deref().unwrap();
+                assert_eq!(channel.rsplit('/').next(), Some(x.signal.id.as_str()));
+            }
+        }
+
+        // Even the pathological floor keeps them apart: at k = 0 every channel IS its id.
+        let mut s = sel(json!({ "mode": "all" }));
+        s.channel_budget = budget(1, 256);
+        let set = served_set(&[], Some(&s), Some(&m));
+        let channels: BTreeSet<&str> =
+            set.signals.iter().filter_map(|x| x.signal.channel.as_deref()).collect();
+        assert_eq!(channels.len(), set.signals.len());
+    }
+
+    #[test]
+    fn a_pathological_budget_is_counted_not_hidden() {
+        let m = deep_model();
+        let mut s = sel(json!({ "mode": "all" }));
+        s.channel_budget = budget(0, 0);
+        let set = served_set(&[], Some(&s), Some(&m));
+        assert_eq!(set.channel_unfit, set.signals.len(), "every signal reports the floor");
+        // The channel is still the id, so the library's own validation is what refuses it.
+        assert_eq!(find(&set, "stock").signal.channel.as_deref(), Some("stock"));
+    }
+
+    #[test]
+    fn an_explicit_channel_is_never_reshaped_but_an_omitted_one_is() {
+        let m = deep_model();
+        let mut s = sel(json!({ "mode": "all" }));
+        s.channel_budget = budget(3, 256);
+
+        // A hand-set channel is the operator's statement: it is taken verbatim, however deep —
+        // the library refuses it loudly on publish if it does not fit, which is the point.
+        let pinned: SignalConfig = serde_json::from_value(json!({
+            "id": "raw-stock", "dataItemId": "stock",
+            "channel": "a/deliberately/deep/hand/written/path"
+        }))
+        .unwrap();
+        let set = served_set(&[pinned], Some(&s), Some(&m));
+        assert_eq!(
+            find(&set, "raw-stock").signal.channel.as_deref(),
+            Some("a/deliberately/deep/hand/written/path")
+        );
+        assert_eq!(set.channel_truncated, 2, "the derived half is still shaped");
+
+        // An explicit entry that omits `channel` takes the derived one, shaped to the same budget.
+        let set = served_set(&[explicit("raw-stock", "stock")], Some(&s), Some(&m));
+        assert_eq!(
+            find(&set, "raw-stock").signal.channel.as_deref(),
+            Some("materials-materials/stock-stock/raw-stock"),
+            "the shaped channel carries the EXPLICIT id"
+        );
+    }
+
+    #[test]
+    fn shaping_a_channel_changes_nothing_else_about_the_served_signal() {
+        // Provenance, ids, names, bindings and publish policies are untouched by the budget: only
+        // the channel is shaped, and the full path stays in the model behind `sb/browse`.
+        let m = deep_model();
+        let wide = {
+            let mut s = sel(json!({ "mode": "all" }));
+            s.channel_budget = budget(9, 256);
+            served_set(&[], Some(&s), Some(&m))
+        };
+        let narrow = {
+            let mut s = sel(json!({ "mode": "all" }));
+            s.channel_budget = budget(2, 60);
+            served_set(&[], Some(&s), Some(&m))
+        };
+        assert_eq!(wide.signals.len(), narrow.signals.len());
+        for (w, n) in wide.signals.iter().zip(&narrow.signals) {
+            assert_eq!(w.provenance, n.provenance);
+            assert_eq!(w.signal.id, n.signal.id);
+            assert_eq!(w.signal.name, n.signal.name);
+            assert_eq!(w.signal.data_item_id, n.signal.data_item_id);
+            assert_eq!(w.signal.condition_binding, n.signal.condition_binding);
+            assert_eq!(w.signal.publish, n.signal.publish);
+        }
+        assert_eq!(wide.derived_matched, narrow.derived_matched);
+        assert_eq!(wide.channel_truncated, 0);
+
+        // The untruncated component path is still what the model serves as `signal.address`.
+        let address = m.address_of("line-a-agent", "stock").expect("an address");
+        assert_eq!(address["componentPath"], json!(MAZAK_STOCK_PATH), "nothing is lost");
     }
 
     // --- precedence ----------------------------------------------------------------------------

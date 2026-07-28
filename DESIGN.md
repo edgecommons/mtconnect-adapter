@@ -145,6 +145,43 @@ Local decisions, recorded so later sessions do not re-litigate them:
   carry a per-instance publication fact. `defaults.publishMode` resolves at compile exactly like
   `defaults.batchMs` (L10) and scopes to derived SAMPLE signals only — explicit signals declare
   their own `publish` block, and an absent block outside a selection stays the immediate default.
+- **D-MtconnectAdapter-L12 (depth-aware channel derivation).** A derived channel is the **last k**
+  UNS-sanitized component-path segments plus the signal id, where `k` is the largest value that
+  fits the instance's real UNS topic budget. This supersedes L10's "the whole component path, then
+  the id": MTConnect component paths go deeper than a UNS topic can carry — the demo Mazak's
+  `stock` sits on `Resources[resources]/Materials[materials]/Stock[stock]`, four channel tokens
+  where an instance-scoped topic has room for three — so under `mode: "all"` the library refused
+  that topic with `DEPTH_EXCEEDED` and the signal never published at all. Decided here:
+  - **The budget is resolved, not assumed.** `app::channel_budget_of` mints a probe topic through
+    the library's own `Uns` builder and measures what the prefix did not spend, so the token and
+    byte limits (`Uns::MAX_TOPIC_SLASHES` = 7 separators, `Uns::MAX_TOPIC_UTF8_BYTES` = 256) are
+    never copied into this repository. It is **per instance** and includes the device, component
+    and instance token lengths, so a verbose identity buys no extra channel — it costs one.
+    `ChannelBudgets` resolves once at startup (identity is fixed for the process, and adding an
+    instance is `RESTART_REQUIRED` — L5) and both `compile_mtconnect` and `SignalRegistry::new`
+    stamp it, so the startup compile and every reload derive identical channels.
+  - **Root-side segments drop first**, because the leaf-most ones are the informative ones
+    (`Materials[materials]/Stock[stock]` says what the signal is; `Resources[resources]` above it
+    barely narrows anything). `k` is computed per signal against both limits at once — a longer
+    path or a longer id simply keeps fewer segments.
+  - **The id is terminal and never dropped.** That is what makes truncation safe: signal ids are
+    unique per instance (`validate_bindings` enforces it for the explicit half, the `-2`/`-3`
+    suffix chain for the derived half), so however much path is dropped, two derived channels
+    cannot collide. No additional suffix rule is needed and none is added.
+  - **Nothing is lost.** The full, untruncated component path stays in the `ProbeModel` and is
+    served as `signal.address.componentPath` on `sb/signals` and on `sb/browse`. Only the topic is
+    shaped.
+  - **Ordinary truncation is not an event.** It is normal derivation on a deep machine: counted in
+    `ServedSet::channel_truncated` and logged once per recompile at DEBUG. The **only** warning is
+    the pathological floor — `k = 0` (the id alone) still does not fit, i.e. the instance's own
+    identity has consumed the topic — which raises the existing `MtconnectSignalSetEvent` with
+    `reason: "channelBudget"`, once per distinct count. The channel stays the bare id in that case,
+    so the library's own validation is what refuses it, loudly, on publish.
+  - **A hand-set `channel` is untouched**, however deep: it is the operator's statement and already
+    fails loudly if it does not fit. An explicit entry that *omits* `channel` takes the derived one
+    and is shaped like any other.
+  - The budget is hashed into the signal-set generation (L9), because it changes what every derived
+    channel is and therefore what a browse cursor was minted against.
 
 ## Module layout
 

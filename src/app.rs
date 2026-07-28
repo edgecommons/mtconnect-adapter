@@ -30,11 +30,13 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use edgecommons::prelude::*;
+use edgecommons::uns::{Uns, UnsClass};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::oneshot;
 
 use crate::device::{BrowseError, BrowsePage, ConnectionConfig, Reading};
+use crate::mtconnect::selection::ChannelBudget;
 
 
 /// One device == one entry of `component.instances[]`.
@@ -72,7 +74,8 @@ pub struct DeviceConfig {
 /// The endpoint is **derived, never configured** (HLD §5.1): an instance names an agent and a
 /// device uuid, and `mtconnect://<host>[:<port>]/<uuid>` follows from them, so the two can never
 /// disagree. `defaults` carries `component.global.defaults.batchMs` and `.publishMode` — the
-/// coalescing window and publish mode a selection-derived SAMPLE signal publishes with.
+/// coalescing window and publish mode a selection-derived SAMPLE signal publishes with; `budgets`
+/// carries each instance's resolved UNS channel budget, which shapes its derived channels.
 ///
 /// # Errors
 /// [`MtcError::Config`] naming the offending instance when a binding is missing, an agent is
@@ -82,6 +85,7 @@ pub fn compile_mtconnect(
     devices: &mut [DeviceConfig],
     agents: &[crate::mtconnect::config::AgentConfig],
     defaults: PublishDefaults,
+    budgets: &ChannelBudgets,
 ) -> std::result::Result<Vec<crate::mtconnect::config::DeviceConfig>, crate::mtconnect::MtcError>
 {
     use crate::mtconnect::MtcError;
@@ -116,6 +120,7 @@ pub fn compile_mtconnect(
         let selection = device.selection.clone().map(|mut s| {
             s.default_batch_ms = defaults.batch_ms;
             s.default_publish_mode = defaults.publish_mode;
+            s.channel_budget = budgets.get(&device.id);
             s
         });
         compiled.push(crate::mtconnect::config::DeviceConfig {
@@ -128,6 +133,86 @@ pub fn compile_mtconnect(
     }
     crate::mtconnect::config::validate_bindings(agents, &compiled)?;
     Ok(compiled)
+}
+
+// =================================================================================================
+// The UNS channel budget
+// =================================================================================================
+
+/// Every instance's resolved [`ChannelBudget`] — how much of its UNS data topic is left for a
+/// channel once its own identity is spent.
+///
+/// Resolved once, at startup, from the live identity: a longer device, component or instance token
+/// leaves fewer bytes, so the budget cannot be gamed by naming an instance
+/// `line-3-cell-b-spindle-controller`. Adding or removing an instance is `RESTART_REQUIRED`
+/// (D-MtconnectAdapter-L5) and the identity is fixed for the process, so these values are stable
+/// for the lifetime of the component — a reload restamps the same map onto the recompiled
+/// selections.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelBudgets(std::collections::HashMap<String, ChannelBudget>);
+
+impl ChannelBudgets {
+    /// One instance's budget, or the conservative [`ChannelBudget::default`] for an instance that
+    /// was never resolved (configuration-shape validation, tests).
+    #[must_use]
+    pub fn get(&self, instance_id: &str) -> ChannelBudget {
+        self.0.get(instance_id).copied().unwrap_or_default()
+    }
+
+    /// Record one instance's budget.
+    pub fn insert(&mut self, instance_id: impl Into<String>, budget: ChannelBudget) {
+        self.0.insert(instance_id.into(), budget);
+    }
+
+    /// Resolve the budget of every named instance against the component's live identity.
+    #[must_use]
+    pub fn resolve<'a>(gg: &EdgeCommons, instance_ids: impl Iterator<Item = &'a str>) -> Self {
+        let mut out = Self::default();
+        for id in instance_ids {
+            let budget = match gg.instance(id) {
+                Ok(instance) => channel_budget_of(instance.uns()),
+                // An instance id that is not a legal UNS token cannot mint a topic at all; the
+                // floor budget makes that visible on the first derivation instead of hiding it.
+                Err(e) => {
+                    tracing::warn!(instance = %id, error = %e, "cannot resolve the UNS channel budget");
+                    ChannelBudget { max_tokens: 0, max_bytes: 0 }
+                }
+            };
+            tracing::debug!(
+                instance = %id, tokens = budget.max_tokens, bytes = budget.max_bytes,
+                "resolved the UNS channel budget"
+            );
+            out.insert(id, budget);
+        }
+        out
+    }
+}
+
+/// The room one instance's `data` topic leaves for a channel, measured against the library's own
+/// topic builder rather than a copy of its rules: mint a topic with a one-token probe channel, and
+/// what the prefix did not spend is the budget.
+///
+/// The 8-level (7-separator) IoT Core depth limit and the 256-byte publish limit are
+/// [`Uns::MAX_TOPIC_SLASHES`] and [`Uns::MAX_TOPIC_UTF8_BYTES`]; a rootless, instance-scoped data
+/// topic spends four separators on `ecv1/{device}/{component}/{instance}/data`, leaving three
+/// channel tokens — two when `topic.includeRoot` adds a site level.
+#[must_use]
+pub fn channel_budget_of(uns: &Uns) -> ChannelBudget {
+    /// A one-token probe channel: the shortest legal UNS token.
+    const PROBE: &str = "x";
+
+    let Ok(topic) = uns.topic_with_channel(UnsClass::Data, PROBE) else {
+        // Not even a one-token channel is publishable: the identity itself has consumed the
+        // topic. Nothing derives — every signal reports the pathological floor.
+        return ChannelBudget { max_tokens: 0, max_bytes: 0 };
+    };
+    // `topic` is `<prefix>/x`, so the prefix (`ecv1/…/data`) is what this instance spends.
+    let prefix_len = topic.len().saturating_sub(PROBE.len() + 1);
+    let prefix_slashes = topic[..prefix_len].matches('/').count();
+    ChannelBudget {
+        max_tokens: Uns::MAX_TOPIC_SLASHES.saturating_sub(prefix_slashes),
+        max_bytes: Uns::MAX_TOPIC_UTF8_BYTES.saturating_sub(prefix_len + 1),
+    }
 }
 
 /// The publish defaults of `component.global.defaults` that selection-derived SAMPLE signals
@@ -462,6 +547,109 @@ pub enum DeviceControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the UNS channel budget -----------------------------------------------------------------
+
+    /// A `Uns` bound to an identity, exactly as the library builds one for an instance.
+    fn uns(device: &str, component: &str, instance: Option<&str>, rooted: bool) -> Uns {
+        use edgecommons::messaging::message::{HierEntry, MessageIdentity};
+        let hier = if rooted {
+            vec![
+                HierEntry { level: "site".into(), value: "plant1".into() },
+                HierEntry { level: "device".into(), value: device.into() },
+            ]
+        } else {
+            vec![HierEntry { level: "device".into(), value: device.into() }]
+        };
+        let identity =
+            MessageIdentity::new(hier, component, instance.map(str::to_string)).unwrap();
+        Uns::new(identity, rooted)
+    }
+
+    #[test]
+    fn the_channel_budget_is_what_the_identity_did_not_spend() {
+        // The ordinary adapter shape: `ecv1/{device}/{component}/{instance}/data/…`. Four of the
+        // seven separators are spent, so three channel tokens remain.
+        let u = uns("gw-01", "mtconnect-adapter", Some("cnc-1"), false);
+        let b = channel_budget_of(&u);
+        assert_eq!(b.max_tokens, 3);
+        let prefix = "ecv1/gw-01/mtconnect-adapter/cnc-1/data/";
+        assert_eq!(b.max_bytes, Uns::MAX_TOPIC_UTF8_BYTES - prefix.len());
+
+        // The budget is not a copy of the rules — it agrees with the builder itself, at the edge.
+        assert!(u.topic_with_channel(UnsClass::Data, "a/b/c").is_ok());
+        assert!(u.topic_with_channel(UnsClass::Data, "a/b/c/d").is_err(), "one token over");
+        assert!(u.topic_with_channel(UnsClass::Data, &"x".repeat(b.max_bytes)).is_ok());
+        assert!(
+            u.topic_with_channel(UnsClass::Data, &"x".repeat(b.max_bytes + 1)).is_err(),
+            "one byte over"
+        );
+    }
+
+    #[test]
+    fn the_mazak_stock_path_is_exactly_one_token_over_the_budget() {
+        // The regression this rule exists for, pinned as a fact rather than a memory: the live
+        // demo Mazak's `Resources[resources]/Materials[materials]/Stock[stock]` plus its id is
+        // four channel tokens, and the library refuses that topic. Dropping the root-side segment
+        // is what makes the signal publishable at all.
+        let u = uns("gw-01", "MtconnectAdapter", Some("cnc-1"), false);
+        let untruncated = "resources-resources/materials-materials/stock-stock/stock";
+        assert!(
+            u.topic_with_channel(UnsClass::Data, untruncated).is_err(),
+            "the whole path is unpublishable - this is the bug"
+        );
+        let leaf_preserving = "materials-materials/stock-stock/stock";
+        assert_eq!(
+            u.topic_with_channel(UnsClass::Data, leaf_preserving).unwrap(),
+            "ecv1/gw-01/MtconnectAdapter/cnc-1/data/materials-materials/stock-stock/stock"
+        );
+
+        // ... and it is what the derivation rule produces from this instance's own budget.
+        let derived = crate::mtconnect::selection::derive_channel(
+            "Resources[resources]/Materials[materials]/Stock[stock]",
+            "stock",
+            channel_budget_of(&u),
+        );
+        assert_eq!(derived.channel, leaf_preserving);
+        assert_eq!(derived.dropped, 1);
+        assert!(derived.fits);
+    }
+
+    #[test]
+    fn a_longer_identity_leaves_a_smaller_budget() {
+        let short = channel_budget_of(&uns("gw", "mtc", Some("a"), false));
+        let long = channel_budget_of(&uns(
+            "packaging-line-3-edge-gateway",
+            "mtconnect-adapter",
+            Some("okuma-genos-vertical-machining-center-1"),
+            false,
+        ));
+        // The token budget is a property of the grammar; the BYTE budget is what a long identity
+        // spends, so a derived channel cannot be bought with a verbose instance name.
+        assert_eq!(short.max_tokens, long.max_tokens);
+        assert!(long.max_bytes < short.max_bytes - 60, "{} vs {}", long.max_bytes, short.max_bytes);
+
+        // A rooted (site) topic spends one more level: two channel tokens, not three.
+        assert_eq!(channel_budget_of(&uns("gw", "mtc", Some("a"), true)).max_tokens, 2);
+    }
+
+    #[test]
+    fn an_unpublishable_identity_reports_the_floor_budget() {
+        // A device token long enough that not even a one-token channel fits: the budget says so
+        // rather than pretending there is room.
+        let u = uns(&"d".repeat(240), "mtconnect-adapter", Some("cnc-1"), false);
+        assert!(u.topic_with_channel(UnsClass::Data, "x").is_err());
+        assert_eq!(channel_budget_of(&u), ChannelBudget { max_tokens: 0, max_bytes: 0 });
+    }
+
+    #[test]
+    fn budgets_default_for_an_instance_that_was_never_resolved() {
+        let mut budgets = ChannelBudgets::default();
+        assert_eq!(budgets.get("cnc-1"), ChannelBudget::default());
+        budgets.insert("cnc-1", ChannelBudget { max_tokens: 2, max_bytes: 40 });
+        assert_eq!(budgets.get("cnc-1"), ChannelBudget { max_tokens: 2, max_bytes: 40 });
+        assert_eq!(budgets.get("cnc-2"), ChannelBudget::default(), "unknown ids fall back");
+    }
 
     #[test]
     fn a_device_parses_from_its_instance_config() {

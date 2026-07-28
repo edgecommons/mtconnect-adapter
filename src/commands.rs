@@ -2370,7 +2370,7 @@ mod tests {
             device_uuid: DEVICE_UUID.into(),
             signals: mtc_signals(),
             selection: None,
-        }]);
+        }], crate::app::ChannelBudgets::default());
         let view =
             ProtocolView::of(&cfg, &agents, &registry).expect("an mtconnect device gets a view");
         assert_eq!(view.agent_id, "line-a-agent");

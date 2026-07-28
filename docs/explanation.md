@@ -124,6 +124,34 @@ item disappears publishes a permanent BAD `MTC_NO_SUCH_DATAITEM`, because a conf
 that can no longer be kept must be *visible*, not absent. Use the derived set for breadth, and
 explicit entries for the identities that matter.
 
+### A machine model is deeper than a topic
+
+An MTConnect device model is a tree with no practical depth limit — a coolant sensor can sit five
+or six components below the device — while a UNS topic is a flat address with a hard ceiling: eight
+levels and 256 bytes, of which `ecv1/{device}/{component}/{instance}/data/` has already spent five
+levels. Mapping one onto the other is not a formatting detail; it is where an unbounded structure
+meets a bounded one, and something has to give.
+
+What gives is the **root** of the path, never the leaf and never the id. A derived channel is the
+last few component-path segments plus the signal id, taking as many segments as the topic has room
+for. `Resources[resources]/Materials[materials]/Stock[stock]` becomes
+`materials-materials/stock-stock/stock`: the segments that survive are the ones that say what the
+signal *is*, and the one that drops is the container that barely narrowed anything. The room is
+measured against the instance's real identity, so a long device or instance name costs channel
+depth rather than quietly breaking the topic.
+
+Two properties make this safe to rely on. The signal id is always the terminal segment, and signal
+ids are unique within an instance — so however much path is dropped, two signals can never land on
+the same channel. And the machine's full component path is not discarded: it stays in the probe
+model and is served as `signal.address.componentPath` on `sb/signals` and on every browse entry. A
+consumer that needs the exact position in the machine tree asks the address; the topic is an
+address on the bus, not a copy of the machine.
+
+The alternative — publishing the whole path and letting the topic be refused — is what the ceiling
+does on its own, and it is the worst outcome: the signal simply never appears, which is
+indistinguishable from a machine that has nothing to say. Shortening a channel is visible in the
+topic; silence is not.
+
 ## Quality is structural, not adapter discipline
 
 Every `Reading` carries a `quality` normalized to `GOOD | BAD | UNCERTAIN`, plus the protocol's

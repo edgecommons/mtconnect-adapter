@@ -688,13 +688,15 @@ pub struct MtcBackend {
 }
 
 impl MtcBackend {
-    /// Wire the configured agents to the configured devices.
+    /// Wire the configured agents to the configured devices. `budgets` carries each instance's
+    /// resolved UNS channel budget, so a reload derives channels exactly as startup did.
     #[must_use]
     pub fn new(
         agents: HashMap<String, Arc<AgentRuntime>>,
         devices: Vec<MtcDeviceConfig>,
+        budgets: crate::app::ChannelBudgets,
     ) -> Self {
-        let signals = Arc::new(SignalRegistry::new(&devices));
+        let signals = Arc::new(SignalRegistry::new(&devices, budgets));
         let devices = devices
             .into_iter()
             .map(|d| (binding_key(&d.agent_id, &d.device_uuid), d))
@@ -873,6 +875,9 @@ pub struct MtcSession {
     /// The last reported `(matched, truncated)` pair, so a still-truncated recompile does not
     /// repeat its warning.
     last_truncation: Option<(usize, usize)>,
+    /// The last reported count of signals that do not fit the UNS topic budget even as their bare
+    /// id, so an unchanged pathological set does not repeat its warning either.
+    last_channel_unfit: Option<usize>,
     /// **Explicit** signals whose `dataItemId` the model does not have: reported BAD every cycle,
     /// never silently dropped. (A derived signal cannot be unbound — it came from the model.)
     unbound: Vec<String>,
@@ -905,6 +910,7 @@ impl MtcSession {
             served: Vec::new(),
             prev_derived: None,
             last_truncation: None,
+            last_channel_unfit: None,
             unbound: Vec::new(),
             notices: Vec::new(),
             last_condition_event: HashMap::new(),
@@ -1135,6 +1141,43 @@ impl MtcSession {
             self.last_truncation = Some(state);
         } else {
             self.last_truncation = None;
+        }
+
+        // Depth-aware channel derivation. Dropping root-side path segments to fit the UNS topic
+        // budget is ORDINARY derivation on a deep machine — the full path is still served as
+        // `signal.address.componentPath` — so it is a debug line, not an event. A signal that
+        // cannot fit even as its bare id is a different story: it will not publish at all.
+        if set.channel_truncated > 0 {
+            tracing::debug!(
+                instance = %self.device.id, signals = set.channel_truncated,
+                "derived channels shortened to the UNS topic budget (leaf-most path segments kept)"
+            );
+        }
+        if set.channel_unfit > 0 {
+            if self.last_channel_unfit != Some(set.channel_unfit) {
+                tracing::warn!(
+                    instance = %self.device.id, signals = set.channel_unfit,
+                    "derived signals cannot fit the UNS topic budget even as their id alone; they will not publish"
+                );
+                self.notices.push(Notice {
+                    event_type: EVENT_SIGNAL_SET,
+                    level: NoticeLevel::Warning,
+                    message: format!(
+                        "{} derived signal(s) do not fit this instance's UNS topic budget even as \
+                         their id alone - shorten the device, component or instance identity",
+                        set.channel_unfit
+                    ),
+                    context: json!({
+                        "instance": self.device.id,
+                        "deviceUuid": self.device.device_uuid,
+                        "reason": "channelBudget",
+                        "unfit": set.channel_unfit,
+                    }),
+                });
+            }
+            self.last_channel_unfit = Some(set.channel_unfit);
+        } else {
+            self.last_channel_unfit = None;
         }
 
         self.served = set.signals;
@@ -1527,6 +1570,7 @@ fn severity_of(q: Quality) -> u8 {
 #[cfg(test)]
 mod mtconnect_seam_tests {
     use super::*;
+    use crate::app::ChannelBudgets;
     use crate::mtconnect::config::{parse_agents, AgentCredentials};
     use crate::mtconnect::model::Category;
     use crate::mtconnect::xml::{parse_devices, parse_streams};
@@ -1960,7 +2004,7 @@ mod mtconnect_seam_tests {
 
     #[tokio::test]
     async fn a_missing_binding_is_a_permanent_configuration_failure() {
-        let backend = MtcBackend::new(HashMap::new(), vec![device(vec![])]);
+        let backend = MtcBackend::new(HashMap::new(), vec![device(vec![])], ChannelBudgets::default());
         // An instance whose connection names nothing.
         let mut bare = connection("line-a-agent", "OKUMA.123456");
         bare.extra.remove("agentId");
@@ -1989,6 +2033,7 @@ mod mtconnect_seam_tests {
                 SignalConfig { name: Some("X position".into()), ..signal("x-position", "Xabs") },
                 signal("x-load", "Xload"),
             ])],
+            ChannelBudgets::default(),
         );
         let inv = backend.inventory(&connection("line-a-agent", "OKUMA.123456"));
         assert_eq!(inv.len(), 2);

@@ -37,7 +37,7 @@ use arc_swap::ArcSwap;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::app::DeviceConfig;
+use crate::app::{ChannelBudgets, DeviceConfig};
 use crate::mtconnect::config::{DeviceConfig as MtcDeviceConfig, SignalConfig};
 use crate::mtconnect::SelectionConfig;
 
@@ -116,11 +116,25 @@ pub fn classify(candidate: &Value, current: Option<&Value>) -> Verdict {
 }
 
 /// Compile a raw configuration's MTConnect instances against its agents — the same semantic
-/// validation startup performs, without touching anything.
+/// validation startup performs, without touching anything. Validity does not depend on the UNS
+/// channel budget (a deep path shapes its channel, it never fails to compile), so the pre-commit
+/// verdict compiles against the default budget; [`SignalRegistry::apply`] uses the resolved one.
 ///
 /// # Errors
 /// A message naming the offending instance or agent.
 pub fn compile(config: &Value) -> Result<Vec<MtcDeviceConfig>, String> {
+    compile_with(config, &ChannelBudgets::default())
+}
+
+/// [`compile`] against a resolved set of per-instance UNS channel budgets — what a live reload
+/// recompiles with, so a swapped-in signal set derives the same channels startup did.
+///
+/// # Errors
+/// A message naming the offending instance or agent.
+pub fn compile_with(
+    config: &Value,
+    budgets: &ChannelBudgets,
+) -> Result<Vec<MtcDeviceConfig>, String> {
     let mut devices: Vec<DeviceConfig> = Vec::new();
     for raw in instances_of(config) {
         let id = raw.get("id").and_then(Value::as_str).unwrap_or("<unnamed>").to_string();
@@ -131,15 +145,21 @@ pub fn compile(config: &Value) -> Result<Vec<MtcDeviceConfig>, String> {
     let needs_agents = devices.iter().any(|d| d.adapter == crate::device::KIND);
     if !needs_agents {
         // Still refuse a `sim` instance carrying a `selection` — there is no probe behind it.
-        crate::app::compile_mtconnect(&mut devices, &[], crate::app::PublishDefaults::default())
-            .map_err(|e| e.to_string())?;
+        crate::app::compile_mtconnect(
+            &mut devices,
+            &[],
+            crate::app::PublishDefaults::default(),
+            budgets,
+        )
+        .map_err(|e| e.to_string())?;
         return Ok(Vec::new());
     }
     let global = agent_host(config);
     let agents =
         crate::mtconnect::config::parse_agents(&global).map_err(|e| e.to_string())?;
     let defaults = crate::app::publish_defaults_of(&global);
-    crate::app::compile_mtconnect(&mut devices, &agents, defaults).map_err(|e| e.to_string())
+    crate::app::compile_mtconnect(&mut devices, &agents, defaults, budgets)
+        .map_err(|e| e.to_string())
 }
 
 /// `parse_agents` reads `component.global`; hand it exactly that subtree.
@@ -243,6 +263,10 @@ pub fn generation_of(signals: &[SignalConfig], selection: Option<&SelectionConfi
         hasher.update([u8::from(sel.auto_condition_binding)]);
         hasher.update(sel.default_batch_ms.to_le_bytes());
         hasher.update(format!("{:?}", sel.default_publish_mode).as_bytes());
+        // The channel budget shapes every derived channel, so it belongs in the generation the
+        // browse `viewGeneration` is built from.
+        hasher.update(sel.channel_budget.max_tokens.to_le_bytes());
+        hasher.update(sel.channel_budget.max_bytes.to_le_bytes());
     }
     let digest = hasher.finalize();
     digest[..8].iter().fold(String::with_capacity(16), |mut acc, b| {
@@ -286,23 +310,30 @@ impl SignalSlot {
 #[derive(Debug, Default)]
 pub struct SignalRegistry {
     slots: HashMap<String, Arc<SignalSlot>>,
+    /// The UNS channel budgets resolved at startup — identity-derived, so a live reload cannot
+    /// change them and every recompile shapes channels exactly as the first compile did.
+    budgets: ChannelBudgets,
 }
 
 impl SignalRegistry {
-    /// Build the registry for the configured devices.
+    /// Build the registry for the configured devices, holding on to the per-instance UNS channel
+    /// budgets so a reload recompiles against the same identity startup did.
     #[must_use]
-    pub fn new(devices: &[MtcDeviceConfig]) -> Self {
-        Self {
-            slots: devices
-                .iter()
-                .map(|d| {
-                    (
-                        d.id.clone(),
-                        Arc::new(SignalSlot::new(d.signals.clone(), d.selection.clone())),
-                    )
-                })
-                .collect(),
-        }
+    pub fn new(devices: &[MtcDeviceConfig], budgets: ChannelBudgets) -> Self {
+        let slots = devices
+            .iter()
+            .map(|d| {
+                // The budget map is the single authority: restamping here means a slot's
+                // selection carries the same budget whether it came from the startup compile or
+                // from a reload, so the two can never derive different channels.
+                let selection = d.selection.clone().map(|mut s| {
+                    s.channel_budget = budgets.get(&d.id);
+                    s
+                });
+                (d.id.clone(), Arc::new(SignalSlot::new(d.signals.clone(), selection)))
+            })
+            .collect();
+        Self { slots, budgets }
     }
 
     /// One instance's slot.
@@ -320,7 +351,7 @@ impl SignalRegistry {
     /// # Errors
     /// A message naming the offending instance, when the candidate does not compile.
     pub fn apply(&self, config: &Value) -> Result<Vec<String>, String> {
-        let compiled = compile(config)?;
+        let compiled = compile_with(config, &self.budgets)?;
         let mut staged: Vec<(Arc<SignalSlot>, Arc<InstanceSignals>, String)> = Vec::new();
         for device in compiled {
             let Some(slot) = self.slots.get(&device.id) else {
@@ -541,6 +572,33 @@ mod tests {
         let unbound =
             generation_of(&[], sel(json!({ "mode": "all", "autoConditionBinding": false })).as_ref());
         assert_ne!(all, unbound);
+
+        // The channel budget shapes every derived channel, so it moves the generation too - a
+        // browse cursor minted against one set of channels must not page through another.
+        let mut squeezed = sel(json!({ "mode": "all" })).unwrap();
+        squeezed.channel_budget =
+            crate::mtconnect::ChannelBudget { max_tokens: 1, max_bytes: 32 };
+        assert_ne!(all, generation_of(&[], Some(&squeezed)));
+    }
+
+    #[test]
+    fn the_registry_stamps_its_budgets_onto_every_slot() {
+        // The budget map is the single authority: a slot's selection carries the resolved budget
+        // whether the device came from the startup compile or from a reload.
+        let devices = vec![MtcDeviceConfig {
+            id: "cnc-1".into(),
+            agent_id: "line-a-agent".into(),
+            device_uuid: "OKUMA.123456".into(),
+            signals: Vec::new(),
+            selection: Some(serde_json::from_value(json!({ "mode": "all" })).unwrap()),
+        }];
+        let mut budgets = ChannelBudgets::default();
+        let tight = crate::mtconnect::ChannelBudget { max_tokens: 2, max_bytes: 48 };
+        budgets.insert("cnc-1", tight);
+
+        let registry = SignalRegistry::new(&devices, budgets);
+        let live = registry.slot("cnc-1").expect("a slot").load();
+        assert_eq!(live.selection.as_ref().unwrap().channel_budget, tight);
     }
 
     #[test]
@@ -557,7 +615,7 @@ mod tests {
 
         // ... and the swap installs the new selection as one unit with the signals.
         let devices = compile(&current).unwrap();
-        let registry = SignalRegistry::new(&devices);
+        let registry = SignalRegistry::new(&devices, ChannelBudgets::default());
         let before = registry.slot("cnc-1").unwrap().load();
         assert_eq!(before.selection.as_ref().unwrap().max_signals, 500);
 
@@ -602,7 +660,7 @@ mod tests {
     #[test]
     fn applying_a_candidate_swaps_only_what_changed_and_nothing_when_it_does_not_compile() {
         let devices = compile(&config(agents(), json!([instance(one_signal())]))).unwrap();
-        let registry = SignalRegistry::new(&devices);
+        let registry = SignalRegistry::new(&devices, ChannelBudgets::default());
         let before = registry.slot("cnc-1").unwrap().load();
         assert_eq!(before.signals.len(), 1);
 

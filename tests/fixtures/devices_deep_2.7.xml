@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A device whose component paths run DEEPER than a UNS data topic can carry, so the depth-aware
+  channel rule has something real to shape.
+
+  The `stock` item reproduces the live demo.mtconnect.org Mazak exactly:
+  `Resources[resources]/Materials[materials]/Stock[stock]` + the id `stock` is FOUR channel tokens
+  where an instance-scoped rootless topic has room for three. The rest of the tree goes deeper
+  still (five and six levels), plus one long-token path that runs out of BYTES before it runs out
+  of levels.
+-->
+<MTConnectDevices xmlns="urn:mtconnect.org:MTConnectDevices:2.7" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:mtconnect.org:MTConnectDevices:2.7 http://schemas.mtconnect.org/schemas/MTConnectDevices_2.7.xsd">
+  <Header creationTime="2026-07-27T10:00:00Z" sender="mtc-agent" instanceId="1749000000" version="2.7.0.12" bufferSize="131072" assetBufferSize="1024" assetCount="0"/>
+  <Devices>
+    <Device id="mazak" name="Mazak" uuid="Mazak" mtconnectVersion="2.7">
+      <Description manufacturer="Mazak" model="VTC" serialNumber="M-1">Deep-path machining center</Description>
+      <DataItems>
+        <DataItem category="EVENT" id="avail" name="avail" type="AVAILABILITY"/>
+      </DataItems>
+      <Components>
+        <!-- One level: fits whole. -->
+        <Controller id="ctrl" name="controller">
+          <DataItems>
+            <DataItem category="EVENT" id="estop" name="estop" type="EMERGENCY_STOP"/>
+          </DataItems>
+        </Controller>
+        <!-- Three levels: the demo Mazak's `stock`, one segment over the budget. -->
+        <Resources id="resources" name="resources">
+          <Components>
+            <Materials id="materials" name="materials">
+              <Components>
+                <Stock id="stock-c" name="stock">
+                  <DataItems>
+                    <DataItem category="EVENT" id="stock" type="MATERIAL"/>
+                    <DataItem category="CONDITION" id="stock-cond" name="stockCond" type="SYSTEM"/>
+                  </DataItems>
+                </Stock>
+              </Components>
+            </Materials>
+          </Components>
+        </Resources>
+        <!-- Five levels: three segments over the budget. -->
+        <Systems id="systems" name="systems">
+          <Components>
+            <Hydraulic id="hyd" name="hydraulic">
+              <Components>
+                <Pump id="pump" name="pump">
+                  <Components>
+                    <Motor id="motor" name="motor">
+                      <Components>
+                        <Sensor id="sensor" name="sensor">
+                          <DataItems>
+                            <DataItem category="SAMPLE" id="Ptemp" name="Ptemp" type="TEMPERATURE" units="CELSIUS"/>
+                          </DataItems>
+                        </Sensor>
+                      </Components>
+                    </Motor>
+                  </Components>
+                </Pump>
+              </Components>
+            </Hydraulic>
+          </Components>
+        </Systems>
+        <!-- Two levels, but long tokens: the BYTE budget bites before the token budget does. -->
+        <Auxiliaries id="aux" name="auxiliaryEquipmentSubsystemAssembly">
+          <Components>
+            <WorkEnvelope id="env" name="workEnvelopeConditioningCircuitAssembly">
+              <DataItems>
+                <DataItem category="SAMPLE" id="Etemp" name="Etemp" type="TEMPERATURE" units="CELSIUS"/>
+              </DataItems>
+            </WorkEnvelope>
+          </Components>
+        </Auxiliaries>
+      </Components>
+    </Device>
+  </Devices>
+</MTConnectDevices>
