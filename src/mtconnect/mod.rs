@@ -76,7 +76,8 @@ pub use config::{
 pub use error::{MtcError, ParseCounters};
 pub use model::{BrowseNode, Category, DataItemMeta, DeviceNode, NodeKind, ProbeModel, Repr};
 pub use selection::{
-    served_set, Matcher, Provenance, SelectionConfig, SelectionMode, ServedSet, ServedSignal,
+    served_set, ChannelBudget, DerivedChannel, Matcher, Provenance, SelectionConfig, SelectionMode,
+    ServedSet, ServedSignal,
 };
 pub use observations::{CondState, ObsValue, Observation};
 pub use sequence::{AcqState, HeaderOutcome, SequenceState};

@@ -156,9 +156,45 @@ For every selected data item the adapter derives:
 |-------|------------|
 | `id` | The lower-kebab sanitization of the `dataItemId` (`Xabs` → `xabs`, `SpindleSpeed` → `spindle-speed`, `t1-Tpos` → `t1-tpos`). A collision with another id gets a deterministic `-2`, `-3`, … suffix in browse-tree order, with a warning log. |
 | `name` | The probe's own `DataItem/@name`; an item with none is named by its type plus subType (`POSITION ACTUAL`). |
-| `channel` | The UNS-sanitized component path, then the id: `Axes/Linear[X]` + `xabs` → `axes/linear-x/xabs`. A device-level item publishes on its id alone. |
+| `channel` | The UNS-sanitized component path, then the id: `Axes/Linear[X]` + `xabs` → `axes/linear-x/xabs`. A device-level item publishes on its id alone. A path deeper than the UNS topic can carry keeps its leaf-most segments — see [Deep component paths](#deep-component-paths). |
 | `publish` | SAMPLE: the mode from `component.global.defaults.publishMode` with `batchMs` from `component.global.defaults.batchMs`, and **no deadband** — a units-aware default is not cleanly derivable (a millimeter on a micro-positioner and on a gantry are different facts), so none is invented; set one on an explicit entry when you want it. EVENT/CONDITION: `on-change`, immediate. |
 | `conditionBinding` | Under `autoConditionBinding` (the default), the CONDITION data items of the signal's own component; a CONDITION signal itself binds nothing. |
+
+### Deep component paths
+
+A UNS topic carries at most 8 levels and 256 UTF-8 bytes, and an instance's data topic
+(`ecv1/{device}/{component}/{instance}/data/…`) has already spent five of those levels. Machine
+tool models nest deeper than that: `Resources[resources]/Materials[materials]/Stock[stock]` plus a
+signal id is four channel tokens where three fit.
+
+A derived channel is therefore the **last few** component-path segments plus the id — as many
+segments as the topic has room for, computed per signal:
+
+| Component path | Derived channel |
+|----------------|-----------------|
+| *(device level)* | `stock` |
+| `Controller[controller]` | `controller-controller/estop` |
+| `Axes/Linear[X]` | `axes/linear-x/xabs` |
+| `Resources[resources]/Materials[materials]/Stock[stock]` | `materials-materials/stock-stock/stock` |
+| `Systems[systems]/Hydraulic[hydraulic]/Pump[pump]/Motor[motor]/Sensor[sensor]` | `motor-motor/sensor-sensor/ptemp` |
+
+The leaf-most segments are kept because they are the ones that identify the signal; segments nearer
+the device drop first. The room is measured against the instance's own identity, so a long device,
+component or instance name leaves fewer bytes for the channel.
+
+**Nothing is lost.** The full, untruncated component path is served as
+`signal.address.componentPath` on `sb/signals` and on every `sb/browse` entry — only the topic is
+shortened. Channels stay unique because the signal id is always the last segment and signal ids are
+unique within an instance.
+
+Two limits on this:
+
+- A `channel` you set by hand on an explicit `signals[]` entry is published exactly as written. If
+  it does not fit the topic, the publish fails with a `DEPTH_EXCEEDED` or `LENGTH_EXCEEDED`
+  validation error rather than being silently rewritten.
+- If an identity is long enough that not even a bare signal id fits, those signals cannot publish.
+  The adapter raises an `MtconnectSignalSetEvent` warning with `reason: "channelBudget"` naming how
+  many signals are affected; shorten the device, component or instance name.
 
 ### Precedence: explicit entries win, field by field
 

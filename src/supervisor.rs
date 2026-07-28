@@ -130,7 +130,12 @@ impl App {
         let agent_configs =
             if needs_agents { parse_agents(config.global())? } else { Vec::new() };
         let defaults = crate::app::publish_defaults_of(config.global());
-        let mtc_devices = compile_mtconnect(&mut devices, &agent_configs, defaults)?;
+        // Every instance's UNS channel budget, resolved once against the live identity: it is what
+        // shapes the derived channels of a machine whose component paths run deeper than a topic
+        // can carry. Identity is fixed for the process, so this map outlives every reload.
+        let budgets =
+            crate::app::ChannelBudgets::resolve(gg, devices.iter().map(|d| d.id.as_str()));
+        let mtc_devices = compile_mtconnect(&mut devices, &agent_configs, defaults, &budgets)?;
 
         // Vault references become values exactly once, here — the protocol client never sees a
         // reference, and never learns the credential service exists.
@@ -143,7 +148,7 @@ impl App {
             tracing::info!(agent = %id, url = %cfg.url, mode = ?cfg.streaming, "agent runtime configured");
             agents.insert(id, AgentRuntime::new(cfg, &creds)?);
         }
-        let mtconnect = Arc::new(MtcBackend::new(agents.clone(), mtc_devices));
+        let mtconnect = Arc::new(MtcBackend::new(agents.clone(), mtc_devices, budgets));
         let signals = mtconnect.signals();
         gg.add_config_change_listener(Arc::new(ConfigListener { signals: Arc::clone(&signals) }));
 

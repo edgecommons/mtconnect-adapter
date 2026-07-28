@@ -458,6 +458,7 @@ async fn selection_mode_all_derives_the_tiny_devices_signals_live() {
     let backend = MtcBackend::new(
         HashMap::from([("live-agent".to_string(), Arc::clone(&rt))]),
         vec![device],
+        mtconnect_adapter::app::ChannelBudgets::default(),
     );
     let conn: ConnectionConfig = serde_json::from_value(json!({
         "agentId": "live-agent", "deviceUuid": DEV_TINY
@@ -548,6 +549,7 @@ async fn a_batched_signal_coalesces_live_streamed_readings_into_one_update() {
     let backend = MtcBackend::new(
         HashMap::from([("live-agent".to_string(), Arc::clone(&rt))]),
         vec![device],
+        mtconnect_adapter::app::ChannelBudgets::default(),
     );
     let conn: ConnectionConfig = serde_json::from_value(json!({
         "agentId": "live-agent", "deviceUuid": DEV_TINY

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A `/current` snapshot for the deep-path device of `devices_deep_2.7.xml`. -->
+<MTConnectStreams xmlns="urn:mtconnect.org:MTConnectStreams:2.7" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:mtconnect.org:MTConnectStreams:2.7 http://schemas.mtconnect.org/schemas/MTConnectStreams_2.7.xsd">
+  <Header creationTime="2026-07-27T10:00:05Z" sender="mtc-agent" instanceId="1749000000" version="2.7.0.12" bufferSize="131072" firstSequence="1" lastSequence="10" nextSequence="11"/>
+  <Streams>
+    <DeviceStream name="Mazak" uuid="Mazak">
+      <ComponentStream component="Device" name="Mazak" componentId="mazak">
+        <Events>
+          <Availability dataItemId="avail" name="avail" sequence="1" timestamp="2026-07-27T10:00:00.100000Z">AVAILABLE</Availability>
+        </Events>
+      </ComponentStream>
+      <ComponentStream component="Controller" name="controller" componentId="ctrl">
+        <Events>
+          <EmergencyStop dataItemId="estop" name="estop" sequence="2" timestamp="2026-07-27T10:00:00.200000Z">ARMED</EmergencyStop>
+        </Events>
+      </ComponentStream>
+      <ComponentStream component="Stock" name="stock" componentId="stock-c">
+        <Events>
+          <Material dataItemId="stock" sequence="3" timestamp="2026-07-27T10:00:01.000000Z">ALUMINUM-6061</Material>
+        </Events>
+        <Condition>
+          <Normal dataItemId="stock-cond" name="stockCond" sequence="4" timestamp="2026-07-27T10:00:01.100000Z" type="SYSTEM"/>
+        </Condition>
+      </ComponentStream>
+      <ComponentStream component="Sensor" name="sensor" componentId="sensor">
+        <Samples>
+          <Temperature dataItemId="Ptemp" name="Ptemp" sequence="5" timestamp="2026-07-27T10:00:02.000000Z">41.5</Temperature>
+        </Samples>
+      </ComponentStream>
+      <ComponentStream component="WorkEnvelope" name="workEnvelopeConditioningCircuitAssembly" componentId="env">
+        <Samples>
+          <Temperature dataItemId="Etemp" name="Etemp" sequence="6" timestamp="2026-07-27T10:00:02.500000Z">22.0</Temperature>
+        </Samples>
+      </ComponentStream>
+    </DeviceStream>
+  </Streams>
+</MTConnectStreams>
