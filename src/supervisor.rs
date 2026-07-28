@@ -28,11 +28,13 @@ use crate::app::{
     DeviceConfig, DeviceControl, Health, LinkState,
 };
 use crate::device::{
-    resolve_agent_credentials, BrowseError, DeviceBackend, MtcBackend, SimBackend,
+    resolve_agent_credentials, BrowseError, DeviceBackend, DeviceSession, MtcBackend, NoticeLevel,
+    SimBackend,
 };
-use crate::metrics::DeviceMetrics;
+use crate::metrics::{AgentMetrics, AgentTelemetry, DeviceMetrics};
 use crate::mtconnect::config::parse_agents;
 use crate::mtconnect::AgentRuntime;
+use crate::reload::SignalRegistry;
 
 /// How often the periodic metrics emit runs, in the poll loop.
 const METRICS_INTERVAL: Duration = Duration::from_secs(30);
@@ -54,22 +56,50 @@ pub struct App {
     agents: HashMap<String, Arc<AgentRuntime>>,
     /// The MTConnect backend, wired to those runtimes.
     mtconnect: Arc<MtcBackend>,
+    /// Every instance's live, reloadable signal set (LLD §8).
+    signals: Arc<SignalRegistry>,
 }
 
-struct ConfigListener;
+/// Applies a committed configuration to the live runtime (LLD §8). A candidate that would need a
+/// restart — a changed `agents[]`, an added or removed instance — never reaches this listener: the
+/// pre-commit validator (`crate::reload::classify`, registered in `main.rs`) refuses it and the
+/// component keeps running on its last-good configuration.
+struct ConfigListener {
+    signals: Arc<SignalRegistry>,
+}
 
 #[async_trait::async_trait]
 impl ConfigurationChangeListener for ConfigListener {
     async fn on_configuration_change(&self, config: Arc<Config>) -> bool {
-        tracing::info!(identity = %config.identity().path(), "configuration changed");
+        let raw = serde_json::json!({
+            "component": { "global": config.global(), "instances": instances_of(&config) }
+        });
+        match self.signals.apply(&raw) {
+            Ok(changed) if changed.is_empty() => {
+                tracing::info!("configuration reloaded; no signal set changed");
+            }
+            Ok(changed) => {
+                tracing::info!(instances = ?changed, "signal sets recompiled and swapped");
+            }
+            Err(e) => {
+                // The validator already refused anything that cannot compile; if one still gets
+                // here, the live generation is untouched and saying so beats failing quietly.
+                tracing::error!(error = %e, "reloaded configuration did not compile; keeping the live signal sets");
+                return false;
+            }
+        }
         true
     }
 }
 
+/// The `component.instances[]` array of a configuration snapshot, rebuilt from the accessor pair
+/// the library exposes.
+fn instances_of(config: &Config) -> Vec<serde_json::Value> {
+    config.instance_ids().iter().filter_map(|id| config.instance(id).cloned()).collect()
+}
+
 impl App {
     pub fn new(gg: &EdgeCommons) -> anyhow::Result<Self> {
-        gg.add_config_change_listener(Arc::new(ConfigListener));
-
         let config = gg.config();
         let metrics = gg.metrics();
 
@@ -112,8 +142,10 @@ impl App {
             agents.insert(id, AgentRuntime::new(cfg, &creds)?);
         }
         let mtconnect = Arc::new(MtcBackend::new(agents.clone(), mtc_devices));
+        let signals = mtconnect.signals();
+        gg.add_config_change_listener(Arc::new(ConfigListener { signals: Arc::clone(&signals) }));
 
-        Ok(Self { config, metrics, devices, stale_signal_secs, agents, mtconnect })
+        Ok(Self { config, metrics, devices, stale_signal_secs, agents, mtconnect, signals })
     }
 
     /// The backend serving one device's `adapter`.
@@ -133,6 +165,22 @@ impl App {
         // to a running agent runtime, it does not start one.
         for agent in self.agents.values() {
             agent.spawn();
+            // One emitter per AGENT for the acquisition families (HLD §9): the stream is shared by
+            // every device on it, so it is measured once rather than once per attached instance.
+            let am = Arc::new(AgentMetrics::new(
+                Arc::clone(&self.metrics),
+                Arc::clone(&self.config),
+                Arc::clone(agent) as Arc<dyn AgentTelemetry>,
+            ));
+            am.define_all();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(METRICS_INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    am.emit_periodic().await;
+                }
+            });
         }
 
         // Each device's health, shared with its task and read by the connectivity provider.
@@ -151,6 +199,7 @@ impl App {
                 device.id.clone(),
                 Arc::clone(&health),
                 self.stale_signal_secs,
+                agent_telemetry(device, &self.agents),
             ));
             // Pre-define the metric set so it is fixed and discoverable at startup.
             dm.define_all();
@@ -173,7 +222,7 @@ impl App {
                 // `sb/browse` answer from — the shared agent runtime's `ArcSwap<AgentInfo>` and its
                 // cached probe model, read without ever waiting on acquisition. `None` for the
                 // simulator, which has no agent.
-                protocol: crate::commands::ProtocolView::of(device, &self.agents),
+                protocol: crate::commands::ProtocolView::of(device, &self.agents, &self.signals),
             });
 
             tokio::spawn(run_device(
@@ -292,6 +341,9 @@ async fn run_device(
         // The inventory ids back the resume-time snapshot (HLD §7: resume snapshots first).
         let inventory: Vec<String> =
             backend.inventory(&cfg.connection).into_iter().map(|s| s.id).collect();
+        // The session just compiled its signals against the device model: the gauge reports what is
+        // really being served, not what was merely configured.
+        sync_served_signals(session.as_ref(), &health);
         let exit =
             run_polling(&cfg, session, &data, &events, &dm, &health, &mut control, &inventory)
                 .await;
@@ -407,7 +459,9 @@ async fn run_polling(
                         // stale. A live read of the whole inventory republishes the current truth
                         // before on-change flow resumes.
                         if changed && !inventory.is_empty() {
-                            match session.read_named(inventory).await {
+                            let outcome = session.read_named(inventory).await;
+                            emit_notices(cfg, &mut session, events).await;
+                            match outcome {
                                 Ok(mut readings) => {
                                     stamp_received(&mut readings, &now_iso());
                                     publish_readings(cfg, &readings, data, dm, health).await;
@@ -429,12 +483,21 @@ async fn run_polling(
                         if health.is_paused() {
                             let _ = reply.send(Err("instance is paused - resume first".to_string()));
                         } else {
-                            match poll_once(cfg, &mut session, data, dm, health, true).await {
-                                Ok(n) => {
+                            // A forced FRESH snapshot, not a drain of what happened to arrive
+                            // (LLD §7): `polled` counts what was published, BAD results included.
+                            let result = session.snapshot_now().await;
+                            emit_notices(cfg, &mut session, events).await;
+                            match result {
+                                Ok(mut readings) => {
+                                    stamp_received(&mut readings, &now_iso());
+                                    let n =
+                                        publish_readings(cfg, &readings, data, dm, health).await;
                                     let _ = reply.send(Ok(n));
                                 }
-                                Err(()) => {
-                                    let _ = reply.send(Err("link error".to_string()));
+                                Err(e) => {
+                                    tracing::warn!(instance = %cfg.id, error = %e, "repoll failed");
+                                    health.read_errors.fetch_add(1, Ordering::Relaxed);
+                                    let _ = reply.send(Err(e.to_string()));
                                     session.close().await;
                                     return PollExit::LinkLost;
                                 }
@@ -448,7 +511,10 @@ async fn run_polling(
             // instance's stream cache stays current — HLD §7), and only PUBLICATION is gated.
             _ = ticker.tick() => {
                 let publish = !health.is_paused();
-                if poll_once(cfg, &mut session, data, dm, health, publish).await.is_err() {
+                let outcome = poll_once(cfg, &mut session, data, dm, health, publish).await;
+                emit_notices(cfg, &mut session, events).await;
+                sync_served_signals(session.as_ref(), health);
+                if outcome.is_err() {
                     session.close().await;
                     return PollExit::LinkLost;
                 }
@@ -537,6 +603,48 @@ async fn publish_readings(
     published
 }
 
+/// Drain the session's protocol notices and publish each as a UNS event through the `events()`
+/// facade — the HLD §9 event surface (`MtconnectAgentEvent`, `MtconnectDataLossEvent`,
+/// `MtconnectModelDriftEvent`, `MtconnectConditionEvent`). The *mapping* lives in `device.rs`; this
+/// only carries it to the wire.
+async fn emit_notices(
+    cfg: &DeviceConfig,
+    session: &mut Box<dyn DeviceSession>,
+    events: &EventsFacade,
+) {
+    for notice in session.take_notices() {
+        if let Err(e) = events
+            .emit(
+                severity_of(notice.level),
+                notice.event_type,
+                Some(notice.message.clone()),
+                Some(notice.context.clone()),
+            )
+            .await
+        {
+            tracing::warn!(instance = %cfg.id, event = notice.event_type, error = %e, "event emit failed");
+        }
+    }
+}
+
+/// The library severity one notice level publishes under.
+fn severity_of(level: NoticeLevel) -> Severity {
+    match level {
+        NoticeLevel::Info => Severity::Info,
+        NoticeLevel::Warning => Severity::Warning,
+        NoticeLevel::Critical => Severity::Critical,
+    }
+}
+
+/// Report what the session is actually delivering as `southbound_health.signalsSubscribed`. A
+/// backend that compiles its signals against a device model (MTConnect) knows better than the
+/// configuration does; one that does not keeps the configured inventory size.
+fn sync_served_signals(session: &dyn DeviceSession, health: &Arc<Health>) {
+    if let Some(count) = session.served_signals() {
+        health.set_signal_inventory(count);
+    }
+}
+
 /// What servicing the control channel while the session is down concluded.
 enum DownOutcome {
     /// A `reconnect` command wants us to connect *now* (cut the backoff short); settle its reply on
@@ -601,6 +709,19 @@ async fn serve_while_down(
             _ = tokio::time::sleep(remaining) => return DownOutcome::Elapsed,
         }
     }
+}
+
+/// The agent telemetry behind one device — the source of its `MtconnectParse` family. `None` for
+/// the simulator, which has no agent and parses no documents.
+fn agent_telemetry(
+    cfg: &DeviceConfig,
+    agents: &HashMap<String, Arc<AgentRuntime>>,
+) -> Option<Arc<dyn AgentTelemetry>> {
+    if cfg.adapter != crate::device::KIND {
+        return None;
+    }
+    let (agent_id, _uuid) = crate::device::connection_binding(&cfg.connection).ok()?;
+    agents.get(&agent_id).map(|a| Arc::clone(a) as Arc<dyn AgentTelemetry>)
 }
 
 /// The adapter's receive-moment stamp: ISO-8601 UTC "now", from the library's own clock (the same

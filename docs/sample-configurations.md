@@ -1,19 +1,19 @@
 # Sample Configurations
 
-*This documents the generated scaffold; rewrite it as you build the component out.*
-
-Two configurations: the shipped `test-configs/config.json` explained option-by-option, and a
-non-trivial multi-device variant. For the exhaustive option list see
+Three configurations: the shipped simulator config, the shipped real-agent config explained
+option-by-option, and a non-trivial multi-device/secured variant. For the exhaustive option list see
 [reference/configuration.md](reference/configuration.md); for message shapes see
 [reference/messaging-interface.md](reference/messaging-interface.md).
 
 The adapter loads **one JSON document** from `-c/--config`. The top level carries `component`
-(this scaffold's own config) plus the standard `edgecommons` sections: `tags`, `hierarchy`,
+(this adapter's own config) plus the standard `edgecommons` sections: `tags`, `hierarchy`,
 `identity`, `messaging`, `metricEmission`, `logging`, `heartbeat`.
 
 ---
 
-## 1. The shipped `test-configs/config.json`
+## 1. The shipped `test-configs/config.json` (simulator)
+
+The quickest way to see the adapter running with no agent at all:
 
 ```jsonc
 {
@@ -37,24 +37,7 @@ The adapter loads **one JSON document** from `-c/--config`. The top level carrie
 }
 ```
 
-**What each option does at runtime**
-
-| Option | Effect |
-|--------|--------|
-| `logging.level` / `rust_format` | Standard edgecommons log level + format string. `DEBUG` here is intentionally verbose for local dev. |
-| `hierarchy.levels` / `identity` | Places the component in the UNS enterprise tree: `identity.path = "factory-1/<thing>"`. The last hierarchy level's value is always the resolved Thing name (`-t`). |
-| `heartbeat.*` | The `state` keepalive cadence and its `cpu`/`memory` system measures — independent of device polling. |
-| `metricEmission.target: log` | Routes `southbound_health` and the two operational families to a local log file. Set `target: "messaging"` to see them on the UNS `metric` class instead. |
-| `component.global.defaults.pollIntervalMs` | Fallback read cadence for any device that does not set its own. |
-| `component.global.timeouts.*` | Connect timeout and reconnect backoff window (currently informational in the scaffold's fixed `Backoff::default()` — wire them through if you make backoff configurable). |
-| `component.global.healthThresholds.staleSignalSecs` | A signal with no update for longer than this counts toward `southbound_health.staleSignals`. |
-| `instances[].id` | The `{instance}` token of every UNS topic for this device, and the `instance` metric dimension. |
-| `instances[].adapter` | Which `DeviceBackend` serves the instance: `mtconnect` (the real client, configured in `test-configs/mtconnect.json`) or `sim` (the built-in simulator, which needs no agent). |
-| `instances[].connection.endpoint` | Opaque to the framework; the simulator only checks it is non-empty. A real protocol reads whatever else it needs from this **open** object. |
-| `instances[].pollIntervalMs` | Per-device override of the global default. |
-| `instances[].writes.allow` | Empty — read-only by default. See variant 2 for opening it up. |
-
-Run it:
+No `component.global.agents[]` here — a pure `sim` deployment needs no agent. Run it:
 
 ```bash
 cargo run -- --platform HOST --transport MQTT ./test-configs/standalone-messaging.json \
@@ -63,9 +46,76 @@ cargo run -- --platform HOST --transport MQTT ./test-configs/standalone-messagin
 
 ---
 
-## 2. A non-trivial variant: two devices, one writable
+## 2. The shipped `test-configs/mtconnect.json` (real MTConnect agent)
 
-Two devices behind one adapter process, one of them with a writable signal and a faster poll rate:
+```jsonc
+{
+  "logging": { "level": "DEBUG", "rust_format": "{timestamp} [{level}] [{component}] {target} - {message}" },
+  "hierarchy": { "levels": ["site", "device"] },
+  "identity": { "site": "factory-1" },
+  "heartbeat": { "enabled": true, "intervalSecs": 5, "measures": { "cpu": true, "memory": true }, "destination": "local" },
+  "metricEmission": { "target": "log", "namespace": "edgecommons" },
+  "tags": { "site": "factory-1" },
+  "component": {
+    "global": {
+      "agents": [
+        {
+          "id": "line-a-agent",
+          "url": "http://127.0.0.1:5000",
+          "streaming": "poll-only",
+          "pollIntervalMs": 1000,
+          "requestTimeoutMs": 10000,
+          "heartbeatMs": 10000
+        }
+      ],
+      "defaults": { "pollIntervalMs": 1000, "publishMode": "on-change", "maxDocumentBytes": 16777216 },
+      "healthThresholds": { "staleSignalSecs": 30 }
+    },
+    "instances": [
+      {
+        "id": "cnc-1",
+        "adapter": "mtconnect",
+        "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.123456" },
+        "pollIntervalMs": 1000,
+        "signals": [
+          { "id": "x-position", "name": "X axis actual position", "dataItemId": "Xabs", "conditionBinding": ["Xtravel"] },
+          { "id": "x-load", "name": "X axis load", "dataItemId": "Xload" },
+          { "id": "spindle-speed", "name": "Spindle speed", "dataItemId": "Sspeed" },
+          { "id": "execution", "name": "Execution state", "dataItemId": "execution" },
+          { "id": "x-travel-condition", "name": "X axis travel condition", "dataItemId": "Xtravel" }
+        ],
+        "writes": { "allow": [] }
+      }
+    ]
+  }
+}
+```
+
+Point `url` at whatever agent you actually have running (e.g. `http://127.0.0.1:5010` for the
+compose harness in the [tutorial](tutorial.md#7-run-it-against-a-real-mtconnect-agent)) before
+running it.
+
+**What each option does at runtime**
+
+| Option | Effect |
+|--------|--------|
+| `agents[0].id` | The stable id `connection.agentId` below references. |
+| `agents[0].url` | The agent's base URL — no userinfo, no credentials embedded; see variant 3 for `auth`/`tls`. |
+| `agents[0].streaming: "poll-only"` | This particular agent is read on a fixed cadence, never via a multipart stream — a deliberate, simple choice for this fixture. Omit the key (or set `"prefer"`) to stream instead. |
+| `agents[0].pollIntervalMs` | How often `line-a-agent`'s `/current` is read on the polling path. |
+| `agents[0].heartbeatMs` | The streaming liveness window (unused while this agent is `poll-only`, but validated regardless). |
+| `component.global.healthThresholds.staleSignalSecs` | A signal with no update for longer than this counts toward `southbound_health.staleSignals`. |
+| `instances[0].connection.agentId` / `.deviceUuid` | Which agent, and which `Device/@uuid` on it, this instance represents. The published endpoint (`mtconnect://127.0.0.1:5000/OKUMA.123456`) is **derived** from these two — never itself configured. |
+| `instances[0].pollIntervalMs` | Per-device override of the drain-and-publish cadence (independent of the agent's own `pollIntervalMs` above). |
+| `signals[].dataItemId` | The MTConnect `DataItem/@id` each signal reads. `x-position`'s value comes from `Xabs`; its quality also reflects `Xtravel`'s condition state (next row). |
+| `signals[].conditionBinding` | `x-position` degrades to `UNCERTAIN`/`BAD` whenever `Xtravel` (a CONDITION data item) reports `Warning`/`Fault` — the value is untouched. `x-travel-condition` publishes that same data item's own state directly, as its own signal — both are valid, and independent of each other. |
+| `writes.allow` | Empty, and schema-pinned to stay that way: MTConnect has no write path. |
+
+---
+
+## 3. A non-trivial variant: two devices on a secured agent, streaming
+
+Two devices behind one TLS/authenticated agent, one polling and one streaming:
 
 ```jsonc
 {
@@ -77,22 +127,36 @@ Two devices behind one adapter process, one of them with a writable signal and a
   "metricEmission": { "target": "messaging" },
   "component": {
     "global": {
-      "defaults": { "pollIntervalMs": 5000 },
+      "agents": [
+        {
+          "id": "pumphouse-agent",
+          "url": "https://agent.pumphouse.example.com",
+          "auth": { "type": "basic", "username": "svc-mtconnect", "secretRef": "pumphouse/agent-password" },
+          "tls": { "caSecretRef": "pumphouse/agent-ca-bundle" },
+          "streaming": "prefer",
+          "heartbeatMs": 10000
+        }
+      ],
       "healthThresholds": { "staleSignalSecs": 15 }
     },
     "instances": [
       {
         "id": "skid-1",
-        "adapter": "sim",
-        "connection": { "endpoint": "sim://skid-1" },
-        "pollIntervalMs": 1000,
-        "writes": { "allow": ["temperature-1"] }
+        "adapter": "mtconnect",
+        "connection": { "agentId": "pumphouse-agent", "deviceUuid": "PUMP.SKID.001" },
+        "signals": [
+          { "id": "suction-pressure", "dataItemId": "SuctionPress" },
+          { "id": "skid-fault", "dataItemId": "SkidFault" }
+        ]
       },
       {
         "id": "skid-2",
-        "adapter": "sim",
-        "connection": { "endpoint": "sim://skid-2" },
-        "writes": { "allow": [] }
+        "adapter": "mtconnect",
+        "connection": { "agentId": "pumphouse-agent", "deviceUuid": "PUMP.SKID.002" },
+        "pollIntervalMs": 2000,
+        "signals": [
+          { "id": "suction-pressure", "dataItemId": "SuctionPress", "conditionBinding": ["SkidFault"] }
+        ]
       }
     ]
   }
@@ -101,20 +165,24 @@ Two devices behind one adapter process, one of them with a writable signal and a
 
 **How this behaves differently from the shipped config**
 
-- **Two devices, two tasks.** `skid-1` and `skid-2` each get their own connect/poll loop and their
-  own entry in the `state` keepalive's `instances[]` array. One going down does not affect the
-  other.
-- **`instance` becomes required.** With only one device configured, a command body may omit
-  `instance`; with two, `sb/status`/`sb/read`/`sb/browse`/etc. **must** name one (`BAD_ARGS` if
-  missing, `NO_SUCH_INSTANCE` if the name is not configured).
-- **`skid-1` polls 5× faster** (`pollIntervalMs: 1000` overrides the `global.defaults` value of
-  `5000`), independent of `skid-2`, which inherits the default.
-- **Nothing is writable anywhere.** `sb/write` answers `WRITE_NOT_ALLOWED` for every request on
-  every instance, before any entry is inspected: MTConnect's API is read-only by specification, and
-  `writes.allow` is pinned empty by the schema.
-- **A shorter staleness window** (`staleSignalSecs: 15`) means `southbound_health.staleSignals`
-  trips sooner if a device stops updating — useful when the deployment expects tighter freshness
-  than the 30-second scaffold default.
+- **One agent, two devices, three tasks.** `pumphouse-agent`'s HTTP connection and stream/poll cycle
+  exist exactly once; `skid-1` and `skid-2` each get their own drain-and-publish task and their own
+  entry in the `state` keepalive's `instances[]` array — one going down (a bad `dataItemId`, a pause)
+  never affects the other or the shared agent connection.
+- **Credentials never appear here.** `auth.secretRef`/`tls.caSecretRef` are vault references, resolved
+  once at startup — the password and CA bundle themselves live in the credential vault, not in this
+  file, logs, or `sb/status`.
+- **`instance` becomes required.** With two devices configured, `sb/status`/`sb/read`/`sb/browse`/etc.
+  **must** name one (`BAD_ARGS` if missing, `NO_SUCH_INSTANCE` if the name is not configured).
+- **`skid-2` binds its own condition to itself, differently.** `skid-2`'s `suction-pressure` degrades
+  quality when *its own* `SkidFault` condition trips; `skid-1` publishes the same-shaped signal with
+  no such binding — each instance's `conditionBinding` is independent, even reading the same
+  `dataItemId` name across two different physical devices.
+- **`skid-2` polls slower** (`pollIntervalMs: 2000` overrides nothing since the agent has no
+  `pollIntervalMs` set at the instance level for `skid-1`, which falls back to
+  `component.global.defaults.pollIntervalMs`, `5000` by built-in default).
+- **A shorter staleness window** (`staleSignalSecs: 15`) trips `southbound_health.staleSignals` sooner
+  if a device stops updating.
 - **`metricEmission.target: "messaging"`** puts `southbound_health` and the operational families on
   the UNS `metric` class instead of a log file, so `mosquitto_sub -t 'ecv1/+/+/+/metric/#' -v` shows
   them directly.

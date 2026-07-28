@@ -52,6 +52,7 @@ pub mod model;
 pub mod multipart;
 pub mod observations;
 pub mod sequence;
+pub mod stats;
 pub mod stream;
 pub mod xml;
 
@@ -75,6 +76,7 @@ pub use error::{MtcError, ParseCounters};
 pub use model::{BrowseNode, Category, DataItemMeta, DeviceNode, NodeKind, ProbeModel, Repr};
 pub use observations::{CondState, ObsValue, Observation};
 pub use sequence::{AcqState, HeaderOutcome, SequenceState};
+pub use stats::{AgentStats, AgentStatsSnapshot};
 pub use stream::{ChunkSource, HeartbeatWatch, PartOutcome, StreamExit};
 
 /// How many events one instance may fall behind before the runtime starts counting drops.
@@ -212,6 +214,8 @@ pub struct AgentRuntime {
     info: ArcSwap<AgentInfo>,
     seq: Mutex<SequenceState>,
     parse: Mutex<ParseCounters>,
+    /// The acquisition counters the `MtconnectStream`/`MtconnectProbe` families report (HLD §9).
+    stats: AgentStats,
     ctl_tx: mpsc::Sender<AgentCtl>,
     ctl_rx: Mutex<Option<mpsc::Receiver<AgentCtl>>>,
     dropped_events: AtomicU64,
@@ -254,6 +258,7 @@ impl AgentRuntime {
             info: ArcSwap::from_pointee(info),
             seq: Mutex::new(SequenceState::new()),
             parse: Mutex::new(ParseCounters::default()),
+            stats: AgentStats::default(),
             ctl_tx,
             ctl_rx: Mutex::new(Some(ctl_rx)),
             dropped_events: AtomicU64::new(0),
@@ -281,6 +286,13 @@ impl AgentRuntime {
     #[must_use]
     pub fn parse_counters(&self) -> ParseCounters {
         *self.parse.lock().expect("parse counters")
+    }
+
+    /// The acquisition counters since start — what `src/metrics.rs` diffs into the
+    /// `MtconnectStream`/`MtconnectProbe` interval measures.
+    #[must_use]
+    pub fn stats(&self) -> AgentStatsSnapshot {
+        self.stats.snapshot()
     }
 
     /// Events dropped because an instance's queue was full.
@@ -346,6 +358,7 @@ impl AgentRuntime {
             Ok(doc) => doc,
             Err(e) => {
                 self.parse.lock().expect("parse counters").record_err();
+                self.stats.record_document_failed();
                 return Err(e);
             }
         };
@@ -373,6 +386,7 @@ impl AgentRuntime {
         });
 
         if changed {
+            self.stats.record_model_change();
             self.dispatch(
                 device_uuid,
                 InstanceEvent::ModelDrift {
@@ -385,7 +399,10 @@ impl AgentRuntime {
     }
 
     async fn probe_text(&self) -> Result<String, MtcError> {
-        match self.client.probe().await {
+        let started = std::time::Instant::now();
+        let result = self.client.probe().await;
+        self.stats.record_probe(elapsed_ms(started), result.is_ok());
+        match result {
             Ok(text) => Ok(text),
             Err(e) => {
                 self.mark_down(&e);
@@ -411,7 +428,10 @@ impl AgentRuntime {
     /// Any client or parse error; the runtime marks itself down and tells every attached instance
     /// before returning.
     pub async fn snapshot_cycle(&self, republish_all: bool) -> Result<PollReport, MtcError> {
-        let text = match self.client.current(None).await {
+        let started = std::time::Instant::now();
+        let fetched = self.client.current(None).await;
+        self.stats.record_latency(elapsed_ms(started), fetched.is_ok());
+        let text = match fetched {
             Ok(text) => text,
             Err(e) => {
                 self.mark_down(&e);
@@ -452,6 +472,7 @@ impl AgentRuntime {
             Ok(doc) => doc,
             Err(e) => {
                 self.parse.lock().expect("parse counters").record_err();
+                self.stats.record_document_failed();
                 self.mark_down(&e);
                 return Err(e);
             }
@@ -512,6 +533,8 @@ impl AgentRuntime {
             }
         }
 
+        self.stats.record_document(report.observations as u64);
+
         let was_down = !self.info().connected;
         let mode = if self.streaming_active.load(Ordering::Relaxed) {
             AcqState::Streaming { next: 0 }.mode()
@@ -550,7 +573,10 @@ impl AgentRuntime {
         device_uuid: &str,
         data_item_ids: &[String],
     ) -> Result<Vec<Observation>, MtcError> {
-        let text = match self.client.current(None).await {
+        let started = std::time::Instant::now();
+        let fetched = self.client.current(None).await;
+        self.stats.record_latency(elapsed_ms(started), fetched.is_ok());
+        let text = match fetched {
             Ok(text) => text,
             Err(e) => {
                 self.mark_down(&e);
@@ -561,6 +587,7 @@ impl AgentRuntime {
             Ok(doc) => doc,
             Err(e) => {
                 self.parse.lock().expect("parse counters").record_err();
+                self.stats.record_document_failed();
                 return Err(e);
             }
         };
@@ -763,6 +790,7 @@ impl AgentRuntime {
                 // only the body is open-ended, and liveness there is the heartbeat's job.
                 let open_timeout =
                     Duration::from_millis(u64::from(self.cfg.request_timeout_ms));
+                let open_started = std::time::Instant::now();
                 let opened = match tokio::time::timeout(
                     open_timeout,
                     self.client.open_sample_stream(&request),
@@ -772,6 +800,12 @@ impl AgentRuntime {
                     Ok(result) => result,
                     Err(_) => Err(MtcError::Timeout { ms: open_timeout.as_millis() as u64 }),
                 };
+                self.stats.record_latency(elapsed_ms(open_started), opened.is_ok());
+                if opened.is_ok() {
+                    // Every established stream comes back through here - the ladders and the
+                    // degradation floor alike - so this is where a re-establishment is counted.
+                    self.stats.record_stream_opened();
+                }
                 let opened = opened.and_then(|response| {
                     let reader = MultipartReader::from_content_type(
                         response.content_type(),
@@ -855,6 +889,7 @@ impl AgentRuntime {
                             agent = %self.cfg.id, first_sequence, skipped,
                             "agent buffer overran our position; snapshot recovery"
                         );
+                        self.stats.record_gap(skipped);
                         self.broadcast(&InstanceEvent::DataLoss { skipped });
                         republish_next_snapshot = true;
                         continue 'connect;
@@ -973,6 +1008,7 @@ impl AgentRuntime {
             }
             PartDoc::Errors(doc) => {
                 self.parse.lock().expect("parse counters").record_ok(doc.unknown_elements);
+                self.stats.record_document(0);
                 // An error document's header still names the agent incarnation: a restart
                 // discovered here is still a restart (ladder 3 beats ladder 2).
                 if doc.header.instance_id != 0 {
@@ -1000,11 +1036,13 @@ impl AgentRuntime {
             PartDoc::Unexpected(name) => {
                 tracing::warn!(agent = %self.cfg.id, root = %name, "unexpected document in stream");
                 self.parse.lock().expect("parse counters").record_err();
+                self.stats.record_document_failed();
                 PartOutcome::Undecodable
             }
             PartDoc::Unreadable(e) => {
                 tracing::warn!(agent = %self.cfg.id, error = %e, "undecodable part");
                 self.parse.lock().expect("parse counters").record_err();
+                self.stats.record_document_failed();
                 PartOutcome::Undecodable
             }
         }
@@ -1141,6 +1179,11 @@ enum CtlFlow {
     Reconnected,
     /// Shutdown was requested.
     Shutdown,
+}
+
+/// Milliseconds elapsed since `started`, saturating (a latency measure never wraps).
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The dedupe key: data item ids are unique **per device**, so the floor is keyed by both.

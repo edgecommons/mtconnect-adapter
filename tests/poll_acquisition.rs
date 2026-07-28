@@ -459,3 +459,136 @@ async fn a_reconnect_through_the_running_task_reports_a_probe_failure() {
     assert_eq!(err.code(), "HTTP");
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_repoll_takes_a_fresh_current_and_says_every_configured_signal_again() {
+    // The M4 interim behaviour was a drain of whatever had arrived, so a repoll on an idle machine
+    // published nothing. LLD §7 makes it a FORCED scoped snapshot: `/current` is fetched again and
+    // every configured signal answers, `UNAVAILABLE` and unbound ones included.
+    let agent = FakeAgent::start().await;
+    let (runtime, backend) = wire(
+        &agent,
+        vec![device(vec![
+            signal("x-position", "Xabs"),
+            signal("x-load", "Xload"),
+            signal("ghost", "NOT-IN-MODEL"),
+        ])],
+    );
+    let mut session = backend.connect(&connection()).await.expect("connect");
+
+    // A normal cycle publishes, and a second one publishes nothing: `/current` repeats itself.
+    runtime.poll_once().await.unwrap();
+    assert_eq!(session.read_signals().await.unwrap().len(), 3);
+    runtime.poll_once().await.unwrap();
+    assert_eq!(
+        session.read_signals().await.unwrap().len(),
+        1,
+        "only the permanently-BAD unbound signal, which is republished every cycle"
+    );
+
+    // The repoll goes to the agent regardless, and answers with the whole configured set.
+    let before = agent.request_count("/current");
+    let readings = session.snapshot_now().await.expect("repoll");
+    assert_eq!(agent.request_count("/current"), before + 1, "a repoll is a fresh /current");
+    assert_eq!(readings.len(), 3, "polled counts published results, BAD ones included");
+
+    let x = reading(&readings, "x-position");
+    assert_eq!(x.value, Some(json!(123.456)), "said again, though nothing changed");
+    assert_eq!(x.quality, Quality::Good);
+    let load = reading(&readings, "x-load");
+    assert_eq!(load.value, None);
+    assert_eq!(load.quality_raw.as_deref(), Some("UNAVAILABLE"));
+    let ghost = reading(&readings, "ghost");
+    assert_eq!(ghost.quality_raw.as_deref(), Some("MTC_NO_SUCH_DATAITEM"));
+}
+
+#[tokio::test]
+async fn a_repoll_asks_only_for_this_devices_configured_data_items() {
+    let agent = FakeAgent::start().await;
+    let (_runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    let mut session = backend.connect(&connection()).await.expect("connect");
+
+    let readings = session.snapshot_now().await.expect("repoll");
+    assert_eq!(readings.len(), 1, "the scope is this instance's signals, not the whole agent");
+    assert_eq!(readings[0].signal_id, "x-position");
+
+    // A device with no configured signals has nothing to snapshot, and asks the agent for nothing.
+    let (_r2, backend) = wire(&agent, vec![device(vec![])]);
+    let mut empty = backend.connect(&connection()).await.expect("connect");
+    let before = agent.request_count("/current");
+    assert!(empty.snapshot_now().await.expect("repoll").is_empty());
+    assert_eq!(agent.request_count("/current"), before, "nothing configured, nothing asked");
+}
+
+#[tokio::test]
+async fn a_repoll_against_an_unreachable_agent_reports_the_failure() {
+    let agent = FakeAgent::start().await;
+    let (_runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    let mut session = backend.connect(&connection()).await.expect("connect");
+    agent.documents.lock().unwrap().remove("current");
+
+    let err = session.snapshot_now().await.expect_err("the agent has no /current");
+    // The failure surfaces verbatim rather than being reported as an empty poll: a repoll that
+    // could not reach the agent must not look like a machine with nothing to say.
+    assert!(err.to_string().contains("404"), "{err}");
+    assert!(!err.is_transient(), "a 404 is a client-side mistake, not a link to retry blindly");
+}
+
+#[tokio::test]
+async fn a_reloaded_signal_set_reaches_a_live_session_without_a_reconnect() {
+    // LLD §8: an instance's signals recompile against the CACHED probe model and swap atomically.
+    // The session keeps its socketless attachment; nothing reconnects, nothing re-probes.
+    let agent = FakeAgent::start().await;
+    let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    let mut session = backend.connect(&connection()).await.expect("connect");
+
+    runtime.poll_once().await.unwrap();
+    assert_eq!(session.read_signals().await.unwrap().len(), 1);
+    let probes = agent.request_count("/probe");
+
+    // The operator adds a signal and rebinds nothing else.
+    let reloaded = json!({
+        "component": {
+            "global": { "agents": [{ "id": "line-a-agent", "url": agent.url() }] },
+            "instances": [{
+                "id": "cnc-1",
+                "adapter": "mtconnect",
+                "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.123456" },
+                "signals": [
+                    { "id": "x-position", "dataItemId": "Xabs" },
+                    { "id": "spindle-speed", "dataItemId": "Sspeed" }
+                ]
+            }]
+        }
+    });
+    let changed = backend.signals().apply(&reloaded).expect("the candidate compiles");
+    assert_eq!(changed, vec!["cnc-1".to_string()]);
+
+    // The live session publishes the new signal on its next read, from the cached model.
+    let readings = session.snapshot_now().await.expect("repoll");
+    assert_eq!(readings.len(), 2);
+    assert!(readings.iter().any(|r| r.signal_id == "spindle-speed"));
+    assert_eq!(agent.request_count("/probe"), probes, "a reload re-probes nothing");
+
+    // And `sb/signals` answers from the same live set.
+    let inventory = backend.inventory(&connection());
+    assert_eq!(inventory.len(), 2);
+    assert!(inventory.iter().any(|s| s.id == "spindle-speed"));
+
+    // A signal removed by a reload stops being published.
+    let trimmed = json!({
+        "component": {
+            "global": { "agents": [{ "id": "line-a-agent", "url": agent.url() }] },
+            "instances": [{
+                "id": "cnc-1",
+                "adapter": "mtconnect",
+                "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.123456" },
+                "signals": [{ "id": "spindle-speed", "dataItemId": "Sspeed" }]
+            }]
+        }
+    });
+    backend.signals().apply(&trimmed).expect("the candidate compiles");
+    let readings = session.snapshot_now().await.expect("repoll");
+    assert_eq!(readings.len(), 1);
+    assert_eq!(readings[0].signal_id, "spindle-speed");
+}

@@ -14,4 +14,5 @@ pub mod commands;
 pub mod device;
 pub mod metrics;
 pub mod mtconnect;
+pub mod reload;
 pub mod supervisor;

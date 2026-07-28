@@ -24,10 +24,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use url::Url;
 
@@ -237,9 +238,77 @@ pub trait DeviceSession: Send + Sync {
         Err(BrowseError::Unsupported)
     }
 
+    /// Force a **fresh** read of the whole configured signal set, bypassing any cache or dedupe
+    /// (backs `repoll`). The default is [`read_signals`](Self::read_signals), which is right for a
+    /// backend whose read already goes to the device; override it when reads are served from a
+    /// cache that a `repoll` is meant to refill.
+    ///
+    /// # Errors
+    ///
+    /// Only when the *connection* is broken (same contract as [`read_signals`](Self::read_signals)).
+    async fn snapshot_now(&mut self) -> Result<Vec<Reading>> {
+        self.read_signals().await
+    }
+
+    /// Drain the protocol notices that accumulated since the last call. These become UNS events
+    /// (`crate::supervisor` holds the `events()` facade); the mapping from protocol fact to notice
+    /// lives here, where it is unit-testable.
+    fn take_notices(&mut self) -> Vec<Notice> {
+        Vec::new()
+    }
+
+    /// How many configured signals this session is actually **delivering** right now — the truthful
+    /// `southbound_health.signalsSubscribed` gauge. `None` means "the configured inventory size",
+    /// which is what a backend with no compile step serves.
+    fn served_signals(&self) -> Option<u64> {
+        None
+    }
+
     /// Close the connection. Must be safe to call twice.
     async fn close(&mut self) {}
 }
+
+// =================================================================================================
+// Protocol notices -> UNS events (HLD §9)
+// =================================================================================================
+
+/// How loud a [`Notice`] is. The supervisor maps this onto the library's `Severity` when it emits;
+/// keeping the seam's own vocabulary here means the mapping — the part worth testing — does not
+/// need the `events()` facade to exercise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+    Info,
+    Warning,
+    Critical,
+}
+
+/// One protocol fact worth telling an operator about: an agent that came or went, observations that
+/// were provably lost, a device model that changed under us, a machine alarm that latched.
+///
+/// `event_type` is the UNS `evt` type — the family an edge-console panel subscribes to — and the
+/// context is the event's *payload*: sequence numbers, uuids and data-item ids belong here, never in
+/// a metric dimension (HLD §9).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Notice {
+    pub event_type: &'static str,
+    pub level: NoticeLevel,
+    pub message: String,
+    pub context: Value,
+}
+
+/// The agent lifecycle family: reachable, unreachable, degraded to polling (HLD §9).
+pub const EVENT_AGENT: &str = "MtconnectAgentEvent";
+/// Observations the agent's buffer overran before we read them (HLD §9, ladder 2).
+pub const EVENT_DATA_LOSS: &str = "MtconnectDataLossEvent";
+/// The device's probe model changed under a running instance (HLD §9, D-MTC-5).
+pub const EVENT_MODEL_DRIFT: &str = "MtconnectModelDriftEvent";
+/// A CONDITION data item that latched into `Fault` (HLD §9, rate-limited).
+pub const EVENT_CONDITION: &str = "MtconnectConditionEvent";
+
+/// A `Fault` that keeps re-asserting must not become a firehose: one condition event per data item
+/// per minute (HLD §9). The state itself is always published as the signal's value — this limit
+/// bounds only the *event*.
+pub const CONDITION_EVENT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Opens sessions. One factory per protocol.
 #[async_trait]
@@ -504,6 +573,7 @@ use crate::mtconnect::config::{DeviceConfig as MtcDeviceConfig, SignalConfig};
 use crate::mtconnect::model::ProbeModel;
 use crate::mtconnect::observations::{CondState, ObsValue, Observation};
 use crate::mtconnect::{AgentRuntime, InstanceEvent, MtcError};
+use crate::reload::{SignalRegistry, SignalSlot};
 
 /// The `adapter` value that selects this backend.
 pub const KIND: &str = "mtconnect";
@@ -580,6 +650,9 @@ fn binding_key(agent_id: &str, device_uuid: &str) -> String {
 pub struct MtcBackend {
     agents: HashMap<String, Arc<AgentRuntime>>,
     devices: HashMap<String, MtcDeviceConfig>,
+    /// The live, reloadable signal set of each instance (LLD §8). A session reads its slot rather
+    /// than the startup configuration, so a reload reaches acquisition without a reconnect.
+    signals: Arc<SignalRegistry>,
 }
 
 impl MtcBackend {
@@ -589,11 +662,18 @@ impl MtcBackend {
         agents: HashMap<String, Arc<AgentRuntime>>,
         devices: Vec<MtcDeviceConfig>,
     ) -> Self {
+        let signals = Arc::new(SignalRegistry::new(&devices));
         let devices = devices
             .into_iter()
             .map(|d| (binding_key(&d.agent_id, &d.device_uuid), d))
             .collect();
-        Self { agents, devices }
+        Self { agents, devices, signals }
+    }
+
+    /// The live signal registry a reload swaps into (LLD §8) — the same slots the sessions read.
+    #[must_use]
+    pub fn signals(&self) -> Arc<SignalRegistry> {
+        Arc::clone(&self.signals)
     }
 
     fn binding(&self, cfg: &ConnectionConfig) -> std::result::Result<&MtcDeviceConfig, DeviceError> {
@@ -617,11 +697,17 @@ impl DeviceBackend for MtcBackend {
     /// `sb/signals` answers while the agent is unreachable.
     fn inventory(&self, cfg: &ConnectionConfig) -> Vec<SignalInfo> {
         match self.binding(cfg) {
-            Ok(device) => device
-                .signals
-                .iter()
-                .map(|s| SignalInfo { id: s.id.clone(), name: s.name.clone() })
-                .collect(),
+            // The LIVE set, not the startup one: after a reload the inventory is what is published
+            // now (LLD §8).
+            Ok(device) => match self.signals.slot(&device.id) {
+                Some(slot) => slot
+                    .load()
+                    .signals
+                    .iter()
+                    .map(|s| SignalInfo { id: s.id.clone(), name: s.name.clone() })
+                    .collect(),
+                None => Vec::new(),
+            },
             Err(_) => Vec::new(),
         }
     }
@@ -641,8 +727,14 @@ impl DeviceBackend for MtcBackend {
 
         // "Connected" means the agent answered AND this device is really in its probe.
         let model = agent.ensure_model(&device.device_uuid).await.map_err(to_device_error)?;
+        let slot = self.signals.slot(&device.id).ok_or_else(|| {
+            DeviceError::Permanent(anyhow::anyhow!(
+                "instance `{}` has no signal slot; it was not in the compiled configuration",
+                device.id
+            ))
+        })?;
         let handle = agent.attach(&device.device_uuid);
-        Ok(Box::new(MtcSession::new(agent, device, model, handle.rx)))
+        Ok(Box::new(MtcSession::with_slot(agent, device, model, handle.rx, slot)))
     }
 }
 
@@ -723,6 +815,11 @@ pub fn resolve_agent_credentials(
 pub struct MtcSession {
     agent: Arc<AgentRuntime>,
     device: MtcDeviceConfig,
+    /// The live signal set, swapped by a reload (LLD §8). `None` for a session built without a
+    /// registry, which then keeps the set it was constructed with.
+    slot: Option<Arc<SignalSlot>>,
+    /// The generation currently compiled — compared against the slot to notice a reload.
+    generation: String,
     model: Arc<ProbeModel>,
     rx: mpsc::Receiver<InstanceEvent>,
     /// The latest state of every CONDITION data item this device published, with its native code —
@@ -731,6 +828,10 @@ pub struct MtcSession {
     /// Configured signals whose `dataItemId` the model does not have: reported BAD every cycle,
     /// never silently dropped.
     unbound: Vec<String>,
+    /// Protocol notices awaiting a drain into UNS events.
+    notices: Vec<Notice>,
+    /// When each condition data item last raised a `MtconnectConditionEvent` — the 1/min limiter.
+    last_condition_event: HashMap<String, Instant>,
     closed: bool,
 }
 
@@ -741,10 +842,153 @@ impl MtcSession {
         model: Arc<ProbeModel>,
         rx: mpsc::Receiver<InstanceEvent>,
     ) -> Self {
-        let mut session =
-            Self { agent, device, model, rx, conditions: HashMap::new(), unbound: Vec::new(), closed: false };
+        let generation = crate::reload::generation_of(&device.signals);
+        let mut session = Self {
+            agent,
+            device,
+            slot: None,
+            generation,
+            model,
+            rx,
+            conditions: HashMap::new(),
+            unbound: Vec::new(),
+            notices: Vec::new(),
+            last_condition_event: HashMap::new(),
+            closed: false,
+        };
         session.recompile();
         session
+    }
+
+    /// The production constructor: the signal set comes from the instance's reloadable slot.
+    fn with_slot(
+        agent: Arc<AgentRuntime>,
+        device: MtcDeviceConfig,
+        model: Arc<ProbeModel>,
+        rx: mpsc::Receiver<InstanceEvent>,
+        slot: Arc<SignalSlot>,
+    ) -> Self {
+        let mut session = Self::new(agent, device, model, rx);
+        session.slot = Some(slot);
+        session.adopt_current_signals();
+        session
+    }
+
+    /// Pick up a reloaded signal set, if one has been swapped in. Recompiling costs a walk of the
+    /// configured signals against the **cached** model — no agent round-trip, so a reload lands
+    /// even while the agent is unreachable (LLD §8).
+    fn adopt_current_signals(&mut self) {
+        let Some(slot) = &self.slot else { return };
+        let live = slot.load();
+        if live.generation == self.generation {
+            return;
+        }
+        tracing::info!(
+            instance = %self.device.id,
+            from = %self.generation,
+            to = %live.generation,
+            signals = live.signals.len(),
+            "signal set reloaded; recompiling against the cached probe model"
+        );
+        self.device.signals.clone_from(&live.signals);
+        self.generation = live.generation.clone();
+        self.recompile();
+    }
+
+    /// The configured data item ids of this device — the scope of a forced `/current` snapshot.
+    fn configured_data_items(&self) -> Vec<String> {
+        let mut ids: Vec<String> =
+            self.device.signals.iter().map(|s| s.data_item_id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// Whether this data item may raise a condition event now (one per minute, HLD §9).
+    fn allow_condition_event(&mut self, data_item_id: &str, now: Instant) -> bool {
+        match self.last_condition_event.get(data_item_id) {
+            Some(last) if now.saturating_duration_since(*last) < CONDITION_EVENT_INTERVAL => false,
+            _ => {
+                self.last_condition_event.insert(data_item_id.to_string(), now);
+                true
+            }
+        }
+    }
+
+    /// Turn one runtime event into the operator-facing notice it deserves. The agent's own
+    /// published state supplies the sequence window a data-loss event needs.
+    fn note(&mut self, event: &InstanceEvent) {
+        let info = self.agent.info();
+        let notice = match event {
+            InstanceEvent::AgentUp(up) => Notice {
+                event_type: EVENT_AGENT,
+                level: NoticeLevel::Info,
+                message: format!("agent `{}` is reachable", up.agent_id),
+                context: json!({
+                    "instance": self.device.id,
+                    "agentId": up.agent_id,
+                    "state": "up",
+                    "mode": up.mode,
+                    "instanceId": up.instance_id,
+                    "agentVersion": up.agent_version,
+                    "standardVersion": up.standard_version,
+                }),
+            },
+            InstanceEvent::AgentDown(reason) => Notice {
+                event_type: EVENT_AGENT,
+                level: NoticeLevel::Critical,
+                message: format!("agent `{}` is unreachable", info.agent_id),
+                context: json!({
+                    "instance": self.device.id,
+                    "agentId": info.agent_id,
+                    "state": "down",
+                    "reason": reason,
+                }),
+            },
+            InstanceEvent::StreamDegraded { failures } => Notice {
+                event_type: EVENT_AGENT,
+                level: NoticeLevel::Warning,
+                message: format!(
+                    "streaming could not be established after {failures} attempts; acquisition degraded to polling"
+                ),
+                context: json!({
+                    "instance": self.device.id,
+                    "agentId": info.agent_id,
+                    "state": "degraded",
+                    "mode": "poll",
+                    "failures": failures,
+                }),
+            },
+            InstanceEvent::DataLoss { skipped } => Notice {
+                event_type: EVENT_DATA_LOSS,
+                level: NoticeLevel::Warning,
+                message: format!("{skipped} observations were lost: the agent's buffer overran our position"),
+                context: json!({
+                    "instance": self.device.id,
+                    "agentId": info.agent_id,
+                    "skipped": skipped,
+                    "firstSequence": info.first_sequence,
+                    "nextSequence": info.next_sequence,
+                    "bufferSize": info.buffer_size,
+                }),
+            },
+            InstanceEvent::ModelDrift { old, new } => Notice {
+                event_type: EVENT_MODEL_DRIFT,
+                level: NoticeLevel::Warning,
+                message: "the device's probe model changed; signals were recompiled and browse cursors are void"
+                    .to_string(),
+                context: json!({
+                    "instance": self.device.id,
+                    "agentId": info.agent_id,
+                    "deviceUuid": self.device.device_uuid,
+                    "oldDigest": old,
+                    "newDigest": new,
+                }),
+            },
+            // Observations are data, not events: they publish as samples.
+            InstanceEvent::Obs(_) | InstanceEvent::Snapshot(_) => return,
+        };
+        self.notices.push(notice);
     }
 
     /// Re-check every configured signal against the current model. A signal bound to a data item
@@ -774,10 +1018,38 @@ impl MtcSession {
     /// Fold a batch of observations into readings: condition states are recorded **first**, so a
     /// value observed in the same batch as the fault that invalidates it is already degraded.
     fn map_batch(&mut self, observations: &[Observation]) -> Vec<Reading> {
+        self.map_batch_at(observations, Instant::now())
+    }
+
+    /// [`Self::map_batch`] with an explicit clock, so the condition-event rate limit is testable.
+    fn map_batch_at(&mut self, observations: &[Observation], now: Instant) -> Vec<Reading> {
         for obs in observations {
             if let Some(state) = obs.condition_state() {
                 let code = obs.extra("nativeCode").and_then(Value::as_str).map(str::to_string);
-                self.conditions.insert(obs.data_item_id.clone(), (state, code));
+                let previous = self
+                    .conditions
+                    .insert(obs.data_item_id.clone(), (state, code.clone()))
+                    .map(|(s, _)| s);
+                // A latching Fault is the event an operator wants; a Fault that is merely still
+                // asserted is not, so only the TRANSITION into Fault raises one (rate-limited).
+                if state == CondState::Fault
+                    && previous != Some(CondState::Fault)
+                    && self.allow_condition_event(&obs.data_item_id, now)
+                {
+                    self.notices.push(Notice {
+                        event_type: EVENT_CONDITION,
+                        level: NoticeLevel::Critical,
+                        message: format!("condition `{}` went to Fault", obs.data_item_id),
+                        context: json!({
+                            "instance": self.device.id,
+                            "dataItemId": obs.data_item_id,
+                            "state": "FAULT",
+                            "previousState": previous.map(condition_state_name),
+                            "nativeCode": code,
+                            "timestamp": obs.timestamp,
+                        }),
+                    });
+                }
             }
         }
         let mut out = Vec::new();
@@ -812,11 +1084,13 @@ impl DeviceSession for MtcSession {
     /// answer is not a failure: `/current` deduplicates, so a machine that is not changing produces
     /// nothing, which is exactly what "on change" means.
     async fn read_signals(&mut self) -> Result<Vec<Reading>> {
+        self.adopt_current_signals();
         let mut observations = Vec::new();
         let mut down: Option<String> = None;
         let mut drifted = false;
 
         while let Ok(event) = self.rx.try_recv() {
+            self.note(&event);
             match event {
                 InstanceEvent::Obs(obs) => observations.push(*obs),
                 InstanceEvent::Snapshot(batch) => observations.extend(batch),
@@ -843,6 +1117,7 @@ impl DeviceSession for MtcSession {
     /// `sb/read`: a scoped `/current` read, serialized with acquisition through the agent's control
     /// channel. Always live — a read answers with what the agent has now.
     async fn read_named(&mut self, ids: &[String]) -> Result<Vec<Reading>> {
+        self.adopt_current_signals();
         let wanted: Vec<String> = self
             .device
             .signals
@@ -878,6 +1153,38 @@ impl DeviceSession for MtcSession {
     /// refuses first, and this exists so no code path can ever reach a write.
     async fn write_signal(&mut self, _signal_id: &str, _value: &Value) -> Result<()> {
         Err(DeviceError::Permanent(anyhow::anyhow!(READ_ONLY_MESSAGE)))
+    }
+
+    /// `repoll`: a **forced, fresh** `/current` for this device, scoped to its configured data items
+    /// and serialized with acquisition through the agent's control channel (LLD §7). It is not a
+    /// drain of what happened to have arrived — a repoll exists precisely to say the current truth
+    /// again, so every configured signal answers, `UNAVAILABLE` ones included.
+    async fn snapshot_now(&mut self) -> Result<Vec<Reading>> {
+        self.adopt_current_signals();
+        let wanted = self.configured_data_items();
+        let observations = if wanted.is_empty() {
+            Vec::new()
+        } else {
+            self.agent
+                .request_snapshot(&self.device.device_uuid, &wanted)
+                .await
+                .map_err(to_device_error)?
+        };
+        let mut readings = self.map_batch(&observations);
+        readings.extend(self.unbound_readings());
+        Ok(readings)
+    }
+
+    fn take_notices(&mut self) -> Vec<Notice> {
+        std::mem::take(&mut self.notices)
+    }
+
+    /// The signals this session is really delivering: the configured set minus the ones whose data
+    /// item the current device model does not have (those publish a permanent BAD instead). Same
+    /// number whether acquisition is streaming or polling — the compiled set is what is served, and
+    /// the mode only decides how it arrives.
+    fn served_signals(&self) -> Option<u64> {
+        Some(self.device.signals.len().saturating_sub(self.unbound.len()) as u64)
     }
 
     /// `sb/browse`: the probe tree, paged out of the cached model — so the address space stays
@@ -924,6 +1231,17 @@ impl DeviceSession for MtcSession {
 // =================================================================================================
 // Observation -> Reading (HLD §5.3 and §6)
 // =================================================================================================
+
+/// The wire name of a condition state, for a notice's `previousState`.
+#[must_use]
+pub fn condition_state_name(state: CondState) -> &'static str {
+    match state {
+        CondState::Normal => "NORMAL",
+        CondState::Warning => "WARNING",
+        CondState::Fault => "FAULT",
+        CondState::Unavailable => "UNAVAILABLE",
+    }
+}
 
 /// Map one observation onto one configured signal.
 ///
@@ -1035,8 +1353,10 @@ fn severity_of(q: Quality) -> u8 {
 mod mtconnect_seam_tests {
     use super::*;
     use crate::mtconnect::config::{parse_agents, AgentCredentials, PublishCfg};
+    use crate::mtconnect::model::Category;
     use crate::mtconnect::xml::{parse_devices, parse_streams};
     use serde_json::json;
+    use std::time::Duration;
 
     const DEVICES_2_7: &str = include_str!("../tests/fixtures/devices_2.7.xml");
     const CURRENT_2_7: &str = include_str!("../tests/fixtures/current_2.7.xml");
@@ -1409,6 +1729,158 @@ mod mtconnect_seam_tests {
 
         let Err(e) = session.read_signals().await else { panic!("a lost agent must surface") };
         assert!(e.is_transient(), "reconnecting is exactly the right response");
+    }
+
+    // --- protocol notices -> UNS events (HLD §9) ------------------------------------------------
+
+    /// A session fed from a channel the test owns, so every runtime event can be delivered
+    /// deliberately — including the ones a fake agent could not be made to produce on demand.
+    fn scripted_session(
+        signals: Vec<SignalConfig>,
+    ) -> (MtcSession, mpsc::Sender<InstanceEvent>) {
+        let agent = runtime("http://127.0.0.1:9");
+        let (tx, rx) = mpsc::channel(32);
+        (MtcSession::new(agent, device(signals), model(), rx), tx)
+    }
+
+    #[tokio::test]
+    async fn every_runtime_event_becomes_the_operator_event_it_deserves() {
+        let (mut session, tx) = scripted_session(vec![signal("x", "Xabs")]);
+
+        let info = Arc::new(crate::mtconnect::AgentInfo {
+            agent_id: "line-a-agent".into(),
+            mode: "stream",
+            instance_id: Some(1_700_000_000),
+            agent_version: Some("2.7.0.12".into()),
+            ..Default::default()
+        });
+        tx.send(InstanceEvent::AgentUp(info)).await.unwrap();
+        tx.send(InstanceEvent::DataLoss { skipped: 12 }).await.unwrap();
+        tx.send(InstanceEvent::ModelDrift { old: "aa".into(), new: "bb".into() }).await.unwrap();
+        tx.send(InstanceEvent::StreamDegraded { failures: 3 }).await.unwrap();
+        session.read_signals().await.expect("drain");
+
+        let notices = session.take_notices();
+        assert_eq!(notices.len(), 4);
+        assert!(session.take_notices().is_empty(), "a drain empties the queue");
+
+        let up = &notices[0];
+        assert_eq!(up.event_type, EVENT_AGENT);
+        assert_eq!(up.level, NoticeLevel::Info);
+        assert_eq!(up.context["state"], json!("up"));
+        assert_eq!(up.context["agentId"], json!("line-a-agent"));
+        assert_eq!(up.context["instanceId"], json!(1_700_000_000u64));
+        assert_eq!(up.context["mode"], json!("stream"));
+
+        let loss = &notices[1];
+        assert_eq!(loss.event_type, EVENT_DATA_LOSS);
+        assert_eq!(loss.level, NoticeLevel::Warning);
+        // The count and the sequence window are event FIELDS - never metric dimensions (HLD §9).
+        assert_eq!(loss.context["skipped"], json!(12));
+        assert!(loss.context.get("firstSequence").is_some());
+        assert!(loss.context.get("nextSequence").is_some());
+
+        let drift = &notices[2];
+        assert_eq!(drift.event_type, EVENT_MODEL_DRIFT);
+        assert_eq!(drift.context["oldDigest"], json!("aa"));
+        assert_eq!(drift.context["newDigest"], json!("bb"));
+        assert_eq!(drift.context["deviceUuid"], json!("OKUMA.123456"));
+
+        let degraded = &notices[3];
+        assert_eq!(degraded.event_type, EVENT_AGENT);
+        assert_eq!(degraded.level, NoticeLevel::Warning);
+        assert_eq!(degraded.context["state"], json!("degraded"));
+        assert_eq!(degraded.context["failures"], json!(3));
+
+        // No notice carries anything that came out of a vault.
+        for n in &notices {
+            let rendered = n.context.to_string();
+            assert!(!rendered.contains("secret") && !rendered.contains("password"), "{rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lost_agent_still_reports_its_event_even_though_the_read_fails() {
+        let (mut session, tx) = scripted_session(vec![signal("x", "Xabs")]);
+        tx.send(InstanceEvent::AgentDown("connect refused".into())).await.unwrap();
+        assert!(session.read_signals().await.is_err(), "the supervisor must reconnect");
+
+        let notices = session.take_notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].event_type, EVENT_AGENT);
+        assert_eq!(notices[0].level, NoticeLevel::Critical);
+        assert_eq!(notices[0].context["state"], json!("down"));
+        assert_eq!(notices[0].context["reason"], json!("connect refused"));
+    }
+
+    #[test]
+    fn only_the_transition_into_fault_raises_a_condition_event_and_at_most_once_a_minute() {
+        let agent = runtime("http://127.0.0.1:9");
+        let (_tx, rx) = mpsc::channel(4);
+        let mut session =
+            MtcSession::new(agent, device(vec![signal("x", "Xabs")]), model(), rx);
+
+        let cond = |state: CondState, seq: u64| Observation {
+            data_item_id: "Xtravel".into(),
+            sequence: seq,
+            timestamp: "2026-07-27T10:00:00Z".into(),
+            name: None,
+            value: ObsValue::Condition(state),
+            extras: smallvec::smallvec![("nativeCode", json!("ALM-2"))],
+            element: "Fault".into(),
+            sub_type: None,
+            category: Category::Condition,
+        };
+
+        let t0 = Instant::now();
+        session.map_batch_at(&[cond(CondState::Normal, 1)], t0);
+        assert!(session.take_notices().is_empty(), "a healthy condition is not an event");
+
+        session.map_batch_at(&[cond(CondState::Fault, 2)], t0);
+        let raised = session.take_notices();
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].event_type, EVENT_CONDITION);
+        assert_eq!(raised[0].level, NoticeLevel::Critical);
+        assert_eq!(raised[0].context["dataItemId"], json!("Xtravel"));
+        assert_eq!(raised[0].context["state"], json!("FAULT"));
+        assert_eq!(raised[0].context["previousState"], json!("NORMAL"));
+        assert_eq!(raised[0].context["nativeCode"], json!("ALM-2"));
+
+        // Still faulted: the state keeps publishing as the signal's value, the EVENT does not repeat.
+        session.map_batch_at(&[cond(CondState::Fault, 3)], t0 + Duration::from_secs(1));
+        assert!(session.take_notices().is_empty(), "a still-asserted fault is not a new event");
+
+        // A fault that clears and re-latches inside the window is still rate-limited.
+        session.map_batch_at(&[cond(CondState::Normal, 4)], t0 + Duration::from_secs(2));
+        session.map_batch_at(&[cond(CondState::Fault, 5)], t0 + Duration::from_secs(3));
+        assert!(session.take_notices().is_empty(), "one condition event per data item per minute");
+
+        // Past the window, a re-latch is news again.
+        session.map_batch_at(&[cond(CondState::Normal, 6)], t0 + Duration::from_secs(61));
+        session.map_batch_at(&[cond(CondState::Fault, 7)], t0 + Duration::from_secs(62));
+        assert_eq!(session.take_notices().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn signals_subscribed_counts_what_is_served_not_what_was_configured() {
+        // Two signals bind real data items, one binds a data item the device does not have: the
+        // gauge must report the two that are really delivered, in stream mode and poll mode alike
+        // (the compiled set is what is served; the mode only decides how it arrives).
+        let (session, _tx) = scripted_session(vec![
+            signal("x-position", "Xabs"),
+            signal("x-load", "Xload"),
+            signal("ghost", "NOT-IN-MODEL"),
+        ]);
+        assert_eq!(session.served_signals(), Some(2));
+
+        let (empty, _tx) = scripted_session(vec![]);
+        assert_eq!(empty.served_signals(), Some(0));
+
+        // The template simulator compiles nothing, so it keeps the configured inventory size.
+        let sim_conn: ConnectionConfig =
+            serde_json::from_value(json!({ "endpoint": "sim://plc-1" })).unwrap();
+        let sim = SimBackend.connect(&sim_conn).await.unwrap();
+        assert_eq!(sim.served_signals(), None);
     }
 
     #[tokio::test]

@@ -32,8 +32,13 @@ carries a runnable example.
 
 ## Validation expectations
 
-- `cargo test` covers every module against the simulator and a mocked device-control channel — no
-  network, no broker, no device required.
+- `cargo test` covers every module against the simulator, a mocked device-control channel, and a
+  fake in-process agent (canned XML documents) — no network, no broker, no live device required.
+  `tests/poll_acquisition.rs` drives the polling path end to end; `tests/stream_acquisition.rs` and
+  `tests/stream_sequence.rs` drive the streaming path and the resync ladder; `tests/config_schema.rs`
+  validates every shipped configuration against `config.schema.json` and through
+  `mtconnect::config::validate_bindings`; `tests/fuzz_style.rs` exercises the XML parser against
+  malformed/hostile input; `tests/isolation.rs` enforces the seam rule below.
 - `cargo llvm-cov --fail-under-lines 90` is the coverage gate (`.github/workflows/ci.yml`'s
   `coverage` job) — the org rule is 90% line coverage per language. The `ethernet-ip-adapter`
   discipline is followed: the untestable live drivers are isolated in a thin `src/supervisor.rs`
@@ -41,15 +46,25 @@ carries a runnable example.
   `--ignore-filename-regex '(supervisor\.rs|main\.rs|tests[/\\]live_.*\.rs)'` so ONLY that seam plus
   the binary shim and the self-skipping live suite are excluded — each pinned to a reason in the
   workflow. Every pure decision they compose (backoff, the write allow-list, connectivity, the
-  metric-family math) stays in `app.rs`/`commands.rs`/`device.rs`/`metrics.rs`, in the denominator,
-  and is unit-tested. Do not lower the gate or exclude testable code to pass it — add tests.
+  metric-family math, XML parsing, the probe model, the sequence/resync state machine) stays in
+  `app.rs`/`commands.rs`/`device.rs`/`metrics.rs`/`mtconnect/**`, in the denominator, and is
+  unit-tested. Do not lower the gate or exclude testable code to pass it — add tests.
 - `tests/scoped_delivery.rs` drives the `sb/*` surface end to end through a **real** `CommandInbox`
   over a recording messaging seam: both cmd wildcards, the topic instance token selecting a device
   among several, the library refusing a conflicting body `instance` before dispatch (handler not
   invoked), and `describe` advertising every verb as `"scope": "instance"`. It is the guard on the
-  addressing invariant above — do not delete it when you replace the simulator.
+  addressing invariant above.
 - `tests/live_sim.rs` is a **self-skipping** live suite, gated on `EC_LIVE_SIM` — it must show as
   skipped in a normal `cargo test` and pass when pointed at a real simulator/device.
+- `tests/agent_integration.rs` is a **second, separately env-gated** live suite — set `EC_MTC_AGENT`
+  (and optionally `EC_MTC_AGENT_TINY`) after starting `docker compose -f
+  tests/compose.mtconnect-agent.yaml up -d`, which brings up the pinned canonical test peer
+  (`mtconnect/agent`, i.e. cppagent 2.7.0.12 — D-MTC-9) with two fixtures: a two-device agent for
+  probe/stream/restart/`instanceId`-resync/demultiplexing coverage, and a tiny-buffer agent
+  (`BufferSize = 7`, 128 observations) for buffer-wrap/`OUT_OF_RANGE` recovery coverage. The SHDR
+  feed both containers dial into is served in-process by the test binary itself (fixed host ports,
+  reached via `host.docker.internal`), so no separate simulator process is needed. Without
+  `EC_MTC_AGENT` every test in this file self-skips, so `cargo test` stays green with no Docker.
 - `edgecommons component validate` checks this repo's config against `config.schema.json` and warns
   if `Cargo.lock` is not committed.
 
@@ -66,9 +81,34 @@ carries a runnable example.
   `CONNECTING`/`ONLINE`/`BACKOFF`/`PAUSED` token that answers `sb/status` onto the `state` keepalive's
   `instances[]` entries via `with_state`. One state model, every surface — never a second
   bookkeeping path.
-- **The write allow-list is checked BEFORE any device I/O.** A refused entry never becomes a
-  `DeviceControl::Write`.
-- **The device seam stays protocol-only.** No EdgeCommons types in `src/device.rs`.
+- **The write allow-list is checked BEFORE any device I/O** — moot for the shipping protocol
+  (`writes.allow` is schema-pinned to `maxItems: 0`, and `sb/write` refuses unconditionally before
+  any entry is inspected — D-MTC-7), but the check still runs in that order so a future write-capable
+  backend inherits the discipline rather than a special case.
+- **The device seam stays protocol-only.** No EdgeCommons types in `src/device.rs`, and no
+  `edgecommons` import anywhere under `src/mtconnect/**` — `tests/isolation.rs` enforces the latter
+  mechanically (a source-text scan, not a trust exercise).
+- **One state model per agent, shared by every device it serves.** `AgentRuntime` (`src/mtconnect/mod.rs`)
+  owns exactly one `ArcSwap<AgentInfo>`, one cached `ProbeModel` per attached device uuid, and one
+  `SequenceState`/`ParseCounters` pair for the whole agent connection. `sb/status` and `sb/browse`
+  read this published state directly and never round-trip through a device's control channel — a
+  status call cannot queue behind acquisition, and browsing keeps working while the agent link is
+  down, because the address space came from the last successful probe, not from the wire.
+- **Both MTConnect streaming content-types are accepted.** The multipart reader
+  (`src/mtconnect/multipart.rs`) is built from the response's own `Content-Type` header and handles
+  both `multipart/x-mixed-replace` (cppagent's historical framing) and
+  `multipart/mixed` — an agent is free to send either, and the client does not assume one.
+- **Every published observation carries a dedupe key, not a chronological guess.** The dedupe floor
+  in `mtconnect::sequence::SequenceState` (`last_published`, keyed by `dataItemId`) is per data item,
+  not a single global sequence cursor — a `/current` snapshot taken to recover from `OUT_OF_RANGE` or
+  an `instanceId` resync overlaps the stream's own window, and a global floor would let one data
+  item's higher sequence number silently suppress a different, still-unpublished, lower-sequence
+  item. Do not collapse this back to one counter.
+- **MTConnect's whole surface is read-only** (Part 1 Fundamentals §5.1, D-MTC-7): `sb/write` stays
+  registered (so a caller gets `WRITE_NOT_ALLOWED`, not "unknown verb") but is refused before any
+  entry is inspected, is advertised `unsupported` via command availability, and no panel names a
+  `writeVerb`. There is no `sb/discover` either — the address space is read from the cached probe
+  model, never mutated.
 
 ## Org conventions this scaffold inherits
 

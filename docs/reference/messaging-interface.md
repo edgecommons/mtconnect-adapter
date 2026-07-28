@@ -1,7 +1,5 @@
 # Reference — Messaging Interface & CLI
 
-*This documents the generated scaffold; rewrite it as you build the component out.*
-
 Every topic and message this adapter publishes or accepts, and its CLI flags. Addressing follows the
 **Unified Namespace (UNS)**: `ecv1/{device}/{component}/{instance}/{class}[/channel]`. For the
 data/control plane model, see [explanation.md](../explanation.md); for client recipes, the
@@ -35,7 +33,7 @@ with the same `correlation_id`.
 | `cmd` | `sb/resume` | `instance` | bus → adapter | `ecv1/{device}/mtconnect-adapter/[{instance}/]cmd/sb/resume` | `{ok,result}` |
 | `cmd` | `reconnect` | `instance` | bus → adapter | `ecv1/{device}/mtconnect-adapter/[{instance}/]cmd/reconnect` | `{ok,result}` |
 | `cmd` | `repoll` | `instance` | bus → adapter | `ecv1/{device}/mtconnect-adapter/[{instance}/]cmd/repoll` | `{ok,result}` |
-| `metric` | `southbound_health`, `MtconnectAdapterConnection`, `MtconnectAdapterCommand` | — | adapter → bus (auto) | `ecv1/{device}/mtconnect-adapter/metric/{metricName}` | — |
+| `metric` | `southbound_health`, `MtconnectAdapterConnection`, `MtconnectAdapterCommand`, `MtconnectStream`, `MtconnectProbe`, `MtconnectParse` | — | adapter → bus (auto) | `ecv1/{device}/mtconnect-adapter/metric/{metricName}` | — |
 | `state` | keepalive | — | adapter → bus (auto) | `ecv1/{device}/mtconnect-adapter/state` | — |
 
 **Scope** is the verb's declared addressing, advertised on its `describe` entry. All nine verbs act
@@ -60,9 +58,12 @@ verbs (`src/commands.rs`).
 The reply body is `{"ok": true, "result": <verb result>}` on success, or
 `{"ok": false, "error": {"code", "message"}}` on failure — codes: `BAD_ARGS` (a malformed request, a
 body `instance` conflicting with the topic's token, or a missing instance with two or more devices),
-`NO_SUCH_INSTANCE`, `WRITE_NOT_ALLOWED`, `WRITE_FAILED`, `DEVICE_UNAVAILABLE`, `READ_FAILED`,
-`RECONNECT_FAILED`, `BROWSE_UNSUPPORTED`, `BROWSE_FAILED`, `PAUSED` (a `repoll` on a paused
-instance — resume first).
+`NO_SUCH_INSTANCE`, `WRITE_NOT_ALLOWED` (every `sb/write` request, unconditionally),
+`DEVICE_UNAVAILABLE` (the device's own task is gone), `RECONNECT_FAILED`, `BROWSE_UNSUPPORTED`,
+`BROWSE_FAILED` (carrying `MTC_NO_PROBE` / `MTC_VIEW_CHANGED` / `MTC_BAD_CURSOR` in its message for
+an `mtconnect`-adapter instance), `PAUSED` (a `repoll` on a paused instance — resume first). `sb/read`
+never fails at the top level for a per-signal problem — see [`sb/read`](#sbread-command-requestreply)
+below for its per-entry codes.
 
 ### Addressing a verb
 
@@ -171,8 +172,10 @@ command itself stays `ok`, because one unreadable signal is not a failed session
 - **`sb/pause`** / **`sb/resume`** → `{ id, paused, changed }` — idempotent; pausing an
   already-paused device reports `changed: false`.
 - **`reconnect`** → `{ id, connected: true }` or a `RECONNECT_FAILED` error.
-- **`repoll`** → `{ id, polled: <count> }` — the number of signal results published, `BAD` ones
-  included; refused with `PAUSED` while paused.
+- **`repoll`** → `{ id, polled: <count> }` — a forced, fresh `/current` scoped to this instance's
+  configured data items, not a drain of what happened to have arrived: an idle machine still answers.
+  `polled` is the number of signal results published, `BAD` ones (`UNAVAILABLE`,
+  `MTC_NO_SUCH_DATAITEM`) included; refused with `PAUSED` while paused.
 
 ### `sb/status.result.protocol`
 
@@ -265,9 +268,36 @@ refusal rides the command-availability surface instead.
 ## Events (`evt` class)
 
 Published through the library's `events()` facade; severity **derives** the channel
-(`evt/{severity}/{type}`), so the topic and the body can never disagree. This scaffold emits
-`device-connected` (info), `device-unreachable` (critical, raised on drop / cleared on restore),
-`adapter-paused` (warning), and `adapter-resumed` (info).
+(`evt/{severity}/{type}`), so the topic and the body can never disagree.
+
+The lifecycle events every adapter emits: `device-connected` (info), `device-unreachable` (critical,
+raised on drop / cleared on restore), `adapter-paused` (warning), `adapter-resumed` (info).
+
+On top of them, four families carry what only MTConnect knows. Sequence numbers, device uuids and
+data-item ids belong here, in the event's `context` — never as a metric dimension.
+
+| Type | Severity | Emitted when | `context` |
+|---|---|---|---|
+| `MtconnectAgentEvent` | info / critical / warning | the agent became reachable (`state: "up"`), unreachable (`"down"`), or streaming could not be established and acquisition degraded to polling (`"degraded"`) | `instance`, `agentId`, `state`; plus `mode`, `instanceId`, `agentVersion`, `standardVersion` when up, `reason` when down, `failures` when degraded |
+| `MtconnectDataLossEvent` | warning | the agent's buffer overran the adapter's position, so observations are provably lost (resync ladder step 2) | `instance`, `agentId`, `skipped`, `firstSequence`, `nextSequence`, `bufferSize` |
+| `MtconnectModelDriftEvent` | warning | a re-probe returned a different device model: signals recompile and browse cursors are void | `instance`, `agentId`, `deviceUuid`, `oldDigest`, `newDigest` |
+| `MtconnectConditionEvent` | critical | a CONDITION data item **transitioned into** `Fault` | `instance`, `dataItemId`, `state`, `previousState`, `nativeCode`, `timestamp` |
+
+A condition that is merely still asserted is not a new event, and a fault that clears and re-latches
+raises at most one event per data item per minute. The condition state itself is unaffected by that
+limit: it publishes as the signal's value on every observation, and degrades any signal that binds it
+through `conditionBinding`.
+
+```jsonc
+// ecv1/{device}/mtconnect-adapter/cnc-1/evt/critical/MtconnectConditionEvent
+{ "severity": "critical", "type": "MtconnectConditionEvent",
+  "message": "condition `Xtravel` went to Fault", "timestamp": "2026-07-27T10:00:05.000Z",
+  "context": { "instance": "cnc-1", "dataItemId": "Xtravel", "state": "FAULT",
+               "previousState": "NORMAL", "nativeCode": "ALM-2",
+               "timestamp": "2026-07-27T10:00:04.900000Z" } }
+```
+
+The `conditions` and `diagnostics` panels subscribe to these families by name.
 
 ## State keepalive (`state` class, reserved — automatic)
 

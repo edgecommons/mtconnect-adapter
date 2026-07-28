@@ -55,3 +55,8 @@ tempfile = "3"
 #  enables tokio's paused clock for the virtual-clock sequence tests
 # (tests/stream_sequence.rs, LLD 12 row 3).
 tokio = { version = "1", features = ["test-util"] }
+# A local TLS agent for the transport-security leg (tests/tls_auth.rs): a throwaway private CA and
+# server/client identities, minted in-process so the suite needs no fixture files and no network.
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }

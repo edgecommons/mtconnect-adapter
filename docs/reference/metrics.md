@@ -1,7 +1,5 @@
 # Reference — Metrics
 
-*This documents the generated scaffold; rewrite it as you build the component out.*
-
 `MtconnectAdapter` emits metrics through the EdgeCommons metric service (`src/metrics.rs`). With
 `metricEmission.target: messaging`, they publish on the reserved UNS `metric` class:
 
@@ -15,10 +13,10 @@ The adapter never writes reserved `metric` topics directly — it defines metric
 
 ## Dimension model
 
-Every dimension is deliberately low-cardinality: `instance`, `verb` (the closed set of registered
-`sb/*` verbs), and `result` (`success`/`error`). Signal names, addresses, endpoints, and raw error
-text are **never** metric dimensions — an unbounded dimension shreds a fleet dashboard. Use `data`,
-`evt`, logs, or command replies for those details.
+Every dimension is deliberately low-cardinality: `instance`, `agentId`, `verb` (the closed set of
+registered `sb/*` verbs), and `result` (`success`/`error`). Signal names, `dataItemId`s, addresses,
+endpoints, sequence numbers, and raw error text are **never** metric dimensions — an unbounded
+dimension shreds a fleet dashboard. Use `data`, `evt`, logs, or command replies for those details.
 
 ## `southbound_health`
 
@@ -30,17 +28,16 @@ Dimensions: `instance`.
 |---|---:|---:|---|
 | `connectionState` | Count | 1 | `1` connected, `0` not. Drives simple health alarms. |
 | `publishLatencyMs` | Milliseconds | 1 | Time spent publishing the most recent poll's readings. |
-| `pollLatencyMs` | Milliseconds | 1 | Time spent reading the device on the most recent poll. |
+| `pollLatencyMs` | Milliseconds | 1 | Time spent draining and reading the device on the most recent cycle. |
 | `readErrors` | Count | 60 | Failed reads in the reporting interval — polling failures without reading logs. |
 | `staleSignals` | Count | 60 | Signals with no update for longer than `healthThresholds.staleSignalSecs`. |
 | `reconnects` | Count | 60 | Reconnects (link drops that required re-establishing the session). |
-| `writeErrors` | Count | 60 | Write entries that failed on the device path in the reporting interval — device rejections and unavailable-device aborts. Entries that never reach the device (unresolved refs, allow-list refusals, missing values) are not counted. |
-| `signalsSubscribed` | Count | 1 | Signals the connected session currently serves (the `sb/signals` inventory size); `0` while disconnected. A gauge, not a pair. |
+| `writeErrors` | Count | 60 | Structurally always `0` for this adapter — MTConnect has no write path — kept for cross-adapter dashboard uniformity. |
+| `signalsSubscribed` | Count | 1 | Signals the connected instance currently **serves**: its configured set minus any whose `dataItemId` the current device model does not have (those publish a permanent BAD instead). The same number whether acquisition is streaming or polling — the compiled set is what is served, and the mode only decides how it arrives. `0` while disconnected. A gauge, not a pair. |
 
 ## `MtconnectAdapterConnection`
 
-The worked operational family for the connect/reconnect lifecycle — named from the component so a
-fleet view separates one adapter's connection health from another's.
+The connect/reconnect lifecycle, per device.
 
 Dimensions: `instance`.
 
@@ -55,7 +52,7 @@ Dimensions: `instance`.
 
 ## `MtconnectAdapterCommand`
 
-The worked operational family for the `sb/*` command surface.
+The `sb/*` command surface, per device.
 
 Dimensions: `instance`, `verb`, `result` (`success`/`error`) — the full `(verb, result)` matrix is
 pre-defined at startup so the dimension set is fixed and discoverable.
@@ -66,19 +63,60 @@ pre-defined at startup so the dimension set is fixed and discoverable.
 | `commandErrorsTotal` / `commandErrorsInterval` | Count | Invocations that returned a coded error (mirrors the `error`-result rows of `commandRequests`, kept separate for a quick numerator). |
 | `commandLatencyMs` | Milliseconds | Accumulated handler latency for this `(verb, result)` combination. |
 
+## `MtconnectStream`
+
+One **agent**'s acquisition — streaming or polling, whichever is currently active — emitted once per
+configured agent, not once per device attached to it: an agent's connection and document flow exist
+exactly once no matter how many devices share it (`component.global.agents[]`).
+
+Dimensions: `agentId`, `result`.
+
+| Measure | Unit | Purpose |
+|---|---:|---|
+| `documentsTotal` / `documentsInterval` | Count | `success`: documents decoded. `error`: documents that failed to decode. |
+| `observationsTotal` / `observationsInterval` | Count | Observations published from decoded documents (`success` cell only). |
+| `heartbeatsTotal` / `heartbeatsInterval` | Count | Heartbeat (empty) documents received while streaming (`success` cell only). |
+| `reconnectsTotal` / `reconnectsInterval` | Count | Streams **re**-established after a missed heartbeat, a transport drop, or malformed framing. The first stream a process opens is the initial connect, not a reconnect (`error` cell only). |
+| `gapsTotal` / `gapsInterval` | Count | Observations provably lost — the count the agent's `firstSequence` proves was skipped past our position (`error` cell only). |
+| `outOfRangeTotal` / `outOfRangeInterval` | Count | `OUT_OF_RANGE` recoveries: the resync-ladder step 2 events those lost observations were discovered through (`error` cell only). |
+| `latencyMs` | Milliseconds | Accumulated latency of this cell's acquisition requests (`/current`, opening a stream) since the previous emit. |
+
+## `MtconnectProbe`
+
+One **agent**'s `/probe` traffic, emitted once per configured agent.
+
+Dimensions: `agentId`, `result`.
+
+| Measure | Unit | Purpose |
+|---|---:|---|
+| `probesTotal` / `probesInterval` | Count | `/probe` requests, split by whether the agent answered. |
+| `modelChangesTotal` / `modelChangesInterval` | Count | Probes whose content digest differed from the previously cached model (a `ModelDrift`) — always `0` in the `error` cell, since a failed probe cannot have seen a new model. |
+| `latencyMs` | Milliseconds | Accumulated `/probe` latency for this cell since the previous emit. |
+
+## `MtconnectParse`
+
+Document decoding, reported **per device instance** (parsing happens above the per-device split, at
+the document level, so every instance attached to one agent reports that agent's own document
+counters).
+
+Dimensions: `instance`, `result`.
+
+| Measure | Unit | Purpose |
+|---|---:|---|
+| `documentsParsedTotal` / `documentsParsedInterval` | Count | Documents this instance's agent decoded successfully. |
+| `parseErrorsTotal` / `parseErrorsInterval` | Count | Documents that failed to decode. |
+
+This family is only defined for an `mtconnect`-adapter instance; the built-in simulator parses no
+documents and emits nothing under this name.
+
 ## The Total/Interval counter convention
 
 Every **counter** measure is emitted as a pair: `<name>Total` (monotonic since the process started)
 and `<name>Interval` (since the previous emit of that family — **reset on emit**). Gauges
-(`connectionState`, `signalsSubscribed`) and interval sums (the `*Ms` latencies/durations) are
-single measures. This is
-the same convention `modbus-adapter` and `ethernet-ip-adapter` use, so a fleet dashboard reads every
-adapter's operational metrics the same way.
-
-## Adding your protocol's families
-
-Your protocol has its own inventory, poll/subscribe path, and publish path worth measuring — add
-`MtconnectAdapterInventory` / `MtconnectAdapterPoll` / `MtconnectAdapterPublish` families next to
-the two above. See the [how-to guide](../how-to-guides.md#add-your-protocols-metric-families) and
-`modbus-adapter`/`ethernet-ip-adapter`'s fully worked equivalents (poll cycles, samples
-good/bad/changed/suppressed, batch flushes, …) for the full pattern.
+(`connectionState`, `signalsSubscribed`) and interval sums (the `*Ms` latencies/durations) are single
+measures. This is the same convention `modbus-adapter` and `ethernet-ip-adapter` use, so a fleet
+dashboard reads every adapter's operational metrics the same way. Within `MtconnectStream` and
+`MtconnectProbe`, the `result` dimension is a full outcome split, not just an error tally: every
+measure exists in both the `success` and `error` cells, and each counter is non-zero only in the cell
+its outcome actually belongs to (a stream gap is by definition a recovery from something that went
+wrong, so it only ever appears in the `error` cell).

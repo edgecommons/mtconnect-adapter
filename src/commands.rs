@@ -57,6 +57,7 @@ use crate::metrics::DeviceMetrics;
 use crate::mtconnect::config::SignalConfig;
 use crate::mtconnect::model::{BrowseNode, Category, NodeKind, ProbeModel, ROOT_NODE_ID};
 use crate::mtconnect::{AgentInfo, AgentRuntime};
+use crate::reload::{SignalRegistry, SignalSlot};
 
 /// The per-entry `sb/read` failure code for an observation the agent has no value for (HLD §7).
 /// The *published sample* uses the protocol's own `UNAVAILABLE` in `qualityRaw`; a read entry names
@@ -107,8 +108,10 @@ pub struct ProtocolView {
     pub agent_id: String,
     /// The MTConnect `Device/@uuid` this instance represents.
     pub device_uuid: String,
-    /// The configured signal set, in configuration order (`sb/signals`, browse `Configured` flags).
-    pub signals: Vec<SignalConfig>,
+    /// The **live** signal set, in configuration order (`sb/signals`, browse `Configured` flags).
+    /// Read through the slot on every call, so a reloaded signal set is visible immediately and a
+    /// browse cursor minted against the old one is refused (LLD §8).
+    pub signals: Arc<SignalSlot>,
 }
 
 impl ProtocolView {
@@ -116,7 +119,11 @@ impl ProtocolView {
     /// its binding does not resolve to a configured agent — the supervisor already refused to start
     /// such an instance, so there is nothing to publish for it).
     #[must_use]
-    pub fn of(cfg: &DeviceConfig, agents: &HashMap<String, Arc<AgentRuntime>>) -> Option<Self> {
+    pub fn of(
+        cfg: &DeviceConfig,
+        agents: &HashMap<String, Arc<AgentRuntime>>,
+        signals: &SignalRegistry,
+    ) -> Option<Self> {
         if cfg.adapter != crate::device::KIND {
             return None;
         }
@@ -126,8 +133,14 @@ impl ProtocolView {
             agent: Arc::clone(agent) as Arc<dyn AgentView>,
             agent_id,
             device_uuid,
-            signals: cfg.signals.clone(),
+            signals: signals.slot(&cfg.id)?,
         })
+    }
+
+    /// The live signal set and the generation token identifying it.
+    #[must_use]
+    pub fn signals(&self) -> Arc<crate::reload::InstanceSignals> {
+        self.signals.load()
     }
 
     /// The cached probe model for this device, if one has been fetched.
@@ -167,7 +180,8 @@ impl ProtocolView {
     #[must_use]
     pub fn signal_rows(&self, writes: &Writes) -> Vec<Value> {
         let model = self.model();
-        self.signals
+        self.signals()
+            .signals
             .iter()
             .map(|s| {
                 let meta = model.as_ref().and_then(|m| m.item(&s.data_item_id));
@@ -207,8 +221,8 @@ impl ProtocolView {
     }
 
     /// The `dataItemId`s the configured signals bind — the browse `Configured` flag.
-    fn bound_data_items(&self) -> HashSet<&str> {
-        self.signals.iter().map(|s| s.data_item_id.as_str()).collect()
+    fn bound_data_items(signals: &[SignalConfig]) -> HashSet<&str> {
+        signals.iter().map(|s| s.data_item_id.as_str()).collect()
     }
 }
 
@@ -939,6 +953,7 @@ impl Commander {
             // fallback for the simulator.
             if let Some(p) = &h.protocol {
                 return p
+                    .signals()
                     .signals
                     .iter()
                     .find(|s| s.name.as_deref() == Some(name))
@@ -964,8 +979,11 @@ impl Commander {
 /// hierarchical when there is. Both modes publish the model's digest as `viewGeneration`, so a
 /// consumer can tell that the address space it paged through is the one it is still looking at.
 fn browse_model(instance_id: &str, p: &ProtocolView, model: &ProbeModel, body: &Value) -> Reply {
-    let generation = model.digest_hex();
-    let bound = p.bound_data_items();
+    let signals = p.signals();
+    // BOTH generations: the entries come from the probe model, their `Configured` flags from the
+    // signal set, so a reload voids a cursor exactly as a re-probe does (LLD §8).
+    let generation = crate::reload::view_generation(&model.digest_hex(), &signals.generation);
+    let bound = ProtocolView::bound_data_items(&signals.signals);
     let flags = configured_flags(model, &bound);
     match body.get("ref") {
         Some(_) => browse_model_hierarchical(instance_id, model, &flags, &generation, body),
@@ -1416,7 +1434,7 @@ mod tests {
             agent: Arc::new(FakeAgent { info: Arc::new(info), model }),
             agent_id: "line-a-agent".into(),
             device_uuid: DEVICE_UUID.into(),
-            signals: mtc_signals(),
+            signals: Arc::new(SignalSlot::new(mtc_signals())),
         }
     }
 
@@ -1474,7 +1492,7 @@ mod tests {
     }
 
     fn make_dm(cfg: &DeviceConfig, health: Arc<Health>) -> Arc<DeviceMetrics> {
-        Arc::new(DeviceMetrics::new(Arc::new(NoopMetrics), config(), cfg.id.clone(), health, 30))
+        Arc::new(DeviceMetrics::new(Arc::new(NoopMetrics), config(), cfg.id.clone(), health, 30, None))
     }
 
     fn harness(cfg: DeviceConfig, opts: MockOpts) -> Harness {
@@ -1884,8 +1902,14 @@ mod tests {
     async fn browse_pages_the_probe_tree_with_its_digest_as_the_view_generation() {
         let h = mtc_harness();
         let out = ok(h.commander.browse(None, &json!({})).await);
-        let generation = probe_model().digest_hex();
+        // The view generation covers BOTH halves of what a browse page says: the probe model the
+        // entries come from, and the signal set their `Configured` flags come from (LLD §8).
+        let generation = crate::reload::view_generation(
+            &probe_model().digest_hex(),
+            &crate::reload::generation_of(&mtc_signals()),
+        );
         assert_eq!(out["viewGeneration"], json!(generation));
+        assert!(generation.starts_with(&probe_model().digest_hex()));
 
         let entries = out["entries"].as_array().unwrap();
         // Pre-order: the device, its own data items, then each component subtree.
@@ -1973,7 +1997,13 @@ mod tests {
         let h = mtc_harness();
         let out = ok(h.commander.browse(None, &json!({ "ref": "root" })).await);
         assert_eq!(out["mode"], json!("hierarchical"));
-        assert_eq!(out["viewGeneration"], json!(probe_model().digest_hex()));
+        assert_eq!(
+            out["viewGeneration"],
+            json!(crate::reload::view_generation(
+                &probe_model().digest_hex(),
+                &crate::reload::generation_of(&mtc_signals())
+            ))
+        );
         let root = &out["root"];
         assert_eq!(root["nodeId"], json!("mtc:/component/"), "`root` is an alias of the device node id");
         assert_eq!(root["nodeClass"], json!("device"));
@@ -2187,18 +2217,25 @@ mod tests {
 
         let mut cfg = mtc_device();
         cfg.signals = mtc_signals();
-        let view = ProtocolView::of(&cfg, &agents).expect("an mtconnect device gets a view");
+        let registry = SignalRegistry::new(&[crate::mtconnect::config::DeviceConfig {
+            id: cfg.id.clone(),
+            agent_id: "line-a-agent".into(),
+            device_uuid: DEVICE_UUID.into(),
+            signals: mtc_signals(),
+        }]);
+        let view =
+            ProtocolView::of(&cfg, &agents, &registry).expect("an mtconnect device gets a view");
         assert_eq!(view.agent_id, "line-a-agent");
         assert_eq!(view.device_uuid, DEVICE_UUID);
-        assert_eq!(view.signals.len(), 3);
+        assert_eq!(view.signals().signals.len(), 3);
         assert!(view.model().is_none(), "nothing is cached before the first probe");
         assert_eq!(view.status_object()["agentId"], json!("line-a-agent"));
 
         // The simulator has no agent, and an unknown agent id resolves to nothing.
-        assert!(ProtocolView::of(&a_device(), &agents).is_none());
+        assert!(ProtocolView::of(&a_device(), &agents, &registry).is_none());
         let mut orphan = mtc_device();
         orphan.connection.extra.insert("agentId".into(), json!("nope"));
-        assert!(ProtocolView::of(&orphan, &agents).is_none());
+        assert!(ProtocolView::of(&orphan, &agents, &registry).is_none());
     }
 
     // --- the registered wiring: verbs, declared scope, and scoped delivery ------------------------
@@ -2380,7 +2417,7 @@ mod tests {
             agent: Arc::new(FakeAgent { info: Arc::new(learned_info()), model: Some(probe_model()) }),
             agent_id: "line-a-agent".into(),
             device_uuid: DEVICE_UUID.into(),
-            signals: Vec::new(),
+            signals: Arc::new(SignalSlot::new(Vec::new())),
         }
         .status_object();
         for field in status["fields"].as_array().unwrap() {
@@ -2439,7 +2476,7 @@ mod tests {
             agent: Arc::new(FakeAgent { info: Arc::new(learned_info()), model: Some(probe_model()) }),
             agent_id: "line-a-agent".into(),
             device_uuid: DEVICE_UUID.into(),
-            signals: mtc_signals(),
+            signals: Arc::new(SignalSlot::new(mtc_signals())),
         }
         .signal_rows(&Writes::default());
         for column in grid["columns"].as_array().unwrap() {

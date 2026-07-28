@@ -279,6 +279,7 @@ impl Harness {
                 cfg.id.clone(),
                 Arc::clone(&health),
                 30,
+                None,
             ));
 
             let log = Arc::clone(&control_log);
