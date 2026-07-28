@@ -46,8 +46,8 @@ of `0`; `maxDocumentBytes` of `0`; `reconnect.maxMs` less than `reconnect.initia
 | Key | Type | Default | Definition |
 |-----|------|---------|-----------|
 | `defaults.pollIntervalMs` | integer | `5000` | Fallback read cadence for a device that sets no `pollIntervalMs` of its own. |
-| `defaults.publishMode` | `"on-change"` \| `"interval"` | `"on-change"` | Default publish policy for signals that declare none. |
-| `defaults.batchMs` | integer | `0` | Default coalescing window for `interval` mode. |
+| `defaults.publishMode` | `"on-change"` \| `"interval"` | `"on-change"` | The publish mode selection-derived SAMPLE signals use (see [publish shaping](#publish-shaping)). Explicit `signals[]` entries set their own `publish.mode`; derived EVENT/CONDITION signals are always `on-change`, immediate. |
+| `defaults.batchMs` | integer | `0` | The coalescing window selection-derived SAMPLE signals publish with. Explicit `signals[]` entries set their own `publish.batchMs`. |
 | `defaults.maxDocumentBytes` | integer | `16777216` | Default response/part size cap for an agent that sets none of its own. |
 | `defaults.reconnect.*` | object | see above | Default reconnect bounds for an agent that sets none of its own. |
 | `timeouts.connectMs` | integer | `5000` | How long a connect attempt may take before it is treated as failed. |
@@ -81,9 +81,41 @@ across agent restarts — even though the observation timestamps and sequence nu
 | `channel` | string | none | An explicit UNS channel for this signal, instead of publishing on its id. |
 | `dataItemId` | string | **required** | The `DataItem/@id` this signal reads. One not present in the device's current model is published as a BAD signal with `qualityRaw: MTC_NO_SUCH_DATAITEM` — named, never silently dropped. |
 | `conditionBinding[]` | array of string | `[]` | CONDITION data-item ids whose state degrades this signal's quality: a bound `Warning` makes it `UNCERTAIN` and a bound `Fault` makes it `BAD`, with the alarm's own native code riding in `qualityRaw`. Must **not** name the signal's own `dataItemId` — refused at startup if it does. When more than one bound condition is active at once, the **worst** one wins (`Fault` over `Warning` over `Normal`). |
-| `publish.mode` | `"on-change"` \| `"interval"` | `"on-change"` | How this signal is published. |
-| `publish.batchMs` | integer | `0` | Coalescing window for `interval` mode. |
-| `publish.deadband` | number | none | Absolute deadband, SAMPLE-category signals only: a change smaller than this is not published. |
+| `publish.mode` | `"on-change"` \| `"interval"` | `"on-change"` | `on-change` publishes every accepted reading — immediately, or coalesced into the batch window when `batchMs` > 0. `interval` keeps only the **latest** accepted reading per window, publishing one sample per window. With `batchMs: 0` both modes publish immediately. |
+| `publish.batchMs` | integer | `0` | The signal's coalescing window, in milliseconds. `0` publishes each reading immediately. Above `0`, GOOD readings buffer and the window flushes on expiry as **one** `SouthboundSignalUpdate` whose `samples[]` carries the window's readings in arrival order — each sample keeping its own timestamps and extras (`sequence`, `receivedTs`, …). A BAD or UNCERTAIN reading flushes the window immediately, itself included: a quality transition never sits in a window. |
+| `publish.deadband` | number | none | Absolute deadband, SAMPLE-category signals only, applied when a reading enters the publish pipeline: a numeric value differing from the last accepted value by less than this is not published. Non-numeric and array values always pass; any `quality`/`qualityRaw` change always passes; the first reading after a connect, resync, or resume always passes. |
+
+### Publish shaping
+
+The `publish` policy is enforced per signal, **above** the protocol session — the `mtconnect` and
+`sim` backends are shaped by the same engine, so a policy behaves identically whichever backend
+serves the instance. The rules around the three keys:
+
+- **Unconfigured signals are untouched.** No `publish` block (or `batchMs: 0`, the default) means
+  every reading publishes immediately as its own update.
+- **Batching produces one message per window.** The window opens when the first reading buffers and
+  closes `batchMs` later; the flush is one `SouthboundSignalUpdate` whose `samples[]` carries the
+  buffered readings in arrival order. Under `mode: "interval"` only the latest reading of the
+  window is kept; an empty window publishes nothing.
+- **Quality outranks the window.** A BAD or UNCERTAIN reading — an `UNAVAILABLE`, a
+  `conditionBinding` degradation — flushes its signal's window at once.
+- **Deadband gates entry, not exit.** A suppressed reading never reaches a window. The comparison
+  anchor is the last **accepted** value, so a slow drift still publishes once it accumulates past
+  the deadband.
+- **`sb/pause` discards open windows.** Nothing reaches the wire while paused, and `sb/resume`
+  republishes a fresh snapshot of the whole inventory first — flushing pre-pause readings after
+  that snapshot would publish stale data out of order, so they are dropped, with a log line.
+  The deadband re-arms on resume: the first reading of every signal passes.
+- **`repoll` and the resume snapshot bypass shaping.** A forced snapshot is a fresh full publish
+  of the current truth, not on-change flow.
+- **Shutdown, reconnect, and link loss flush open windows.** Buffered readings are data; a SIGTERM
+  does not lose them.
+- **Reloads swap the policy atomically.** Editing a signal's `publish` block rides the same live
+  signals-swap as any other signal edit; the open windows of changed signals flush with the
+  readings their old policy collected.
+
+The engine's activity is observable as the [`MtconnectAdapterShaping`](metrics.md#mtconnectadaptershaping)
+metric family: updates published, readings coalesced, readings deadband-dropped.
 
 ## `component.instances[].selection`
 
@@ -125,7 +157,7 @@ For every selected data item the adapter derives:
 | `id` | The lower-kebab sanitization of the `dataItemId` (`Xabs` → `xabs`, `SpindleSpeed` → `spindle-speed`, `t1-Tpos` → `t1-tpos`). A collision with another id gets a deterministic `-2`, `-3`, … suffix in browse-tree order, with a warning log. |
 | `name` | The probe's own `DataItem/@name`; an item with none is named by its type plus subType (`POSITION ACTUAL`). |
 | `channel` | The UNS-sanitized component path, then the id: `Axes/Linear[X]` + `xabs` → `axes/linear-x/xabs`. A device-level item publishes on its id alone. |
-| `publish` | SAMPLE: `on-change` with `batchMs` from `component.global.defaults.batchMs`, and **no deadband** — a units-aware default is not cleanly derivable (a millimeter on a micro-positioner and on a gantry are different facts), so none is invented; set one on an explicit entry when you want it. EVENT/CONDITION: `on-change`, immediate. |
+| `publish` | SAMPLE: the mode from `component.global.defaults.publishMode` with `batchMs` from `component.global.defaults.batchMs`, and **no deadband** — a units-aware default is not cleanly derivable (a millimeter on a micro-positioner and on a gantry are different facts), so none is invented; set one on an explicit entry when you want it. EVENT/CONDITION: `on-change`, immediate. |
 | `conditionBinding` | Under `autoConditionBinding` (the default), the CONDITION data items of the signal's own component; a CONDITION signal itself binds nothing. |
 
 ### Precedence: explicit entries win, field by field

@@ -105,6 +105,11 @@ pub struct SelectionConfig {
     /// `selection` document itself. Derived SAMPLE signals publish with this coalescing window.
     #[serde(skip)]
     pub default_batch_ms: u32,
+    /// The `component.global.defaults.publishMode` in force — resolved at compile time, like
+    /// [`Self::default_batch_ms`]. Derived SAMPLE signals publish in this mode; derived
+    /// EVENT/CONDITION signals are always `on-change`, immediate.
+    #[serde(skip)]
+    pub default_publish_mode: PublishMode,
 }
 
 fn default_max_signals() -> usize {
@@ -123,6 +128,7 @@ impl Default for SelectionConfig {
             max_signals: DEFAULT_MAX_SIGNALS,
             auto_condition_binding: true,
             default_batch_ms: 0,
+            default_publish_mode: PublishMode::OnChange,
         }
     }
 }
@@ -477,7 +483,7 @@ pub fn served_set(
         let default_publish = || -> PublishCfg {
             match item.category {
                 Category::Sample => PublishCfg {
-                    mode: PublishMode::OnChange,
+                    mode: sel.default_publish_mode,
                     batch_ms: sel.default_batch_ms,
                     deadband: None,
                 },
@@ -843,17 +849,23 @@ mod tests {
     }
 
     #[test]
-    fn the_sample_batch_window_comes_from_the_resolved_default() {
+    fn the_sample_batch_window_and_mode_come_from_the_resolved_defaults() {
         let m = model();
         let mut s = sel(json!({ "mode": "include", "include": [{ "idMatch": "Xabs" }] }));
         s.default_batch_ms = 250;
+        s.default_publish_mode = PublishMode::Interval;
         let set = served_set(&[], Some(&s), Some(&m));
-        assert_eq!(set.signals[0].signal.publish_policy().batch_ms, 250);
-        // ... and events stay immediate regardless.
+        let p = set.signals[0].signal.publish_policy();
+        assert_eq!(p.batch_ms, 250, "defaults.batchMs is the derived SAMPLE window");
+        assert_eq!(p.mode, PublishMode::Interval, "defaults.publishMode is the derived SAMPLE mode");
+        // ... and events stay on-change immediate regardless.
         let mut s = sel(json!({ "mode": "include", "include": [{ "idMatch": "execution" }] }));
         s.default_batch_ms = 250;
+        s.default_publish_mode = PublishMode::Interval;
         let set = served_set(&[], Some(&s), Some(&m));
-        assert_eq!(set.signals[0].signal.publish_policy().batch_ms, 0);
+        let p = set.signals[0].signal.publish_policy();
+        assert_eq!(p.batch_ms, 0);
+        assert_eq!(p.mode, PublishMode::OnChange, "an EVENT's state is never latest-only coalesced");
     }
 
     #[test]

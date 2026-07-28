@@ -11,8 +11,8 @@
 
 use std::path::Path;
 
-use mtconnect_adapter::app::{compile_mtconnect, DeviceConfig};
-use mtconnect_adapter::mtconnect::config::parse_agents;
+use mtconnect_adapter::app::{compile_mtconnect, DeviceConfig, PublishDefaults};
+use mtconnect_adapter::mtconnect::config::{parse_agents, PublishMode};
 use serde_json::{json, Value};
 
 fn schema() -> Value {
@@ -72,7 +72,7 @@ fn the_shipped_mtconnect_configuration_compiles_through_the_semantic_validator()
         .iter()
         .map(|v| serde_json::from_value(v.clone()).expect("instance"))
         .collect();
-    let compiled = compile_mtconnect(&mut devices, &agents, 0).expect("bindings resolve");
+    let compiled = compile_mtconnect(&mut devices, &agents, PublishDefaults::default()).expect("bindings resolve");
 
     assert_eq!(compiled.len(), 1);
     assert_eq!(compiled[0].device_uuid, "OKUMA.123456");
@@ -94,7 +94,7 @@ fn the_shipped_simulator_configuration_still_works() {
     assert_eq!(devices[0].adapter, "sim");
     assert_eq!(devices[0].connection.endpoint, "sim://device-1");
     // No MTConnect instances, so no agent is needed.
-    assert!(compile_mtconnect(&mut devices, &[], 0).unwrap().is_empty());
+    assert!(compile_mtconnect(&mut devices, &[], PublishDefaults::default()).unwrap().is_empty());
 }
 
 #[test]
@@ -202,11 +202,21 @@ fn the_selection_block_is_additive_closed_and_validated() {
     let agents = parse_agents(&json!({ "agents": [{ "id": "line-a-agent", "url": "http://a:5000" }] }))
         .unwrap();
     let mut devices: Vec<DeviceConfig> = vec![serde_json::from_value(minimal).unwrap()];
-    let compiled = compile_mtconnect(&mut devices, &agents, 250).expect("compiles");
+    let compiled = compile_mtconnect(
+        &mut devices,
+        &agents,
+        PublishDefaults { batch_ms: 250, publish_mode: PublishMode::Interval },
+    )
+    .expect("compiles");
     let selection = compiled[0].selection.as_ref().expect("the selection rides the compile");
     assert_eq!(selection.max_signals, 500, "the derived-set cap defaults to 500");
     assert!(selection.auto_condition_binding, "auto conditionBinding defaults on");
     assert_eq!(selection.default_batch_ms, 250, "defaults.batchMs is stamped in at compile");
+    assert_eq!(
+        selection.default_publish_mode,
+        PublishMode::Interval,
+        "defaults.publishMode is stamped in at compile"
+    );
 
     // The full shape.
     validate_instance(&json!({
@@ -259,7 +269,10 @@ fn the_selection_block_is_additive_closed_and_validated() {
         "selection": { "mode": "include", "include": [{ "type": "(" }] }
     }))
     .unwrap()];
-    assert!(compile_mtconnect(&mut bad, &agents, 0).is_err(), "a bad pattern never commits");
+    assert!(
+        compile_mtconnect(&mut bad, &agents, PublishDefaults::default()).is_err(),
+        "a bad pattern never commits"
+    );
 
     // A `sim` instance has no probe to derive from: selection is refused there.
     let mut sim: Vec<DeviceConfig> = vec![serde_json::from_value(json!({
@@ -268,7 +281,7 @@ fn the_selection_block_is_additive_closed_and_validated() {
         "selection": { "mode": "all" }
     }))
     .unwrap()];
-    assert!(compile_mtconnect(&mut sim, &[], 0).is_err());
+    assert!(compile_mtconnect(&mut sim, &[], PublishDefaults::default()).is_err());
 }
 
 #[test]

@@ -71,8 +71,8 @@ pub struct DeviceConfig {
 ///
 /// The endpoint is **derived, never configured** (HLD §5.1): an instance names an agent and a
 /// device uuid, and `mtconnect://<host>[:<port>]/<uuid>` follows from them, so the two can never
-/// disagree. `default_batch_ms` is `component.global.defaults.batchMs`, the coalescing window a
-/// selection-derived SAMPLE signal publishes with.
+/// disagree. `defaults` carries `component.global.defaults.batchMs` and `.publishMode` — the
+/// coalescing window and publish mode a selection-derived SAMPLE signal publishes with.
 ///
 /// # Errors
 /// [`MtcError::Config`] naming the offending instance when a binding is missing, an agent is
@@ -81,7 +81,7 @@ pub struct DeviceConfig {
 pub fn compile_mtconnect(
     devices: &mut [DeviceConfig],
     agents: &[crate::mtconnect::config::AgentConfig],
-    default_batch_ms: u32,
+    defaults: PublishDefaults,
 ) -> std::result::Result<Vec<crate::mtconnect::config::DeviceConfig>, crate::mtconnect::MtcError>
 {
     use crate::mtconnect::MtcError;
@@ -114,7 +114,8 @@ pub fn compile_mtconnect(
                 crate::device::endpoint_description(&agent.url, &device_uuid);
         }
         let selection = device.selection.clone().map(|mut s| {
-            s.default_batch_ms = default_batch_ms;
+            s.default_batch_ms = defaults.batch_ms;
+            s.default_publish_mode = defaults.publish_mode;
             s
         });
         compiled.push(crate::mtconnect::config::DeviceConfig {
@@ -129,16 +130,31 @@ pub fn compile_mtconnect(
     Ok(compiled)
 }
 
-/// The `component.global.defaults.batchMs` of a raw global object (`0` when unset) — the batch
-/// window selection-derived SAMPLE signals publish with.
+/// The publish defaults of `component.global.defaults` that selection-derived SAMPLE signals
+/// compile with (D-MtconnectAdapter-L10): the coalescing window (`batchMs`) and the publish mode
+/// (`publishMode`). Explicit signals set their own `publish` block instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PublishDefaults {
+    pub batch_ms: u32,
+    pub publish_mode: crate::mtconnect::config::PublishMode,
+}
+
+/// The [`PublishDefaults`] of a raw global object: `defaults.batchMs` (`0` when unset) and
+/// `defaults.publishMode` (`on-change` when unset).
 #[must_use]
-pub fn default_batch_ms_of(global: &serde_json::Value) -> u32 {
-    global
-        .get("defaults")
+pub fn publish_defaults_of(global: &serde_json::Value) -> PublishDefaults {
+    let defaults = global.get("defaults");
+    let batch_ms = defaults
         .and_then(|d| d.get("batchMs"))
         .and_then(serde_json::Value::as_u64)
         .and_then(|v| u32::try_from(v).ok())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let publish_mode = match defaults.and_then(|d| d.get("publishMode")).and_then(serde_json::Value::as_str)
+    {
+        Some("interval") => crate::mtconnect::config::PublishMode::Interval,
+        _ => crate::mtconnect::config::PublishMode::OnChange,
+    };
+    PublishDefaults { batch_ms, publish_mode }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

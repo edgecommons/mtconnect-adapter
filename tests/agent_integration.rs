@@ -512,3 +512,122 @@ async fn selection_mode_all_derives_the_tiny_devices_signals_live() {
     );
     session.close().await;
 }
+
+// =================================================================================================
+// Publish shaping, live: a batched signal coalesces real streamed readings (the tiny device)
+// =================================================================================================
+
+#[tokio::test]
+async fn a_batched_signal_coalesces_live_streamed_readings_into_one_update() {
+    let Some(_url) = main_agent_url() else { return };
+    let _serial = SERIAL.lock().await;
+    let url = tiny_agent_url();
+    let feed = ShdrFeed::start(7403).await;
+    feed.send("|tavail|AVAILABLE");
+    feed.send("|Tpos|40.0");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    use mtconnect_adapter::device::{ConnectionConfig, DeviceBackend, MtcBackend};
+    use mtconnect_adapter::mtconnect::config::DeviceConfig;
+    use mtconnect_adapter::shaping::Shaper;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    let rt = runtime(&url, json!({}));
+    rt.spawn().unwrap(); // streaming acquisition: read_signals drains what the task delivers
+    let device = DeviceConfig {
+        id: "tiny".into(),
+        agent_id: "live-agent".into(),
+        device_uuid: DEV_TINY.into(),
+        signals: vec![serde_json::from_value(json!({
+            "id": "t-pos", "dataItemId": "t1-Tpos", "publish": { "batchMs": 60000 }
+        }))
+        .unwrap()],
+        selection: None,
+    };
+    let backend = MtcBackend::new(
+        HashMap::from([("live-agent".to_string(), Arc::clone(&rt))]),
+        vec![device],
+    );
+    let conn: ConnectionConfig = serde_json::from_value(json!({
+        "agentId": "live-agent", "deviceUuid": DEV_TINY
+    }))
+    .unwrap();
+    let mut session = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match backend.connect(&conn).await {
+                Ok(session) => return session,
+                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+    })
+    .await
+    .expect("tiny agent reachable");
+
+    // The session compiled the policy table from the live probe: the SAMPLE keeps its window.
+    let mut shaper = Shaper::new();
+    let policies = session.shaping_policies();
+    assert_eq!(policies["t-pos"].batch_ms, 60_000, "the live-compiled policy");
+    let _ = shaper.set_policies(policies);
+
+    // Feed three values and pump real streamed readings through the engine: every t-pos reading
+    // must BUFFER (none released), and the flush must carry them in arrival order.
+    let wanted = [41.25, 42.25, 43.25];
+    let mut fed = 0usize;
+    let mut buffered: Vec<f64> = Vec::new();
+    tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            if fed < wanted.len() {
+                feed.send(&format!("|Tpos|{}", wanted[fed]));
+                fed += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let readings = session.read_signals().await.expect("live drain");
+            for reading in readings {
+                if reading.signal_id != "t-pos" {
+                    continue;
+                }
+                let value = reading.value.clone().and_then(|v| v.as_f64());
+                let good = reading.quality == mtconnect_adapter::device::Quality::Good;
+                let released = shaper.offer(reading, Instant::now());
+                if good {
+                    assert!(
+                        released.is_empty(),
+                        "a GOOD reading of a batched signal must buffer, not publish: {released:?}"
+                    );
+                }
+                // A BAD reading (the pre-feed UNAVAILABLE) flushing immediately is the engine's
+                // quality rule working as designed.
+                if let Some(v) = value {
+                    if wanted.contains(&v) && buffered.last() != Some(&v) {
+                        buffered.push(v);
+                    }
+                }
+            }
+            if buffered == wanted {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the three fed values buffer through the live stream");
+
+    let flushed = shaper.flush_all();
+    assert_eq!(flushed.len(), 1, "ONE update for the whole window");
+    let values: Vec<f64> = flushed[0]
+        .iter()
+        .filter_map(|r| r.value.clone().and_then(|v| v.as_f64()))
+        .filter(|v| wanted.contains(v))
+        .collect();
+    assert_eq!(values, wanted, "arrival order, every reading its own sample");
+    assert!(
+        flushed[0].iter().all(|r| r.extra.as_ref().is_some_and(|e| e.contains_key("sequence"))),
+        "each buffered sample keeps its own sequence extra"
+    );
+    println!(
+        "EVIDENCE live shaping: buffered={:?} flushed_samples={} (one update)",
+        buffered,
+        flushed[0].len()
+    );
+    session.close().await;
+}

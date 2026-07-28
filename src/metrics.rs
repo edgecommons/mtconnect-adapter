@@ -11,6 +11,7 @@
 //! | `southbound_health` | `instance` | the §5 canonical set (below) — every adapter emits this |
 //! | `MtconnectAdapterConnection` | `instance` | the connect/reconnect lifecycle |
 //! | `MtconnectAdapterCommand` | `instance`, `verb`, `result` | the `sb/*` command surface |
+//! | `MtconnectAdapterShaping` | `instance` | the publish-shaping engine — updates published, readings coalesced into batch windows, readings deadband-dropped |
 //!
 //! ## The Total/Interval counter convention
 //!
@@ -70,6 +71,12 @@ pub const HEALTH: &str = "southbound_health";
 pub const CONNECTION: &str = "MtconnectAdapterConnection";
 /// The worked operational family for the `sb/*` command surface, dimensioned `instance`×`verb`×`result`.
 pub const COMMAND: &str = "MtconnectAdapterCommand";
+/// The publish-shaping family, dimensioned `instance`: updates the engine released to the wire,
+/// readings coalesced into batch windows, and readings a deadband suppressed on entry. Per
+/// **instance** (not per agent) because shaping is a property of one device's publication flow —
+/// the engine sits above the session, where `MtconnectStream` measures the shared acquisition
+/// below it.
+pub const SHAPING: &str = "MtconnectAdapterShaping";
 /// HLD §9: the agent's acquisition family — documents, observations, heartbeats, reconnects, gaps,
 /// `OUT_OF_RANGE` recoveries, and request latency. Dimensioned `agentId`×`result`.
 pub const STREAM: &str = "MtconnectStream";
@@ -183,6 +190,17 @@ pub fn family_defs() -> Vec<FamilyDef> {
         measures: cmd,
     });
 
+    // MtconnectAdapterShaping — the publish-shaping engine (dims: instance).
+    let mut shaping = Vec::new();
+    shaping.extend(pair_defs("published"));
+    shaping.extend(pair_defs("coalesced"));
+    shaping.extend(pair_defs("deadbandDropped"));
+    out.push(FamilyDef {
+        name: SHAPING.to_string(),
+        dimensions: dims(&["instance"]),
+        measures: shaping,
+    });
+
     // --- the MTConnect families (HLD §9) ---------------------------------------------------------
 
     // MtconnectStream — one agent's acquisition (dims: agentId, result).
@@ -282,6 +300,29 @@ impl ConnCounters {
         self.connection_drops.drain_into(&mut v, "connectionDrops");
         v.insert("connectedDurationMs".to_string(), self.connected_accrued_ms);
         self.connected_accrued_ms = 0.0;
+        v
+    }
+}
+
+#[derive(Default)]
+struct ShapeCounters {
+    published: Pair,
+    coalesced: Pair,
+    deadband_dropped: Pair,
+}
+
+impl ShapeCounters {
+    fn add(&mut self, c: crate::shaping::ShapingCounters) {
+        self.published.add(c.published as f64);
+        self.coalesced.add(c.coalesced as f64);
+        self.deadband_dropped.add(c.deadband_dropped as f64);
+    }
+
+    fn drain(&mut self) -> HashMap<String, f64> {
+        let mut v = HashMap::new();
+        self.published.drain_into(&mut v, "published");
+        self.coalesced.drain_into(&mut v, "coalesced");
+        self.deadband_dropped.drain_into(&mut v, "deadbandDropped");
         v
     }
 }
@@ -530,6 +571,8 @@ async fn emit_family(
 struct Inner {
     conn: ConnCounters,
     command: std::collections::BTreeMap<(&'static str, &'static str), CmdCounters>,
+    /// The publish-shaping engine's counters ([`SHAPING`]), fed by the device task.
+    shaping: ShapeCounters,
     /// Per-signal last-update instant — the staleness tracker driving `southbound_health.staleSignals`.
     last_update: HashMap<String, Instant>,
     /// The agent's parse totals at the previous [`PARSE`] emit.
@@ -624,6 +667,12 @@ impl DeviceMetrics {
         self.inner.lock().unwrap().last_update.insert(signal_id.to_string(), now);
     }
 
+    /// Record what the publish-shaping engine did since it was last drained — feeds the
+    /// [`SHAPING`] family.
+    pub fn on_shaping(&self, counters: crate::shaping::ShapingCounters) {
+        self.inner.lock().unwrap().shaping.add(counters);
+    }
+
     /// Record one `sb/*` command outcome for its `(verb, result)` combo.
     pub fn record_command(&self, verb: &'static str, ok: bool, latency_ms: u64) {
         let result = if ok { RESULT_SUCCESS } else { RESULT_ERROR };
@@ -666,6 +715,7 @@ impl DeviceMetrics {
     pub fn define_all(&self) {
         self.define(HEALTH, &[("instance", self.instance())]);
         self.define(CONNECTION, &[("instance", self.instance())]);
+        self.define(SHAPING, &[("instance", self.instance())]);
         for verb in COMMAND_VERBS {
             for result in RESULTS {
                 self.define(COMMAND, &[("instance", self.instance()), ("verb", verb), ("result", result)]);
@@ -710,7 +760,15 @@ impl DeviceMetrics {
         self.emit_health(false).await;
         self.emit_connection(false).await;
         self.emit_command().await;
+        self.emit_shaping().await;
         self.emit_parse().await;
+    }
+
+    /// The `MtconnectAdapterShaping` family: what the publish-shaping engine did to this
+    /// instance's flow since the previous emit.
+    async fn emit_shaping(&self) {
+        let values = self.inner.lock().unwrap().shaping.drain();
+        self.emit_combo(SHAPING, &[("instance", self.instance())], values, false).await;
     }
 
     /// The `MtconnectParse` family for this instance: the agent's document-decode totals, diffed
@@ -1008,6 +1066,52 @@ mod tests {
         }
         assert!(names.contains(&"connectionState"), "the state gauge");
         assert!(names.contains(&"connectedDurationMs"), "the connected-duration sum");
+    }
+
+    /// The publish-shaping family: `instance`-dimensioned counter pairs for the three engine
+    /// outcomes — published, coalesced, deadband-dropped.
+    #[test]
+    fn the_shaping_family_is_instance_dimensioned_counter_pairs() {
+        let shaping = family_defs().into_iter().find(|f| f.name == SHAPING).unwrap();
+        assert_eq!(shaping.dimensions, vec!["instance"], "shaping is a per-instance fact");
+        let names: Vec<&str> = shaping.measures.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "publishedTotal",
+                "publishedInterval",
+                "coalescedTotal",
+                "coalescedInterval",
+                "deadbandDroppedTotal",
+                "deadbandDroppedInterval"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn shaping_counters_accumulate_and_drain_on_emit() {
+        let dm = dm(Arc::new(Health::default()), 30);
+        dm.on_shaping(crate::shaping::ShapingCounters {
+            published: 3,
+            coalesced: 7,
+            deadband_dropped: 2,
+        });
+        dm.on_shaping(crate::shaping::ShapingCounters { published: 1, ..Default::default() });
+        {
+            let mut inner = dm.inner.lock().unwrap();
+            let values = inner.shaping.drain();
+            assert_eq!(values["publishedTotal"], 4.0);
+            assert_eq!(values["publishedInterval"], 4.0);
+            assert_eq!(values["coalescedTotal"], 7.0);
+            assert_eq!(values["deadbandDroppedTotal"], 2.0);
+        }
+        // The emit path drains the interval; the total is monotonic.
+        dm.on_shaping(crate::shaping::ShapingCounters { published: 2, ..Default::default() });
+        dm.emit_periodic().await;
+        let mut inner = dm.inner.lock().unwrap();
+        let values = inner.shaping.drain();
+        assert_eq!(values["publishedTotal"], 6.0, "totals are monotonic across emits");
+        assert_eq!(values["publishedInterval"], 0.0, "the periodic emit drained the interval");
     }
 
     #[test]

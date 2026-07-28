@@ -264,6 +264,31 @@ pub trait DeviceSession: Send + Sync {
         None
     }
 
+    /// A token that changes whenever [`shaping_policies`](Self::shaping_policies) would — a signal
+    /// reload, a model drift that recompiled the served set. The supervisor's shaping engine
+    /// rebuilds its policy table only when this moves, and flushes the windows of changed signals
+    /// with their old policy. `None` (the default) means the caller derives the policies from
+    /// static configuration once, at session start.
+    fn shaping_generation(&self) -> Option<String> {
+        None
+    }
+
+    /// The per-signal publish-shaping policies this session serves, keyed by `signal_id` — only
+    /// the non-trivial ones (an absent entry is the immediate-publish default). A backend that
+    /// compiles its signals against a device model knows which policies really apply (MTConnect
+    /// grants a `deadband` only to numeric SAMPLE-category items); one that does not keeps the
+    /// default and lets the caller compile the static configuration instead.
+    fn shaping_policies(&self) -> std::collections::HashMap<String, crate::shaping::PublishPolicy> {
+        std::collections::HashMap::new()
+    }
+
+    /// Whether acquisition re-baselined since the last call — a fresh `/current` snapshot after an
+    /// attach or a resync ladder. The caller must let the next reading of every signal through the
+    /// deadband (the first reading after a resync always passes). Draining it resets it.
+    fn take_resync(&mut self) -> bool {
+        false
+    }
+
     /// Close the connection. Must be safe to call twice.
     async fn close(&mut self) {}
 }
@@ -575,8 +600,8 @@ mod tests {
 
 use std::collections::BTreeSet;
 
-use crate::mtconnect::config::{DeviceConfig as MtcDeviceConfig, SignalConfig};
-use crate::mtconnect::model::ProbeModel;
+use crate::mtconnect::config::{DeviceConfig as MtcDeviceConfig, PublishMode, SignalConfig};
+use crate::mtconnect::model::{Category, ProbeModel};
 use crate::mtconnect::observations::{CondState, ObsValue, Observation};
 use crate::mtconnect::selection::{served_set, ServedSignal};
 use crate::mtconnect::{AgentRuntime, InstanceEvent, MtcError};
@@ -855,6 +880,9 @@ pub struct MtcSession {
     notices: Vec<Notice>,
     /// When each condition data item last raised a `MtconnectConditionEvent` — the 1/min limiter.
     last_condition_event: HashMap<String, Instant>,
+    /// Acquisition re-baselined (a `/current` snapshot was drained) since the supervisor last
+    /// asked — the deadband's first-after-resync-passes trigger.
+    resynced: bool,
     closed: bool,
 }
 
@@ -880,6 +908,7 @@ impl MtcSession {
             unbound: Vec::new(),
             notices: Vec::new(),
             last_condition_event: HashMap::new(),
+            resynced: false,
             closed: false,
         };
         session.recompile();
@@ -1197,7 +1226,12 @@ impl DeviceSession for MtcSession {
             self.note(&event);
             match event {
                 InstanceEvent::Obs(obs) => observations.push(*obs),
-                InstanceEvent::Snapshot(batch) => observations.extend(batch),
+                InstanceEvent::Snapshot(batch) => {
+                    // A snapshot re-baselines the fleet's view (an attach, a resync ladder): the
+                    // supervisor's deadband must let its successors through as fresh.
+                    self.resynced = true;
+                    observations.extend(batch);
+                }
                 InstanceEvent::ModelDrift { .. } => drifted = true,
                 InstanceEvent::AgentDown(reason) => down = Some(reason),
                 InstanceEvent::AgentUp(_)
@@ -1289,6 +1323,43 @@ impl DeviceSession for MtcSession {
     /// arrives.
     fn served_signals(&self) -> Option<u64> {
         Some(self.served.len().saturating_sub(self.unbound.len()) as u64)
+    }
+
+    /// The browse `viewGeneration` shape (probe digest + signal generation): a reload moves the
+    /// right half, a model drift moves the left — and both change what
+    /// [`shaping_policies`](DeviceSession::shaping_policies) says, so both must rebuild the table.
+    fn shaping_generation(&self) -> Option<String> {
+        Some(crate::reload::view_generation(&self.model.digest_hex(), &self.generation))
+    }
+
+    /// The served set's effective publish policies (HLD §5.3): each served signal's `publish`
+    /// block — explicit, or selection-derived — compiled against the model. A `deadband` applies
+    /// only to a **SAMPLE**-category data item (the documented contract); on any other category —
+    /// or a data item the model does not have — it is dropped from the policy, so an EVENT's
+    /// state strings and a CONDITION's transitions are never numerically gated.
+    fn shaping_policies(&self) -> HashMap<String, crate::shaping::PublishPolicy> {
+        let mut out = HashMap::new();
+        for served in &self.served {
+            let sig = &served.signal;
+            let p = sig.publish_policy();
+            let is_sample = self
+                .model
+                .item(&sig.data_item_id)
+                .is_some_and(|item| item.category == Category::Sample);
+            let policy = crate::shaping::PublishPolicy {
+                batch_ms: p.batch_ms,
+                latest_only: p.mode == PublishMode::Interval,
+                deadband: if is_sample { p.deadband } else { None },
+            };
+            if !policy.is_trivial() {
+                out.insert(sig.id.clone(), policy);
+            }
+        }
+        out
+    }
+
+    fn take_resync(&mut self) -> bool {
+        std::mem::take(&mut self.resynced)
     }
 
     /// `sb/browse`: the probe tree, paged out of the cached model — so the address space stays
@@ -1737,6 +1808,119 @@ mod mtconnect_seam_tests {
         let readings = session.map_batch(&[obs("Xabs")]);
         assert_eq!(readings.len(), 1);
         assert_eq!(readings[0].signal_id, "x-position");
+    }
+
+    // --- publish shaping at the seam ----------------------------------------------------------
+
+    #[test]
+    fn shaping_policies_grant_a_deadband_only_to_sample_category_items() {
+        let mut sample = signal("x-position", "Xabs"); // SAMPLE in the fixture model
+        sample.publish = Some(serde_json::from_value(json!({ "batchMs": 250, "deadband": 0.5 })).unwrap());
+        let mut event = signal("execution", "execution"); // EVENT in the fixture model
+        event.publish = Some(serde_json::from_value(json!({ "deadband": 0.5 })).unwrap());
+        let mut condition = signal("x-travel", "Xtravel"); // CONDITION in the fixture model
+        condition.publish = Some(serde_json::from_value(json!({ "deadband": 1.0, "batchMs": 100 })).unwrap());
+        let mut unbound = signal("ghost", "no-such-item"); // not in the model at all
+        unbound.publish =
+            Some(serde_json::from_value(json!({ "deadband": 1.0, "batchMs": 50 })).unwrap());
+        let plain = signal("x-load", "Xload"); // no publish block: not worth a table entry
+
+        let agent = runtime("http://127.0.0.1:9");
+        let (_tx, rx) = mpsc::channel(4);
+        let session = MtcSession::new(
+            agent,
+            device(vec![sample, event, condition, unbound, plain]),
+            model(),
+            rx,
+        );
+        let policies = session.shaping_policies();
+
+        let x = &policies["x-position"];
+        assert_eq!(x.batch_ms, 250);
+        assert_eq!(x.deadband, Some(0.5), "a numeric SAMPLE keeps its deadband");
+        assert!(!x.latest_only);
+
+        assert!(
+            !policies.contains_key("execution"),
+            "an EVENT's deadband is dropped, leaving a trivial policy - no entry"
+        );
+        let c = &policies["x-travel"];
+        assert_eq!(c.deadband, None, "a CONDITION's states are never numerically gated");
+        assert_eq!(c.batch_ms, 100, "but its window still applies");
+        assert_eq!(policies["ghost"].deadband, None, "no model item, no category, no deadband");
+        assert!(!policies.contains_key("x-load"), "the default policy is not worth an entry");
+    }
+
+    #[test]
+    fn interval_mode_compiles_to_a_latest_only_policy() {
+        let mut sig = signal("x-position", "Xabs");
+        sig.publish =
+            Some(serde_json::from_value(json!({ "mode": "interval", "batchMs": 500 })).unwrap());
+        let agent = runtime("http://127.0.0.1:9");
+        let (_tx, rx) = mpsc::channel(4);
+        let session = MtcSession::new(agent, device(vec![sig]), model(), rx);
+        assert!(session.shaping_policies()["x-position"].latest_only);
+    }
+
+    #[test]
+    fn a_selection_derived_sample_signal_carries_the_default_batch_window() {
+        // D-MtconnectAdapter-L10: the derived SAMPLE window comes from defaults.batchMs — and the
+        // shaping table serves it, so the engine really batches derived signals.
+        let mut dev = selecting(vec![], json!({ "mode": "all" }));
+        if let Some(sel) = dev.selection.as_mut() {
+            sel.default_batch_ms = 250;
+            sel.default_publish_mode = PublishMode::Interval;
+        }
+        let agent = runtime("http://127.0.0.1:9");
+        let (_tx, rx) = mpsc::channel(4);
+        let session = MtcSession::new(agent, dev, model(), rx);
+        let policies = session.shaping_policies();
+        assert_eq!(policies["xabs"].batch_ms, 250, "derived SAMPLE: the defaults window");
+        assert!(policies["xabs"].latest_only, "derived SAMPLE: the defaults mode");
+        assert_eq!(policies["xabs"].deadband, None, "no derived deadband, ever (L10)");
+        assert!(!policies.contains_key("execution"), "derived EVENT: immediate, no entry");
+    }
+
+    #[test]
+    fn the_shaping_generation_moves_with_the_signal_set_and_the_model() {
+        let agent = runtime("http://127.0.0.1:9");
+        let (_tx, rx) = mpsc::channel(4);
+        let mut session =
+            MtcSession::new(Arc::clone(&agent), device(vec![signal("x", "Xabs")]), model(), rx);
+        let before = session.shaping_generation().expect("an MTConnect session has a generation");
+
+        // A publish-policy edit moves the generation (the reload swap re-arms the shaper).
+        let mut edited = signal("x", "Xabs");
+        edited.publish = Some(serde_json::from_value(json!({ "batchMs": 100 })).unwrap());
+        session.device.signals = vec![edited];
+        session.generation =
+            crate::reload::generation_of(&session.device.signals, session.device.selection.as_ref());
+        session.recompile();
+        let after = session.shaping_generation().unwrap();
+        assert_ne!(before, after, "a policy edit is a new shaping generation");
+
+        // The generation composes the probe digest too: a model drift recompiles categories.
+        assert!(after.starts_with(&session.model.digest_hex()), "probe digest leads the token");
+    }
+
+    #[tokio::test]
+    async fn a_drained_snapshot_marks_the_session_resynced_once() {
+        let agent = runtime("http://127.0.0.1:9");
+        let (tx, rx) = mpsc::channel(8);
+        let mut session =
+            MtcSession::new(agent, device(vec![signal("x", "Xabs")]), model(), rx);
+        assert!(!session.take_resync(), "nothing drained yet");
+
+        tx.send(InstanceEvent::Snapshot(vec![obs("Xabs")])).await.unwrap();
+        let readings = session.read_signals().await.unwrap();
+        assert!(!readings.is_empty());
+        assert!(session.take_resync(), "the snapshot re-baselined the view");
+        assert!(!session.take_resync(), "draining it resets it");
+
+        // A plain observation is NOT a resync.
+        tx.send(InstanceEvent::Obs(Box::new(obs("Xabs")))).await.unwrap();
+        session.read_signals().await.unwrap();
+        assert!(!session.take_resync());
     }
 
     // --- config plumbing ----------------------------------------------------------------------
