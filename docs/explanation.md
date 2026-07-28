@@ -102,7 +102,7 @@ a console that asks `sb/status` cannot get different answers, because there is o
 adapter's own richer vocabulary (`CONNECTING` / `ONLINE` / `BACKOFF`, and `PAUSED` when paused while
 online) — a boolean alone cannot distinguish "still trying" from "administratively paused".
 
-## Command routing and the allow-list
+## Command routing, and why nothing is writable
 
 The command surface rides the library's inbox, which subscribes both cmd wildcards
 (`ecv1/{device}/mtconnect-adapter/cmd/#` and `ecv1/{device}/mtconnect-adapter/+/cmd/#`). Every `sb/*` verb
@@ -112,6 +112,15 @@ body instead, and a body `instance` disagreeing with the topic token is `BAD_ARG
 receives the resolved instance and only does the part that needs this component's configuration —
 an instance it has no device for is `NO_SUCH_INSTANCE`, and an unnamed one is the sole configured
 device, or `BAD_ARGS` once there are two or more.
-Writes are allow-listed **by stable `signal.id`**, checked before any device I/O — an adapter that
-writes whatever address it is asked to is a control-system vulnerability, not a feature, so the
-default (`writes.allow: []`) is read-only, and opening it up is a deliberate per-signal act.
+`sb/write` is registered and permanently refused. MTConnect's API is read-only by specification
+(Part 1 Fundamentals §5.1): an agent serves observations, and there is no write path to allow-list.
+The verb stays on the surface so a caller gets a standard, explanatory `WRITE_NOT_ALLOWED` instead
+of "unknown verb", the refusal precedes any inspection of the request, and the same fact is
+advertised through command availability (`unsupported`) so a console never renders a write control.
+`writes.allow` is pinned to the empty array by the configuration schema, so no configuration can
+disagree with the protocol.
+
+`sb/status` and `sb/browse` are answered from the agent runtime's *published* state — a lock-free
+snapshot of the agent's document headers and the cached probe model. Neither ever queues behind
+acquisition, and browsing keeps working while the agent is unreachable, because the address space
+came from the probe, not from the wire.

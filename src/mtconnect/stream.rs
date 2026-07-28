@@ -1,21 +1,29 @@
-//! # Streaming acquisition — the heartbeat supervision half (LLD §5, ladder 1)
+//! # Streaming acquisition — supervision and classification (LLD §5/§6)
 //!
 //! The streaming path reads one long multipart response ([`super::multipart`]), classifies each
-//! part, and drives the recovery ladders in [`super::sequence`]. What lives here today is the piece
-//! every ladder depends on and that can be decided without a socket: **liveness**.
+//! part, and drives the recovery ladders in [`super::sequence`]. This module owns the pieces that
+//! can be decided without an `AgentRuntime`:
 //!
-//! An MTConnect agent that has nothing to say still sends an *empty* Streams document every
-//! `heartbeat` milliseconds. Silence past that window means the connection is dead even though TCP
-//! has not noticed — and a TCP-only view of liveness is exactly how a stalled stream goes unnoticed
-//! for hours. [`HeartbeatWatch`] carries the window (2× the agent's heartbeat, LLD ladder 1) and the
-//! last time anything arrived; the state machine drops and re-establishes the stream from
-//! `nextSequence` when it expires.
-//!
-//! The part classifier and the reconnect loop that consume [`PartOutcome`] land with the streaming
-//! milestone; the vocabulary is fixed here so the poll path, the ladders, and the metrics families
-//! already agree on what a part *is*.
+//! * **Liveness** ([`HeartbeatWatch`]): an MTConnect agent that has nothing to say still sends an
+//!   *empty* Streams document every `heartbeat` milliseconds. Silence past that window means the
+//!   connection is dead even though TCP has not noticed — and a TCP-only view of liveness is
+//!   exactly how a stalled stream goes unnoticed for hours. The watch carries the window (2× the
+//!   agent's heartbeat, ladder 1) and the last time anything arrived; the state machine drops and
+//!   re-establishes the stream from `nextSequence` when it expires.
+//! * **Classification** ([`classify_part`]): one part is a Streams document, an Errors document, or
+//!   garbage — and the reader must not guess. The parsed document rides along so it is tokenized
+//!   exactly once.
+//! * **The transport seam** ([`ChunkSource`]): the state machine consumes chunks through this
+//!   trait, which is what lets the virtual-clock sequence tests drive every ladder with a scripted
+//!   source instead of a socket.
+//! * **The exit vocabulary** ([`StreamExit`]): every way a live stream ends, each mapping to one
+//!   rung of the LLD §5 recovery ladder.
 
 use std::time::{Duration, Instant};
+
+use super::error::MtcError;
+use super::multipart::Part;
+use super::xml::{self, DocKind, ErrorsDoc, StreamsDoc};
 
 /// What one part of a multipart stream turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +47,80 @@ impl PartOutcome {
     pub fn is_liveness(&self) -> bool {
         !matches!(self, Self::Undecodable)
     }
+}
+
+/// A source of multipart body chunks — the transport seam the streaming state machine reads
+/// through. [`super::client::StreamResponse`] is the live implementation; the virtual-clock
+/// sequence tests implement it with a script.
+pub trait ChunkSource: Send {
+    /// The next chunk of the body, or `None` at end of stream.
+    fn next_chunk(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, MtcError>> + Send;
+}
+
+/// One classified — and, when readable, parsed — multipart part.
+#[derive(Debug)]
+pub enum PartDoc {
+    /// A Streams document: observations, or the agent's empty heartbeat.
+    Streams(StreamsDoc),
+    /// An `MTConnectError(s)` document.
+    Errors(ErrorsDoc),
+    /// A well-formed document of a kind that has no business in a `/sample` stream (a Devices
+    /// document, an HTML error page). Named for the log; counted as undecodable.
+    Unexpected(String),
+    /// A part that could not be read at all.
+    Unreadable(MtcError),
+}
+
+/// Classify one part by its root element, parsing it exactly once.
+#[must_use]
+pub fn classify_part(part: &Part) -> PartDoc {
+    let text = match part.text() {
+        Ok(t) => t,
+        Err(e) => return PartDoc::Unreadable(e),
+    };
+    let doc = match xml::parse_document(text) {
+        Ok(doc) => doc,
+        Err(e) => return PartDoc::Unreadable(e),
+    };
+    match xml::document_kind(&doc.root.name) {
+        DocKind::Streams => match xml::streams_from_doc(doc) {
+            Ok(d) => PartDoc::Streams(d),
+            Err(e) => PartDoc::Unreadable(e),
+        },
+        DocKind::Errors => match xml::errors_from_doc(doc) {
+            Ok(d) => PartDoc::Errors(d),
+            Err(e) => PartDoc::Unreadable(e),
+        },
+        DocKind::Devices => PartDoc::Unexpected("MTConnectDevices".into()),
+        DocKind::Unknown(name) => PartDoc::Unexpected(name),
+    }
+}
+
+/// Every way a live stream ends. Each variant maps onto one rung of the LLD §5 recovery ladder —
+/// the state machine in [`super::AgentRuntime`] matches on this and nothing else.
+#[derive(Debug)]
+pub enum StreamExit {
+    /// Nothing arrived within 2× the heartbeat: the stream is dead even if TCP disagrees.
+    /// Re-establish from the same `nextSequence` (ladder 1).
+    HeartbeatMissed,
+    /// The transport failed mid-stream. Re-establish from the same `nextSequence` (ladder 1).
+    TransportLost(MtcError),
+    /// The multipart framing broke, a part was oversize, or parts stopped being decodable.
+    /// Re-establish from the same `nextSequence` (ladder 1).
+    Malformed(MtcError),
+    /// The agent closed the response body. Re-establish (ladder 1).
+    EndOfStream,
+    /// The agent's buffer ran past our position: `DataLoss`, snapshot republish, resume from the
+    /// snapshot's `nextSequence` (ladder 2).
+    OutOfRange { first_sequence: u64 },
+    /// The agent restarted (`instanceId` changed): full resync (ladder 3).
+    InstanceChanged,
+    /// A `reconnect` control request asked for a full drop + re-probe.
+    CtlReconnect,
+    /// Shutdown was requested; the acquisition task returns.
+    Shutdown,
 }
 
 /// Liveness supervision for one stream.

@@ -105,14 +105,13 @@ Two devices behind one adapter process, one of them with a writable signal and a
   own entry in the `state` keepalive's `instances[]` array. One going down does not affect the
   other.
 - **`instance` becomes required.** With only one device configured, a command body may omit
-  `instance`; with two, `sb/status`/`sb/read`/`sb/write`/etc. **must** name one (`BAD_ARGS` if
+  `instance`; with two, `sb/status`/`sb/read`/`sb/browse`/etc. **must** name one (`BAD_ARGS` if
   missing, `NO_SUCH_INSTANCE` if the name is not configured).
 - **`skid-1` polls 5× faster** (`pollIntervalMs: 1000` overrides the `global.defaults` value of
   `5000`), independent of `skid-2`, which inherits the default.
-- **`skid-1.temperature-1` is writable.** A `sb/write` naming `temperature-1` on `skid-1` is
-  allow-listed and reaches the simulator's `write_signal` (which just logs and accepts it); the same
-  write addressed at `skid-2` — or at any other signal id on `skid-1` — is refused with
-  `WRITE_NOT_ALLOWED` before any device I/O happens.
+- **Nothing is writable anywhere.** `sb/write` answers `WRITE_NOT_ALLOWED` for every request on
+  every instance, before any entry is inspected: MTConnect's API is read-only by specification, and
+  `writes.allow` is pinned empty by the schema.
 - **A shorter staleness window** (`staleSignalSecs: 15`) means `southbound_health.staleSignals`
   trips sooner if a device stops updating — useful when the deployment expects tighter freshness
   than the 30-second scaffold default.

@@ -88,6 +88,13 @@ impl StreamResponse {
     }
 }
 
+/// The live implementation of the streaming state machine's transport seam.
+impl super::stream::ChunkSource for StreamResponse {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, MtcError> {
+        StreamResponse::next_chunk(self).await
+    }
+}
+
 impl MtcClient {
     /// Build the client for one agent.
     ///

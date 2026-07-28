@@ -822,7 +822,9 @@ impl DeviceSession for MtcSession {
                 InstanceEvent::Snapshot(batch) => observations.extend(batch),
                 InstanceEvent::ModelDrift { .. } => drifted = true,
                 InstanceEvent::AgentDown(reason) => down = Some(reason),
-                InstanceEvent::AgentUp(_) | InstanceEvent::DataLoss { .. } => {}
+                InstanceEvent::AgentUp(_)
+                | InstanceEvent::DataLoss { .. }
+                | InstanceEvent::StreamDegraded { .. } => {}
             }
         }
         if drifted {

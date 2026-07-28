@@ -357,7 +357,16 @@ fn count_unknown_device_elements(e: &XmlElem, in_components: bool) -> u64 {
 /// [`MtcError::Xml`] for malformed XML, a cap breach, or a wrong root;
 /// [`MtcError::UnsupportedVersion`] below the 1.3 floor.
 pub fn parse_streams(xml: &str) -> Result<StreamsDoc, MtcError> {
-    let doc = parse_document(xml)?;
+    streams_from_doc(parse_document(xml)?)
+}
+
+/// Build a [`StreamsDoc`] from an already-tokenized document — the streaming reader's path, where
+/// the root had to be sniffed first ([`document_kind`]) and tokenizing twice would double the cost
+/// of every part.
+///
+/// # Errors
+/// [`MtcError::Xml`] when the root is not `MTConnectStreams`.
+pub fn streams_from_doc(doc: XmlDoc) -> Result<StreamsDoc, MtcError> {
     expect_root(&doc.root, "MTConnectStreams")?;
 
     let header = doc.root.child("Header").map(MtcHeader::from_elem).unwrap_or_default();
@@ -420,7 +429,14 @@ fn collect_component_streams(e: &XmlElem, out: &mut Vec<StreamEntry>, unknown: &
 /// [`MtcError::Xml`] for malformed XML, a cap breach, or a wrong root;
 /// [`MtcError::UnsupportedVersion`] below the 1.3 floor.
 pub fn parse_errors(xml: &str) -> Result<ErrorsDoc, MtcError> {
-    let doc = parse_document(xml)?;
+    errors_from_doc(parse_document(xml)?)
+}
+
+/// Build an [`ErrorsDoc`] from an already-tokenized document (see [`streams_from_doc`]).
+///
+/// # Errors
+/// [`MtcError::Xml`] when the root is not an `MTConnectError(s)` element.
+pub fn errors_from_doc(doc: XmlDoc) -> Result<ErrorsDoc, MtcError> {
     let root = &doc.root;
     if document_kind(&root.name) != DocKind::Errors {
         return Err(MtcError::Xml(format!(

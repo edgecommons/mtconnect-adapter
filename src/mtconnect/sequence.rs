@@ -15,8 +15,9 @@
 //!   starts over, so every floor and the `next` cursor must be reset before anything is published,
 //!   or a fresh observation would be discarded as "older" than a number from a dead incarnation.
 //!
-//! Only the polling path is exercised today; the streaming ladders (heartbeat expiry, `OUT_OF_RANGE`
-//! recovery, `instanceId` resync) are driven by [`super::stream`] against this same state.
+//! The polling path and the streaming ladders (heartbeat expiry, `OUT_OF_RANGE` recovery,
+//! `instanceId` resync) both drive this same state — the state machine lives in
+//! [`super::AgentRuntime`], the vocabulary in [`super::stream`].
 
 use std::collections::HashMap;
 

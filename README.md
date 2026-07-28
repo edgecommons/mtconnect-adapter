@@ -89,21 +89,21 @@ knowing your protocol. `state` is this adapter's **own** vocabulary (`CONNECTING
 `attributes` is an **open** bag for domain data, so what only your adapter understands rides along
 without destabilizing the two fields every consumer relies on.
 
-## Writes are allow-listed, and the list is empty by default
+## Nothing is writable — MTConnect is a read-only protocol
 
 ```json
-{ "id": "device-1", "adapter": "sim",
-  "connection": { "endpoint": "sim://device-1" },
-  "pollIntervalMs": 5000,
+{ "id": "cnc-1", "adapter": "mtconnect",
+  "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.123456" },
   "writes": { "allow": [] } }
 ```
 
-Only signal ids in `writes.allow` can be written, matched on the **stable `signal.id`** and checked
-before the write ever reaches the device. Anything else is refused, whatever the command asks for.
-An adapter that will write any address it is handed is a control-system vulnerability, not a
-convenience — so the default is read-only, and opening it is a deliberate act.
-
-A write is **confirmed**: the command's reply is the device's answer, not "we sent it".
+MTConnect's API is read-only by specification (Part 1 Fundamentals §5.1): an agent serves
+observations, and there is nothing to write. `sb/write` stays registered — so a caller gets a
+standard, explanatory `WRITE_NOT_ALLOWED` instead of "unknown verb" — and the refusal precedes any
+inspection of the request, so no entry is ever resolved and nothing reaches a device. The same fact
+is advertised through command availability (`unsupported`), so a console disables the surface
+instead of offering a control that can never work, and `writes.allow` is pinned to the empty array
+by the configuration schema.
 
 `connection` is deliberately **open** — every protocol needs different keys (a unit id, a security
 policy, a slave address). Everything else in `config.schema.json` is closed, so a typo is caught.
@@ -116,9 +116,13 @@ The adapter serves the generic southbound `sb/*` family on its `commands()` inbo
 the topic's instance token (`…/{instance}/cmd/{verb}`), else a body `instance`, a conflict between
 them refused with `BAD_ARGS` — and this module maps the resolved instance onto a configured device
 (unnamed means the sole one; required once more than one is configured). Every session-touching verb
-is handed to the device's own task over a
-control channel and confirmed through the reply that rides it, so the inbox never touches a live
-connection. The same module registers three edge-console panels — `overview`, `signals`,
-`diagnostics` — an adapter-overview summary with lifecycle bindings, a signal grid bound to
-`sb/signals`, and a hierarchical inventory tree driving `sb/browse`'s `ref` mode. `repoll` is
-refused with `PAUSED` while the instance is paused.
+is handed to the device's own task over a control channel and confirmed through the reply that rides
+it, so the inbox never touches a live connection — while `sb/status` and `sb/browse` answer from the
+agent runtime's *published* state (its document headers and cached probe model), so neither queues
+behind acquisition and the address space stays browsable while the agent is unreachable.
+
+The same module registers five edge-console panels — `overview` (a status dashboard, the lifecycle
+action bar, and link-health metrics), `device-structure` (the probe tree over `sb/browse`'s `ref`
+mode), `signals` (a signal grid bound to `sb/signals`), `conditions` (condition/data-loss/agent
+events), and `diagnostics` (sequence and buffer state, agent events, stream metrics). None of them
+advertises a write surface. `repoll` is refused with `PAUSED` while the instance is paused.

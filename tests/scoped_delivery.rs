@@ -305,6 +305,10 @@ impl Harness {
                 health: Arc::clone(&health),
                 dm,
                 signals: vec![SignalInfo { id: "setpoint-1".into(), name: Some("Setpoint".into()) }],
+                // These devices are the template simulator: no MTConnect agent behind them, so
+                // there is no published protocol view to read (the addressing contract this suite
+                // proves is protocol-independent).
+                protocol: None,
             });
             healths.push(health);
         }
@@ -428,6 +432,45 @@ async fn a_body_instance_conflicting_with_the_topic_is_refused_before_dispatch()
     let body = h.send("sb/pause", Some("plc-1"), json!({})).await;
     assert_eq!(body["result"]["paused"], json!(true));
     assert_eq!(h.control_calls(), vec!["pause".to_string()]);
+    h.inbox.stop().await;
+}
+
+#[tokio::test]
+async fn describe_advertises_sb_write_as_permanently_unsupported() {
+    // D-MTC-7: `sb/write` is registered (so a request gets a real, standard refusal) and advertised
+    // `unsupported` through the command-availability surface, so a console disables the surface
+    // instead of offering a write that can never work. Registration order matters: the availability
+    // is set after the verbs and before the panels, inside the pre-activation window.
+    let h = Harness::start(&["plc-1"]).await;
+    let body = h.send("describe", None, json!({})).await;
+    let commands = body["result"]["commands"].as_array().expect("a commands array");
+
+    let write = commands.iter().find(|c| c["verb"] == json!("sb/write")).expect("sb/write is registered");
+    assert_eq!(write["availability"]["state"], json!("unsupported"));
+    assert_eq!(write["availability"]["reason"], json!("MTConnect is read-only"));
+
+    // Every other verb is plainly available — availability is a capability statement about this
+    // protocol, not a blanket disablement.
+    for verb in VERBS.iter().filter(|v| **v != "sb/write") {
+        let entry = commands.iter().find(|c| c["verb"] == json!(verb)).expect("registered");
+        assert!(entry.get("availability").is_none(), "{verb} is available");
+    }
+
+    // And the wire refusal matches what the manifest says.
+    let reply = h.send("sb/write", Some("plc-1"), json!({ "signalId": "setpoint-1", "value": 1 })).await;
+    assert_eq!(reply["ok"], json!(false));
+    assert_eq!(reply["error"]["code"], json!("WRITE_NOT_ALLOWED"));
+    assert!(h.control_calls().is_empty(), "a refused write never reaches a device task");
+
+    // The five HLD §8 views are on the same descriptor, in order, and none of them is a write
+    // surface.
+    let panels = &body["result"]["panels"];
+    assert_eq!(panels["schemaVersion"], json!("edgecommons.panels.v2"));
+    assert_eq!(panels["defaultView"], json!("overview"));
+    let views = panels["views"].as_array().expect("a views array");
+    let ids: Vec<&str> = views.iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["overview", "device-structure", "signals", "conditions", "diagnostics"]);
+    assert!(!serde_json::to_string(views).unwrap().contains("writeVerb"));
     h.inbox.stop().await;
 }
 

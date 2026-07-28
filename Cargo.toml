@@ -52,3 +52,6 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls", 
 [dev-dependencies]
 jsonschema = { version = "0.49.2", default-features = false }
 tempfile = "3"
+#  enables tokio's paused clock for the virtual-clock sequence tests
+# (tests/stream_sequence.rs, LLD 12 row 3).
+tokio = { version = "1", features = ["test-util"] }

@@ -115,78 +115,152 @@ effective `serverTs`, it rides as a per-sample `receivedTs` extra:
 ### `sb/write` (command)
 
 ```jsonc
-"body": { "writes": [ { "signalId": "temperature-1", "value": 42.5 } ] }
-// result: { "id": "device-1", "written": 1,
-//           "results": [ { "signal": "temperature-1", "value": 42.5, "ok": true } ] }
+"body": { "writes": [ { "signalId": "x-position", "value": 42.5 } ] }
+// reply: { "ok": false,
+//          "error": { "code": "WRITE_NOT_ALLOWED",
+//                     "message": "MTConnect is read-only (Part 1 Fundamentals §5.1)" } }
 ```
 
-A single `{signalId/id/name, value}` object (no `writes` array) is also accepted. A signal-ref is
-`{"signalId": "…"}` / `{"id": "…"}` (the stable id directly) or `{"name": "…"}` (resolved against
-the configured inventory). Every entry is checked against `writes.allow` **before** it reaches the
-device; `WRITE_NOT_ALLOWED` when every entry is refused, `WRITE_FAILED` when every attempted write
-reaches the device and every one is rejected there.
+The verb is registered and every request is refused. MTConnect's API is read-only by specification,
+so the refusal precedes any inspection of the body: no entry is resolved, no allow-list is
+consulted, and nothing reaches a device. The refusal is also advertised on the verb's `describe`
+entry as `availability: { "state": "unsupported", "reason": "MTConnect is read-only" }`, so a
+console disables the surface instead of offering a write that can never work. The instance schema
+pins `writes.allow` to the empty array.
 
 ### `sb/read` (command, request/reply)
 
 ```jsonc
-// request: { "signals": [ { "signalId": "temperature-1" } ] }
-// reply:   { "id": "device-1", "reads": [
-//   { "signal": { "id": "temperature-1" }, "value": 21.7, "quality": "GOOD", "qualityRaw": "unspecified" } ] }
+// request: { "signals": [ { "signalId": "x-position" } ] }
+// reply:   { "id": "cnc-1", "mode": "current", "reads": [
+//   { "signal": { "id": "x-position" }, "value": 123.456, "quality": "GOOD", "qualityRaw": "MTC_OK",
+//     "extra": { "sequence": 37 } } ] }
 ```
 
-An unresolvable ref is reported per-entry with `quality: BAD`/`qualityRaw: "UNRESOLVED_REF"`, not
-omitted.
+A read is answered from a scoped `/current` snapshot taken through the agent's control channel, so
+`mode` is always `current`. A signal-ref is `{"signalId": "…"}` / `{"id": "…"}` (the stable id
+directly) or `{"name": "…"}` (resolved against the configured signal set).
+
+Failures are reported **per entry**, with `quality: BAD` and one of these `qualityRaw` codes; the
+command itself stays `ok`, because one unreadable signal is not a failed session:
+
+| `qualityRaw` | Meaning |
+|---|---|
+| `MTC_UNAVAILABLE` | The agent has no value for that data item. |
+| `MTC_NO_SUCH_DATAITEM` | The configured `dataItemId` is not in the device model. |
+| `MTC_AGENT_ERROR:<code>` | The agent could not serve the snapshot — `UNREACHABLE`, `TIMEOUT`, `HTTP`, `TLS`, `AUTH`, or the agent's own error code. |
+| `MTC_PARSE` | The agent's answer could not be parsed. |
+| `UNRESOLVED_REF` | The request named a signal this instance does not configure. |
+
+`DEVICE_UNAVAILABLE` is reserved for the device task itself being gone.
 
 ## Control plane
 
-- **`sb/status`** → `{ id, adapter, connected, state, paused, endpoint, metrics }`.
-- **`sb/signals`** → `{ id, signals: [ { id, name, writable }, ... ] }` — the configured/backend
-  inventory, no device round-trip.
-- **`sb/browse`** → paged discovery by default: `{ id, entries: [ { id, name, type }, ... ],
-  cursor? }`, or `BROWSE_UNSUPPORTED` if the backend has no discovery (the simulator's one-page
-  browse is the worked example). A request carrying `ref` selects the hierarchical panel mode
-  instead (below); mixing `ref`/`depth`/`maxRefs` with `cursor`/`max` is `BAD_ARGS`, as is
+- **`sb/status`** → `{ id, adapter, connected, state, paused, endpoint, metrics, protocol }`. The
+  `protocol` object is the MTConnect capability view (below), assembled from the agent runtime's
+  published state — a status call never waits on acquisition.
+- **`sb/signals`** → `{ id, signals: [ { id, name, writable, address, units, conditionBinding,
+  bound }, ... ] }` — the configured inventory with the round-trippable `address`, no device
+  round-trip. `writable` is always `false`. `address` carries `{protocol, agentId, deviceUuid,
+  dataItemId, category, type, subType, componentPath}`; everything the probe supplies is `null`
+  until the device model has been fetched, and `bound` says whether the configured `dataItemId`
+  exists in the current model.
+- **`sb/browse`** → the probe tree, paged by default (below) or hierarchical when the request
+  carries `ref`. Mixing `ref`/`depth`/`maxRefs` with `cursor`/`max` is `BAD_ARGS`, as is
   `depth`/`maxRefs` without `ref`.
 - **`sb/pause`** / **`sb/resume`** → `{ id, paused, changed }` — idempotent; pausing an
   already-paused device reports `changed: false`.
 - **`reconnect`** → `{ id, connected: true }` or a `RECONNECT_FAILED` error.
-- **`repoll`** → `{ id, polled: <count> }`; refused with `PAUSED` while paused.
+- **`repoll`** → `{ id, polled: <count> }` — the number of signal results published, `BAD` ones
+  included; refused with `PAUSED` while paused.
+
+### `sb/status.result.protocol`
+
+A closed object; every field the agent teaches us is `null` until it has:
+
+```jsonc
+{ "capability": "MTCONNECT_CLIENT",
+  "standardVersion": "2.7", "schemaNamespace": "urn:mtconnect.org:MTConnectDevices:2.7",
+  "agentId": "line-a-agent", "agentVersion": "2.7.0.12", "instanceId": 1749000000,
+  "bufferSize": 131072, "firstSequence": 1, "nextSequence": 43,
+  "mode": "stream", "heartbeatMs": 10000, "lastHeartbeatAt": "2026-07-27T10:00:00Z",
+  "probeDigest": "sha256:…",
+  "limitations": [ "READ_ONLY", "XML_ONLY", "NO_ASSETS" ] }
+```
+
+`mode` is `stream` or `poll`. Every document an agent sends — including the empty heartbeat
+document — proves liveness, so `lastHeartbeatAt` is the last document's stamp. `probeDigest` is the
+content digest of this device's probe subtree and is also the browse `viewGeneration`.
+
+### Paged `sb/browse`
+
+```jsonc
+// request: { "max": 200, "cursor": "sha256:…#12" }
+// reply:   { "id": "cnc-1", "viewGeneration": "sha256:…", "cursor": "sha256:…#212",
+//            "entries": [ { "id": "mtc:/item/Xabs", "name": "Xabs", "kind": "DATA_ITEM",
+//                           "type": "POSITION", "subType": "ACTUAL", "category": "SAMPLE",
+//                           "units": "MILLIMETER", "dataItemId": "Xabs",
+//                           "parentId": "mtc:/component/Axes/Linear[X]", "depth": 3,
+//                           "configured": true } ] }
+```
+
+Entries are the device's probe projection in pre-order — the device, its own data items, then each
+component subtree. Ids are stable and round-trippable: `mtc:/component/<path>` for the device and
+its components, `mtc:/item/<dataItemId>` for data items. `configured` flags a data item a signal
+binds, and every component holding one. The tree is served from the cached probe, so browsing keeps
+working while the agent is unreachable; before the first probe the answer is `BROWSE_FAILED` with
+`MTC_NO_PROBE`. A `cursor` carries the `viewGeneration` it was minted against — paging on through a
+model that changed underneath is refused with `MTC_VIEW_CHANGED` rather than mixing two address
+spaces.
 
 ### Hierarchical `sb/browse` (the panel mode)
 
 The `treeBrowser` panel drives `sb/browse` with `{ instance?, ref, depth?, maxRefs? }` instead of a
-cursor. `ref` selects the node: `"root"` is the device itself, whose `contains` refs are the same
-inventory the paged mode serves; a signal id selects that node as a known leaf (`"refs": []`). An
-unknown `ref` is `BAD_ARGS`, and so is `depth`/`maxRefs` without `ref`. `depth` is bounded 1–4
-(default 1) and `maxRefs` 1–1000 (default 200); the adapter's inventory is flat, so a deeper `depth`
-finds no grandchildren.
+cursor. `ref` selects the node: `"root"` is an alias of the device node (`mtc:/component/`), and any
+`nodeId` a previous reply handed out expands that node. An unknown `ref` is `BAD_ARGS`. `depth` is
+bounded 1–4 (default 1) and `maxRefs` 1–1000 (default 200); `maxRefs` bounds the whole reply, not
+each level, and `truncated` says whether it cut the expansion short. A data item is a known leaf
+(`"refs": []`); a component that may have children omits `refs` until it is expanded.
 
 ```jsonc
 // request: { "ref": "root", "depth": 1, "maxRefs": 200 }
-// reply:   { "id": "device-1", "mode": "hierarchical",
-//            "root": { "nodeId": "root", "name": "device-1", "nodeClass": "device", "dataType": null,
+// reply:   { "id": "cnc-1", "mode": "hierarchical", "viewGeneration": "sha256:…",
+//            "root": { "nodeId": "mtc:/component/", "name": "OKUMA-CNC", "nodeClass": "device",
+//                      "dataType": null, "kind": "DEVICE", "configured": true,
 //                      "refs": [ { "referenceType": "contains",
-//                                  "target": { "nodeId": "temperature-1", "name": "Ambient temperature",
-//                                              "nodeClass": "signal", "dataType": "REAL" } } ] },
-//            "refCount": 1, "depth": 1, "truncated": false }
+//                                  "target": { "nodeId": "mtc:/item/avail", "name": "avail",
+//                                              "nodeClass": "dataItem", "dataType": "AVAILABILITY",
+//                                              "kind": "DATA_ITEM", "category": "EVENT",
+//                                              "dataItemId": "avail", "configured": false,
+//                                              "refs": [] } } ] },
+//            "refCount": 4, "depth": 1, "truncated": false }
 ```
 
 ## Panels
 
-Three edge-console panel descriptors are registered via `register_panel` (`src/commands.rs`),
-`scope: "instance"` (repeated on every command-backed widget), order 10/20/30:
+Five edge-console panel descriptors are registered via `register_panel` (`src/commands.rs`),
+`scope: "instance"` (repeated on every command-backed widget), order 10/20/30/40/50. Each view
+declares the `rendererRequirements` tokens it needs, and edge-console refuses to mount a view whose
+requirements it cannot meet:
 
-- **`overview`** — an *Adapter overview* summary (Signals / Lifecycle / Writes rows) plus a
-  *Lifecycle bindings* command summary (`sb/status`, `reconnect`, `sb/pause`, `sb/resume`,
-  `repoll`).
-- **`signals`** — a `signalGrid` bound to `sb/signals` through both `signalsVerb` and the
+- **`overview`** (10) — a `statusDashboard` bound to `sb/status` (adapter state, connected, paused,
+  endpoint, agent and standard version, mode, instance id, next sequence, heartbeat age, probe
+  digest), an `actionBar` for `sb/pause` / `sb/resume` / `reconnect` / `repoll`, and a `metricSeries`
+  of `southbound_health`.
+- **`device-structure`** (20) — a hierarchical `treeBrowser` (`browseVerb: sb/browse`,
+  `rootRef: "root"`, `depth: 1`, `maxRefs: 200`, `readVerb: sb/read`) with the columns
+  Name / Kind / Type / SubType / Category / DataItem / Configured.
+- **`signals`** (30) — a `signalGrid` bound to `sb/signals` through both `signalsVerb` and the
   renderer-compat `subscriptionsVerb` alias (a descriptor field alias — no `sb/subscriptions` wire
-  verb exists), with `readVerb: sb/read`.
-- **`diagnostics`** — a hierarchical `treeBrowser` (`browseVerb: sb/browse`, `rootRef: "root"`,
-  `depth: 1`, `maxRefs: 200`, `readVerb: sb/read`) plus a *Diagnostic commands* summary
-  (`sb/status`, `sb/browse`).
+  verb exists), with `readVerb: sb/read` and the columns Signal / Name / DataItem / Category /
+  Type / Units / Quality binding.
+- **`conditions`** (40) — an `eventFeed` of `MtconnectConditionEvent`, `MtconnectDataLossEvent`, and
+  `MtconnectAgentEvent`, plus an observation-flow `metricSeries`.
+- **`diagnostics`** (50) — a sequence/buffer `statusDashboard`, an `eventFeed` of the agent and
+  model-drift events, and a `metricSeries` of stream gaps, reconnects, heartbeats, and parse errors.
 
-No widget names a `writeVerb` — writes stay on the command surface behind the allow-list.
+No view names a `writeVerb` or binds `sb/write`: MTConnect has nothing to write, and the permanent
+refusal rides the command-availability surface instead.
 
 ## Events (`evt` class)
 

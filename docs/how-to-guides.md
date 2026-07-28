@@ -91,21 +91,24 @@ dimension shreds a fleet dashboard).
 
 ---
 
-## Read and write signals from a client
+## Read signals from a client
 
-Both ride the library **command inbox** (`ecv1/{device}/mtconnect-adapter/cmd/{verb}`). See
+Reads ride the library **command inbox** (`ecv1/{device}/mtconnect-adapter/cmd/{verb}`). See
 [reference/messaging-interface.md](reference/messaging-interface.md) for every payload shape; the
 short version:
 
 ```text
-publish ecv1/<device>/mtconnect-adapter/cmd/sb/write
-  {"header":{"name":"sb/write","reply_to":"app/r","correlation_id":"1"},
-   "body":{"writes":[{"signalId":"setpoint-1","value":42.5}]}}
+publish ecv1/<device>/mtconnect-adapter/cmd/sb/read
+  {"header":{"name":"sb/read","reply_to":"app/r","correlation_id":"1"},
+   "body":{"instance":"cnc-1","signals":[{"signalId":"x-position"}]}}
 ```
 
-Nothing is writable until you add its stable `signal.id` to that device's
-`component.instances[].writes.allow` list — the allow-list is checked **before** any device I/O, so
-a refused write never reaches your protocol implementation.
+The reply is a scoped `/current` snapshot (`"mode": "current"`) with one entry per requested signal.
+An entry the agent cannot serve comes back `BAD` with its own code (`MTC_UNAVAILABLE`,
+`MTC_NO_SUCH_DATAITEM`, `MTC_AGENT_ERROR:<code>`) while the command itself stays `ok`.
+
+Writing is not possible: MTConnect's API is read-only by specification, so `sb/write` answers
+`WRITE_NOT_ALLOWED` for every request and advertises itself as `unsupported` on `describe`.
 
 ---
 

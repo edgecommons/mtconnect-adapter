@@ -101,12 +101,31 @@ agent, `conditionBinding` never naming the signal's own data item) are enforced 
 
 ## Command surface
 
-The generic `sb/*` family ships from the scaffold. MTConnect-specific behavior built so far: the
-device seam refuses every write; `sb/browse` enumerates the cached probe tree
-(`mtc:/component/<path>`, `mtc:/item/<dataItemId>`) and works while the agent is unreachable;
-`sb/read` takes a live `/current` snapshot through the agent's control channel. The full verb
-surface (the closed `sb/status.protocol` object, the hierarchical browse mode, the `sb/write`
-availability advertisement) and the panel descriptors are the next milestone.
+The generic `sb/*` family ships from the scaffold; `src/commands.rs` maps it onto MTConnect
+(LLD §7, HLD §7):
+
+- `sb/status` carries the closed `protocol` object (capability, standard/schema version, agent
+  version, `instanceId`, buffer/sequence window, mode, heartbeat, probe digest, limitations),
+  nullable until the agent has taught us and read from the runtime's `ArcSwap<AgentInfo>` — never a
+  control-channel round-trip.
+- `sb/signals` returns the configured inventory with the §5.3 `address`, enriched from the cached
+  model and honestly null before the first probe.
+- `sb/browse` serves the probe tree in both modes (paged and hierarchical) straight from the cached
+  `ProbeModel`: ids `mtc:/component/<path>` / `mtc:/item/<dataItemId>`, entries flagged `Configured`,
+  the model digest as `viewGeneration` (a cursor from a superseded model is refused with
+  `MTC_VIEW_CHANGED`), working while the agent is unreachable and `BROWSE_FAILED`/`MTC_NO_PROBE`
+  before the first probe.
+- `sb/read` takes a scoped `/current` snapshot through the agent's control channel (`mode:
+  "current"`) with per-entry codes (`MTC_UNAVAILABLE`, `MTC_NO_SUCH_DATAITEM`,
+  `MTC_AGENT_ERROR:<code>`, `MTC_PARSE`); an unreachable agent degrades the entries, not the command.
+- `sb/write` is registered and refused unconditionally before entry processing, and advertised
+  `unsupported` through command availability. Registration order is verbs → availability → panels.
+- Five panel descriptors (HLD §8) with their `rendererRequirements`; no view advertises a write
+  surface.
+
+`repoll` currently forces the device task's poll (drain + publish, `polled` counting published
+results including `BAD`); making it force a fresh `/current` snapshot needs the acquisition-side
+republish hook and lands with the streaming milestone.
 
 ## Metrics
 

@@ -169,6 +169,11 @@ impl App {
                 health: Arc::clone(&health),
                 dm: Arc::clone(&dm),
                 signals,
+                // M4 wiring (LLD §7): the published protocol view `sb/status`, `sb/signals`, and
+                // `sb/browse` answer from — the shared agent runtime's `ArcSwap<AgentInfo>` and its
+                // cached probe model, read without ever waiting on acquisition. `None` for the
+                // simulator, which has no agent.
+                protocol: crate::commands::ProtocolView::of(device, &self.agents),
             });
 
             tokio::spawn(run_device(
@@ -284,7 +289,12 @@ async fn run_device(
         };
 
         // --- POLL (until the link breaks or a reconnect is requested) ---
-        let exit = run_polling(&cfg, session, &data, &events, &dm, &health, &mut control).await;
+        // The inventory ids back the resume-time snapshot (HLD §7: resume snapshots first).
+        let inventory: Vec<String> =
+            backend.inventory(&cfg.connection).into_iter().map(|s| s.id).collect();
+        let exit =
+            run_polling(&cfg, session, &data, &events, &dm, &health, &mut control, &inventory)
+                .await;
 
         // The link is down (or a reconnect asked us to drop it).
         health.set_link(LinkState::Backoff);
@@ -322,6 +332,12 @@ enum PollExit {
 
 /// Read on the poll interval and publish, servicing the control channel, until the link breaks or a
 /// reconnect is requested.
+///
+/// **Pause semantics (HLD §7 / D-MTC-7):** the read keeps running while paused — the backend's
+/// stream keeps draining and its latest-value/condition caches keep updating — but nothing is
+/// published. Resuming publishes a fresh snapshot of the whole configured inventory first
+/// (`read_named`, a live read), then normal flow resumes.
+#[allow(clippy::too_many_arguments)]
 async fn run_polling(
     cfg: &DeviceConfig,
     mut session: Box<dyn crate::device::DeviceSession>,
@@ -330,6 +346,7 @@ async fn run_polling(
     dm: &Arc<DeviceMetrics>,
     health: &Arc<Health>,
     control: &mut mpsc::Receiver<DeviceControl>,
+    inventory: &[String],
 ) -> PollExit {
     let mut ticker = tokio::time::interval(Duration::from_millis(cfg.poll_interval_ms));
     let mut since_metrics = Instant::now();
@@ -385,6 +402,24 @@ async fn run_polling(
                                 .await;
                         }
                         let _ = reply.send(changed);
+                        // Resume snapshots FIRST (HLD §7): while paused, drained updates were
+                        // deliberately not published, so the fleet's last view of every signal is
+                        // stale. A live read of the whole inventory republishes the current truth
+                        // before on-change flow resumes.
+                        if changed && !inventory.is_empty() {
+                            match session.read_named(inventory).await {
+                                Ok(mut readings) => {
+                                    stamp_received(&mut readings, &now_iso());
+                                    publish_readings(cfg, &readings, data, dm, health).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        instance = %cfg.id, error = %e,
+                                        "resume snapshot failed; on-change flow resumes without it"
+                                    );
+                                }
+                            }
+                        }
                     }
                     DeviceControl::Reconnect { reply } => {
                         session.close().await;
@@ -394,7 +429,7 @@ async fn run_polling(
                         if health.is_paused() {
                             let _ = reply.send(Err("instance is paused - resume first".to_string()));
                         } else {
-                            match poll_once(cfg, &mut session, data, dm, health).await {
+                            match poll_once(cfg, &mut session, data, dm, health, true).await {
                                 Ok(n) => {
                                     let _ = reply.send(Ok(n));
                                 }
@@ -409,8 +444,11 @@ async fn run_polling(
                 }
             }
 
-            _ = ticker.tick(), if !health.is_paused() => {
-                if poll_once(cfg, &mut session, data, dm, health).await.is_err() {
+            // The tick keeps running while paused: the backend keeps draining (a paused MTConnect
+            // instance's stream cache stays current — HLD §7), and only PUBLICATION is gated.
+            _ = ticker.tick() => {
+                let publish = !health.is_paused();
+                if poll_once(cfg, &mut session, data, dm, health, publish).await.is_err() {
                     session.close().await;
                     return PollExit::LinkLost;
                 }
@@ -425,15 +463,17 @@ async fn run_polling(
 }
 
 /// One poll: read, publish each reading, record latencies + staleness. `Ok(n)` = signals published;
-/// `Err(())` = the *connection* broke (caller reconnects).
+/// `Err(())` = the *connection* broke (caller reconnects). With `publish` false (the instance is
+/// paused) the read still runs — the backend drains and its caches update — but nothing reaches
+/// the wire and the staleness tracker is not fed.
 async fn poll_once(
     cfg: &DeviceConfig,
     session: &mut Box<dyn crate::device::DeviceSession>,
     data: &DataFacade,
     dm: &Arc<DeviceMetrics>,
     health: &Arc<Health>,
+    publish: bool,
 ) -> std::result::Result<u64, ()> {
-    let backend_adapter = cfg.adapter.clone();
     let started = Instant::now();
     let mut readings = match session.read_signals().await {
         Ok(r) => r,
@@ -443,19 +483,34 @@ async fn poll_once(
             return Err(());
         }
     };
+    let latency = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    health.poll_latency_ms.store(latency, Ordering::Relaxed);
+    if !publish {
+        // Paused: the drain above kept the caches current; publication stays gated (HLD §7).
+        return Ok(0);
+    }
     // The read just completed: this is the adapter's receive moment for the whole batch
     // (docs/SOUTHBOUND.md §2) — stamped here, not at publish, so batching cannot skew it.
     stamp_received(&mut readings, &now_iso());
-    let latency = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    health.poll_latency_ms.store(latency, Ordering::Relaxed);
+    Ok(publish_readings(cfg, &readings, data, dm, health).await)
+}
 
+/// Publish a batch of readings through the `data()` facade, recording publish latency and feeding
+/// the staleness tracker. Shared by the poll tick, `repoll`, and the resume-time snapshot.
+async fn publish_readings(
+    cfg: &DeviceConfig,
+    readings: &[crate::device::Reading],
+    data: &DataFacade,
+    dm: &Arc<DeviceMetrics>,
+    health: &Arc<Health>,
+) -> u64 {
     let publish_started = Instant::now();
     let mut published = 0u64;
     for r in readings {
         // The data() facade builds the SouthboundSignalUpdate body, mints the topic, and stamps
         // identity. Do not hand-build any of the three. The whole value/quality/timestamp/extras
         // mapping lives in the unit-tested `build_sample` (docs/SOUTHBOUND.md §2).
-        let sample = build_sample(&r);
+        let sample = build_sample(r);
 
         let mut signal = data.signal(&r.signal_id);
         if let Some(name) = &r.name {
@@ -465,7 +520,7 @@ async fn poll_once(
             signal = signal.signal_path(channel);
         }
         let update = signal
-            .device_parts(&backend_adapter, &cfg.id, &cfg.connection.endpoint)
+            .device_parts(&cfg.adapter, &cfg.id, &cfg.connection.endpoint)
             .sample(sample)
             .build();
 
@@ -479,7 +534,7 @@ async fn poll_once(
     }
     let publish_latency = u64::try_from(publish_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     health.publish_latency_ms.store(publish_latency, Ordering::Relaxed);
-    Ok(published)
+    published
 }
 
 /// What servicing the control channel while the session is down concluded.

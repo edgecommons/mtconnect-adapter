@@ -45,8 +45,12 @@ jobs:
       #   - `src/main.rs` — the binary bootstrap shim (build the runtime, hand off to `supervisor::App`).
       #   - `tests/live_sim.rs` — the self-skipping (`EC_LIVE_SIM`) live suite: it exercises a real
       #     simulator/device, so its body is uncovered in a normal `cargo test` run.
-      # These are validated by `tests/live_sim.rs` against a real endpoint (the §-validation-matrix
-      # HOST/lab legs) and by the scaffold→build gate. NOTHING ELSE is excluded.
+      #   - `tests/agent_integration.rs` — the self-skipping (`EC_MTC_AGENT`) live suite against the
+      #     pinned cppagent Docker harness (tests/compose.mtconnect-agent.yaml): its body needs a
+      #     real agent plus the docker CLI, so it is uncovered in a normal `cargo test` run.
+      # These are validated by `tests/live_sim.rs` / `tests/agent_integration.rs` against real
+      # endpoints (the §-validation-matrix HOST/lab legs) and by the scaffold→build gate.
+      # NOTHING ELSE is excluded.
       - run: >
           cargo llvm-cov --fail-under-lines 90
-          --ignore-filename-regex '(supervisor\.rs|main\.rs|tests[/\\]live_.*\.rs)'
+          --ignore-filename-regex '(supervisor\.rs|main\.rs|tests[/\\](live_.*|agent_integration)\.rs)'
