@@ -72,7 +72,7 @@ fn the_shipped_mtconnect_configuration_compiles_through_the_semantic_validator()
         .iter()
         .map(|v| serde_json::from_value(v.clone()).expect("instance"))
         .collect();
-    let compiled = compile_mtconnect(&mut devices, &agents).expect("bindings resolve");
+    let compiled = compile_mtconnect(&mut devices, &agents, 0).expect("bindings resolve");
 
     assert_eq!(compiled.len(), 1);
     assert_eq!(compiled[0].device_uuid, "OKUMA.123456");
@@ -94,7 +94,7 @@ fn the_shipped_simulator_configuration_still_works() {
     assert_eq!(devices[0].adapter, "sim");
     assert_eq!(devices[0].connection.endpoint, "sim://device-1");
     // No MTConnect instances, so no agent is needed.
-    assert!(compile_mtconnect(&mut devices, &[]).unwrap().is_empty());
+    assert!(compile_mtconnect(&mut devices, &[], 0).unwrap().is_empty());
 }
 
 #[test]
@@ -187,6 +187,88 @@ fn a_signal_must_bind_a_data_item_and_may_declare_its_conditions() {
         "signals": [{ "id": "X_Position", "dataItemId": "Xabs" }]
     }))
     .is_err());
+}
+
+#[test]
+fn the_selection_block_is_additive_closed_and_validated() {
+    // The soak-style minimal instance: nothing but an identity, a binding, and "publish it all".
+    let minimal = json!({
+        "id": "cnc-1",
+        "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.1" },
+        "selection": { "mode": "all" }
+    });
+    validate_instance(&minimal).expect("the minimal selection instance");
+    // ... and it compiles through the semantic validator too.
+    let agents = parse_agents(&json!({ "agents": [{ "id": "line-a-agent", "url": "http://a:5000" }] }))
+        .unwrap();
+    let mut devices: Vec<DeviceConfig> = vec![serde_json::from_value(minimal).unwrap()];
+    let compiled = compile_mtconnect(&mut devices, &agents, 250).expect("compiles");
+    let selection = compiled[0].selection.as_ref().expect("the selection rides the compile");
+    assert_eq!(selection.max_signals, 500, "the derived-set cap defaults to 500");
+    assert!(selection.auto_condition_binding, "auto conditionBinding defaults on");
+    assert_eq!(selection.default_batch_ms, 250, "defaults.batchMs is stamped in at compile");
+
+    // The full shape.
+    validate_instance(&json!({
+        "id": "cnc-1",
+        "connection": { "agentId": "a", "deviceUuid": "u" },
+        "signals": [{ "id": "x-position", "dataItemId": "Xabs" }],
+        "selection": {
+            "mode": "include",
+            "include": [{ "category": "SAMPLE", "type": "POSITION|LOAD", "subType": "ACTUAL",
+                          "idMatch": "X.*", "path": "Axes/**" }],
+            "exclude": [{ "idMatch": "Xfreq" }],
+            "maxSignals": 100,
+            "autoConditionBinding": false
+        }
+    }))
+    .expect("the full selection shape");
+
+    // Closed objects: a typo'd key is a mistake, not a no-op.
+    assert!(validate_instance(&json!({
+        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+        "selection": { "mode": "all", "includes": [] }
+    }))
+    .is_err());
+    assert!(validate_instance(&json!({
+        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+        "selection": { "mode": "include", "include": [{ "types": "POSITION" }] }
+    }))
+    .is_err());
+    // An unknown mode, category, or a zero cap is refused by the schema itself.
+    assert!(validate_instance(&json!({
+        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+        "selection": { "mode": "everything" }
+    }))
+    .is_err());
+    assert!(validate_instance(&json!({
+        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+        "selection": { "mode": "include", "include": [{ "category": "sample" }] }
+    }))
+    .is_err());
+    assert!(validate_instance(&json!({
+        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+        "selection": { "mode": "all", "maxSignals": 0 }
+    }))
+    .is_err());
+
+    // A regex the schema cannot judge is refused by the side-effect-free semantic validator.
+    let mut bad: Vec<DeviceConfig> = vec![serde_json::from_value(json!({
+        "id": "cnc-1",
+        "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.1" },
+        "selection": { "mode": "include", "include": [{ "type": "(" }] }
+    }))
+    .unwrap()];
+    assert!(compile_mtconnect(&mut bad, &agents, 0).is_err(), "a bad pattern never commits");
+
+    // A `sim` instance has no probe to derive from: selection is refused there.
+    let mut sim: Vec<DeviceConfig> = vec![serde_json::from_value(json!({
+        "id": "plc-1", "adapter": "sim",
+        "connection": { "endpoint": "sim://plc-1" },
+        "selection": { "mode": "all" }
+    }))
+    .unwrap()];
+    assert!(compile_mtconnect(&mut sim, &[], 0).is_err());
 }
 
 #[test]

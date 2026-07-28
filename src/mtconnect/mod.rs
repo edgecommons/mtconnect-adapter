@@ -51,6 +51,7 @@ pub mod error;
 pub mod model;
 pub mod multipart;
 pub mod observations;
+pub mod selection;
 pub mod sequence;
 pub mod stats;
 pub mod stream;
@@ -74,6 +75,9 @@ pub use config::{
 };
 pub use error::{MtcError, ParseCounters};
 pub use model::{BrowseNode, Category, DataItemMeta, DeviceNode, NodeKind, ProbeModel, Repr};
+pub use selection::{
+    served_set, Matcher, Provenance, SelectionConfig, SelectionMode, ServedSet, ServedSignal,
+};
 pub use observations::{CondState, ObsValue, Observation};
 pub use sequence::{AcqState, HeaderOutcome, SequenceState};
 pub use stats::{AgentStats, AgentStatsSnapshot};

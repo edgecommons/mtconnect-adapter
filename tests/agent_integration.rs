@@ -428,3 +428,87 @@ async fn one_agent_runtime_demultiplexes_two_live_devices() {
 
     rt.shutdown().await;
 }
+
+// =================================================================================================
+// Probe-derived selection (R1.1), live: mode "all" on the tiny fixture device
+// =================================================================================================
+
+#[tokio::test]
+async fn selection_mode_all_derives_the_tiny_devices_signals_live() {
+    let Some(_url) = main_agent_url() else { return };
+    let _serial = SERIAL.lock().await;
+    let url = tiny_agent_url();
+    let feed = ShdrFeed::start(7403).await;
+    feed.send("|tavail|AVAILABLE");
+    feed.send("|Tpos|3.25");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    use mtconnect_adapter::device::{ConnectionConfig, DeviceBackend, MtcBackend};
+    use mtconnect_adapter::mtconnect::config::DeviceConfig;
+    use std::collections::HashMap;
+
+    let rt = runtime(&url, json!({}));
+    let device = DeviceConfig {
+        id: "tiny".into(),
+        agent_id: "live-agent".into(),
+        device_uuid: DEV_TINY.into(),
+        signals: Vec::new(),
+        selection: Some(serde_json::from_value(json!({ "mode": "all" })).unwrap()),
+    };
+    let backend = MtcBackend::new(
+        HashMap::from([("live-agent".to_string(), Arc::clone(&rt))]),
+        vec![device],
+    );
+    let conn: ConnectionConfig = serde_json::from_value(json!({
+        "agentId": "live-agent", "deviceUuid": DEV_TINY
+    }))
+    .unwrap();
+
+    // Connect (probing the real agent) — retried briefly while the container warms up.
+    let mut session = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match backend.connect(&conn).await {
+                Ok(session) => return session,
+                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+    })
+    .await
+    .expect("tiny agent reachable");
+
+    // Not one signal was configured, yet the whole device serves: the derived set came from the
+    // live probe.
+    let served = session.served_signals().expect("an MTConnect session reports served signals");
+    assert!(served >= 2, "the tiny device has at least tavail + Tpos: {served}");
+
+    // The agent reconnects to this test's fresh SHDR feed on its own cadence (an earlier test in
+    // the serialized suite owned the same port), so wait for the fed value rather than assuming it.
+    let readings = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            feed.send("|Tpos|3.25");
+            let readings = session.snapshot_now().await.expect("scoped /current");
+            if readings
+                .iter()
+                .any(|r| r.signal_id == "t1-tpos" && r.value == Some(json!(3.25)))
+            {
+                return readings;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("the fed value arrives under its derived identity");
+    let tpos = readings
+        .iter()
+        .find(|r| r.signal_id == "t1-tpos")
+        .expect("the derived lower-kebab id of dataItemId `t1-Tpos`");
+    assert_eq!(tpos.value, Some(json!(3.25)), "the live fed value, under a derived identity");
+    assert!(tpos.channel.is_some(), "a derived channel from the live component path");
+    println!(
+        "EVIDENCE selection: served={served} derived ids={:?} t1-tpos value={:?} channel={:?}",
+        readings.iter().map(|r| r.signal_id.as_str()).collect::<Vec<_>>(),
+        tpos.value,
+        tpos.channel
+    );
+    session.close().await;
+}

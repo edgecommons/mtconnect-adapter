@@ -298,6 +298,10 @@ pub struct Notice {
 
 /// The agent lifecycle family: reachable, unreachable, degraded to polling (HLD §9).
 pub const EVENT_AGENT: &str = "MtconnectAgentEvent";
+/// The served signal set changed shape (R1.1): the selection-derived half followed a model change
+/// (counts, not lingering BADs), or `maxSignals` truncated the derived set (a warning — never a
+/// silent cap).
+pub const EVENT_SIGNAL_SET: &str = "MtconnectSignalSetEvent";
 /// Observations the agent's buffer overran before we read them (HLD §9, ladder 2).
 pub const EVENT_DATA_LOSS: &str = "MtconnectDataLossEvent";
 /// The device's probe model changed under a running instance (HLD §9, D-MTC-5).
@@ -569,9 +573,12 @@ mod tests {
 // the `conditionBinding` degradation), the agent's capture timestamp, and the `sequence` extra
 // that gives a consumer exact once-only ordering across reconnects.
 
+use std::collections::BTreeSet;
+
 use crate::mtconnect::config::{DeviceConfig as MtcDeviceConfig, SignalConfig};
 use crate::mtconnect::model::ProbeModel;
 use crate::mtconnect::observations::{CondState, ObsValue, Observation};
+use crate::mtconnect::selection::{served_set, ServedSignal};
 use crate::mtconnect::{AgentRuntime, InstanceEvent, MtcError};
 use crate::reload::{SignalRegistry, SignalSlot};
 
@@ -693,19 +700,26 @@ impl DeviceBackend for MtcBackend {
         KIND
     }
 
-    /// The configured inventory — read straight from configuration, with no device round-trip, so
-    /// `sb/signals` answers while the agent is unreachable.
+    /// The served inventory — the live explicit set plus the selection-derived half against the
+    /// cached probe model, with no device round-trip, so `sb/signals` answers while the agent is
+    /// unreachable. Before the first probe only the explicit signals are known.
     fn inventory(&self, cfg: &ConnectionConfig) -> Vec<SignalInfo> {
         match self.binding(cfg) {
             // The LIVE set, not the startup one: after a reload the inventory is what is published
             // now (LLD §8).
             Ok(device) => match self.signals.slot(&device.id) {
-                Some(slot) => slot
-                    .load()
-                    .signals
-                    .iter()
-                    .map(|s| SignalInfo { id: s.id.clone(), name: s.name.clone() })
-                    .collect(),
+                Some(slot) => {
+                    let live = slot.load();
+                    let model = self
+                        .agents
+                        .get(&device.agent_id)
+                        .and_then(|a| a.model(&device.device_uuid));
+                    served_set(&live.signals, live.selection.as_ref(), model.as_deref())
+                        .signals
+                        .into_iter()
+                        .map(|s| SignalInfo { id: s.signal.id, name: s.signal.name })
+                        .collect()
+                }
                 None => Vec::new(),
             },
             Err(_) => Vec::new(),
@@ -825,8 +839,17 @@ pub struct MtcSession {
     /// The latest state of every CONDITION data item this device published, with its native code —
     /// what `conditionBinding` degrades against.
     conditions: HashMap<String, (CondState, Option<String>)>,
-    /// Configured signals whose `dataItemId` the model does not have: reported BAD every cycle,
-    /// never silently dropped.
+    /// The served union (R1.1): the explicit signals merged with the selection-derived set against
+    /// the current model. This is what publishes, answers `sb/read`, and scopes a repoll.
+    served: Vec<ServedSignal>,
+    /// The derived half's ids after the previous compile — what a drift-driven set change is
+    /// diffed against.
+    prev_derived: Option<BTreeSet<String>>,
+    /// The last reported `(matched, truncated)` pair, so a still-truncated recompile does not
+    /// repeat its warning.
+    last_truncation: Option<(usize, usize)>,
+    /// **Explicit** signals whose `dataItemId` the model does not have: reported BAD every cycle,
+    /// never silently dropped. (A derived signal cannot be unbound — it came from the model.)
     unbound: Vec<String>,
     /// Protocol notices awaiting a drain into UNS events.
     notices: Vec<Notice>,
@@ -842,7 +865,7 @@ impl MtcSession {
         model: Arc<ProbeModel>,
         rx: mpsc::Receiver<InstanceEvent>,
     ) -> Self {
-        let generation = crate::reload::generation_of(&device.signals);
+        let generation = crate::reload::generation_of(&device.signals, device.selection.as_ref());
         let mut session = Self {
             agent,
             device,
@@ -851,6 +874,9 @@ impl MtcSession {
             model,
             rx,
             conditions: HashMap::new(),
+            served: Vec::new(),
+            prev_derived: None,
+            last_truncation: None,
             unbound: Vec::new(),
             notices: Vec::new(),
             last_condition_event: HashMap::new(),
@@ -888,17 +914,19 @@ impl MtcSession {
             from = %self.generation,
             to = %live.generation,
             signals = live.signals.len(),
+            selection = live.selection.as_ref().map(|s| s.mode.as_str()).unwrap_or("none"),
             "signal set reloaded; recompiling against the cached probe model"
         );
         self.device.signals.clone_from(&live.signals);
+        self.device.selection.clone_from(&live.selection);
         self.generation = live.generation.clone();
         self.recompile();
     }
 
-    /// The configured data item ids of this device — the scope of a forced `/current` snapshot.
+    /// The served data item ids of this device — the scope of a forced `/current` snapshot.
     fn configured_data_items(&self) -> Vec<String> {
         let mut ids: Vec<String> =
-            self.device.signals.iter().map(|s| s.data_item_id.clone()).collect();
+            self.served.iter().map(|s| s.signal.data_item_id.clone()).collect();
         ids.sort();
         ids.dedup();
         ids
@@ -991,9 +1019,15 @@ impl MtcSession {
         self.notices.push(notice);
     }
 
-    /// Re-check every configured signal against the current model. A signal bound to a data item
-    /// the device does not have is *named*, not dropped (D-MTC-5: drift is surfaced).
+    /// Recompute the served set against the current model: the explicit signals merged with the
+    /// selection-derived half (R1.1). An **explicit** signal bound to a data item the device does
+    /// not have is *named*, not dropped (D-MTC-5: drift is surfaced); the **derived** half follows
+    /// the model — a removed item simply stops publishing, and the change is announced as a
+    /// set-change event with counts, never a lingering BAD and never silence.
     fn recompile(&mut self) {
+        let set = served_set(&self.device.signals, self.device.selection.as_ref(), Some(&self.model));
+
+        // Explicit signals keep the strict permanent-BAD missing-item contract.
         self.unbound = self
             .device
             .signals
@@ -1008,11 +1042,81 @@ impl MtcSession {
                 "configured signals have no dataItem in the device model"
             );
         }
+
+        // The derived set follows the model: announce a shape change (drift, reload) with counts.
+        let derived = set.derived_ids();
+        if let Some(previous) = &self.prev_derived {
+            if *previous != derived {
+                let added = derived.difference(previous).count();
+                let removed = previous.difference(&derived).count();
+                tracing::info!(
+                    instance = %self.device.id, added, removed, served = set.signals.len(),
+                    "derived signal set changed"
+                );
+                self.notices.push(Notice {
+                    event_type: EVENT_SIGNAL_SET,
+                    level: NoticeLevel::Info,
+                    message: format!(
+                        "derived signal set changed: {added} added, {removed} removed ({} served)",
+                        set.signals.len()
+                    ),
+                    context: json!({
+                        "instance": self.device.id,
+                        "deviceUuid": self.device.device_uuid,
+                        "added": added,
+                        "removed": removed,
+                        "discovered": derived.len(),
+                        "served": set.signals.len(),
+                    }),
+                });
+            }
+        }
+        self.prev_derived = Some(derived);
+
+        // The maxSignals cap is never silent (the org rule): a warning event and a log line, once
+        // per distinct truncation shape.
+        if set.derived_truncated > 0 {
+            let state = (set.derived_matched, set.derived_truncated);
+            if self.last_truncation != Some(state) {
+                let max = self.device.selection.as_ref().map_or(0, |s| s.max_signals);
+                tracing::warn!(
+                    instance = %self.device.id,
+                    matched = set.derived_matched, truncated = set.derived_truncated, max,
+                    "selection matched more data items than maxSignals; derived set truncated in browse-tree order"
+                );
+                self.notices.push(Notice {
+                    event_type: EVENT_SIGNAL_SET,
+                    level: NoticeLevel::Warning,
+                    message: format!(
+                        "selection matched {} data items; maxSignals={max} kept {} and truncated {} (browse-tree order)",
+                        set.derived_matched,
+                        set.derived_matched - set.derived_truncated,
+                        set.derived_truncated
+                    ),
+                    context: json!({
+                        "instance": self.device.id,
+                        "deviceUuid": self.device.device_uuid,
+                        "reason": "maxSignals",
+                        "maxSignals": max,
+                        "matched": set.derived_matched,
+                        "truncated": set.derived_truncated,
+                    }),
+                });
+            }
+            self.last_truncation = Some(state);
+        } else {
+            self.last_truncation = None;
+        }
+
+        self.served = set.signals;
     }
 
-    /// The signals bound to one data item (several signals MAY share one).
+    /// The served signals bound to one data item (several MAY share one).
     fn signals_for<'a>(&'a self, data_item_id: &'a str) -> impl Iterator<Item = &'a SignalConfig> {
-        self.device.signals.iter().filter(move |s| s.data_item_id == data_item_id)
+        self.served
+            .iter()
+            .filter(move |s| s.signal.data_item_id == data_item_id)
+            .map(|s| &s.signal)
     }
 
     /// Fold a batch of observations into readings: condition states are recorded **first**, so a
@@ -1119,11 +1223,10 @@ impl DeviceSession for MtcSession {
     async fn read_named(&mut self, ids: &[String]) -> Result<Vec<Reading>> {
         self.adopt_current_signals();
         let wanted: Vec<String> = self
-            .device
-            .signals
+            .served
             .iter()
-            .filter(|s| ids.iter().any(|id| id == &s.id))
-            .map(|s| s.data_item_id.clone())
+            .filter(|s| ids.iter().any(|id| id == &s.signal.id))
+            .map(|s| s.signal.data_item_id.clone())
             .collect();
         if wanted.is_empty() {
             return Ok(self
@@ -1179,12 +1282,13 @@ impl DeviceSession for MtcSession {
         std::mem::take(&mut self.notices)
     }
 
-    /// The signals this session is really delivering: the configured set minus the ones whose data
-    /// item the current device model does not have (those publish a permanent BAD instead). Same
-    /// number whether acquisition is streaming or polling — the compiled set is what is served, and
-    /// the mode only decides how it arrives.
+    /// The signals this session is really delivering: the served union — explicit plus
+    /// selection-derived — minus the explicit ones whose data item the current device model does
+    /// not have (those publish a permanent BAD instead). Same number whether acquisition is
+    /// streaming or polling — the compiled set is what is served, and the mode only decides how it
+    /// arrives.
     fn served_signals(&self) -> Option<u64> {
-        Some(self.device.signals.len().saturating_sub(self.unbound.len()) as u64)
+        Some(self.served.len().saturating_sub(self.unbound.len()) as u64)
     }
 
     /// `sb/browse`: the probe tree, paged out of the cached model — so the address space stays
@@ -1334,7 +1438,7 @@ pub fn worst_bound_condition(
     sig: &SignalConfig,
     conditions: &HashMap<String, (CondState, Option<String>)>,
 ) -> Option<(CondState, Option<String>)> {
-    sig.condition_binding
+    sig.condition_bindings()
         .iter()
         .filter_map(|id| conditions.get(id))
         .max_by_key(|(state, _)| state.severity())
@@ -1352,7 +1456,7 @@ fn severity_of(q: Quality) -> u8 {
 #[cfg(test)]
 mod mtconnect_seam_tests {
     use super::*;
-    use crate::mtconnect::config::{parse_agents, AgentCredentials, PublishCfg};
+    use crate::mtconnect::config::{parse_agents, AgentCredentials};
     use crate::mtconnect::model::Category;
     use crate::mtconnect::xml::{parse_devices, parse_streams};
     use serde_json::json;
@@ -1393,8 +1497,8 @@ mod mtconnect_seam_tests {
             name: None,
             channel: None,
             data_item_id: data_item_id.into(),
-            condition_binding: Vec::new(),
-            publish: PublishCfg::default(),
+            condition_binding: None,
+            publish: None,
         }
     }
 
@@ -1404,6 +1508,14 @@ mod mtconnect_seam_tests {
             agent_id: "line-a-agent".into(),
             device_uuid: "OKUMA.123456".into(),
             signals,
+            selection: None,
+        }
+    }
+
+    fn selecting(signals: Vec<SignalConfig>, selection: serde_json::Value) -> MtcDeviceConfig {
+        MtcDeviceConfig {
+            selection: Some(serde_json::from_value(selection).unwrap()),
+            ..device(signals)
         }
     }
 
@@ -1496,7 +1608,7 @@ mod mtconnect_seam_tests {
     #[test]
     fn a_bound_condition_degrades_the_signal_it_guards() {
         let mut sig = signal("x-position", "Xabs");
-        sig.condition_binding = vec!["Xtravel".into()];
+        sig.condition_binding = Some(vec!["Xtravel".into()]);
         let mut conditions = HashMap::new();
 
         // Nothing observed yet: the value stands on its own.
@@ -1519,7 +1631,7 @@ mod mtconnect_seam_tests {
         // An UNAVAILABLE value stays UNAVAILABLE: a binding cannot make a reading look better.
         let r = reading_from_observation(&obs("Xload"), &{
             let mut s = signal("x-load", "Xload");
-            s.condition_binding = vec!["Xtravel".into()];
+            s.condition_binding = Some(vec!["Xtravel".into()]);
             s
         }, &model(), &conditions);
         assert_eq!(r.quality_raw.as_deref(), Some("UNAVAILABLE"));
@@ -1537,7 +1649,7 @@ mod mtconnect_seam_tests {
     #[test]
     fn the_worst_bound_condition_wins() {
         let mut sig = signal("s", "Xabs");
-        sig.condition_binding = vec!["c1".into(), "c2".into(), "c3".into()];
+        sig.condition_binding = Some(vec!["c1".into(), "c2".into(), "c3".into()]);
         let mut conditions = HashMap::new();
         assert!(worst_bound_condition(&sig, &conditions).is_none());
 
@@ -1599,6 +1711,32 @@ mod mtconnect_seam_tests {
         sig.channel = Some("axes/x".into());
         let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &HashMap::new());
         assert_eq!(r.channel.as_deref(), Some("axes/x"));
+    }
+
+    #[test]
+    fn a_session_serves_the_selection_derived_union() {
+        // R1.1 at the seam: the session's served set is the explicit signals merged with the
+        // selection-derived half against its cached model.
+        let agent = runtime("http://127.0.0.1:9");
+        let (_tx, rx) = mpsc::channel(4);
+        let mut session = MtcSession::new(
+            agent,
+            selecting(vec![signal("x-position", "Xabs")], serde_json::json!({ "mode": "all" })),
+            model(),
+            rx,
+        );
+        assert_eq!(session.served_signals(), Some(14), "1 explicit (merged) + 13 derived");
+
+        // A derived signal maps a batch onto its derived identity — id and channel included.
+        let readings = session.map_batch(&[obs("Sspeed")]);
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].signal_id, "sspeed");
+        assert_eq!(readings[0].channel.as_deref(), Some("axes/rotary-c/sspeed"));
+
+        // The explicit entry claims its data item: one reading, under the explicit id.
+        let readings = session.map_batch(&[obs("Xabs")]);
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].signal_id, "x-position");
     }
 
     // --- config plumbing ----------------------------------------------------------------------

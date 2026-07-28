@@ -161,11 +161,13 @@ command itself stays `ok`, because one unreadable signal is not a failed session
   `protocol` object is the MTConnect capability view (below), assembled from the agent runtime's
   published state — a status call never waits on acquisition.
 - **`sb/signals`** → `{ id, signals: [ { id, name, writable, address, units, conditionBinding,
-  bound }, ... ] }` — the configured inventory with the round-trippable `address`, no device
-  round-trip. `writable` is always `false`. `address` carries `{protocol, agentId, deviceUuid,
-  dataItemId, category, type, subType, componentPath}`; everything the probe supplies is `null`
-  until the device model has been fetched, and `bound` says whether the configured `dataItemId`
-  exists in the current model.
+  bound, provenance }, ... ] }` — the **served** inventory (the explicit `signals[]` plus the
+  `selection`-derived set) with the round-trippable `address`, no device round-trip. `writable` is
+  always `false`. `address` carries `{protocol, agentId, deviceUuid, dataItemId, category, type,
+  subType, componentPath}`; everything the probe supplies is `null` until the device model has been
+  fetched, and `bound` says whether the `dataItemId` exists in the current model. `provenance` is
+  `"configured"` for an explicit entry and `"discovered"` for a selection-derived one; before the
+  first probe only the explicit entries are listed (there is no model to derive from).
 - **`sb/browse`** → the probe tree, paged by default (below) or hierarchical when the request
   carries `ref`. Mixing `ref`/`depth`/`maxRefs` with `cursor`/`max` is `BAD_ARGS`, as is
   `depth`/`maxRefs` without `ref`.
@@ -204,17 +206,19 @@ content digest of this device's probe subtree and is also the browse `viewGenera
 //                           "type": "POSITION", "subType": "ACTUAL", "category": "SAMPLE",
 //                           "units": "MILLIMETER", "dataItemId": "Xabs",
 //                           "parentId": "mtc:/component/Axes/Linear[X]", "depth": 3,
-//                           "configured": true } ] }
+//                           "configured": true, "provenance": "configured" } ] }
 ```
 
 Entries are the device's probe projection in pre-order — the device, its own data items, then each
 component subtree. Ids are stable and round-trippable: `mtc:/component/<path>` for the device and
-its components, `mtc:/item/<dataItemId>` for data items. `configured` flags a data item a signal
-binds, and every component holding one. The tree is served from the cached probe, so browsing keeps
-working while the agent is unreachable; before the first probe the answer is `BROWSE_FAILED` with
-`MTC_NO_PROBE`. A `cursor` carries the `viewGeneration` it was minted against — paging on through a
-model that changed underneath is refused with `MTC_VIEW_CHANGED` rather than mixing two address
-spaces.
+its components, `mtc:/item/<dataItemId>` for data items. `configured` flags a data item any served
+signal binds — explicit or `selection`-derived — and every component holding one; `provenance`
+refines it on data items (`"configured"` for an explicit binding, `"discovered"` for a
+selection-derived one, `null` for an unserved item and for component/device nodes). The tree is
+served from the cached probe, so browsing keeps working while the agent is unreachable; before the
+first probe the answer is `BROWSE_FAILED` with `MTC_NO_PROBE`. A `cursor` carries the
+`viewGeneration` it was minted against — paging on through a model that changed underneath is
+refused with `MTC_VIEW_CHANGED` rather than mixing two address spaces.
 
 ### Hierarchical `sb/browse` (the panel mode)
 
@@ -273,7 +277,7 @@ Published through the library's `events()` facade; severity **derives** the chan
 The lifecycle events every adapter emits: `device-connected` (info), `device-unreachable` (critical,
 raised on drop / cleared on restore), `adapter-paused` (warning), `adapter-resumed` (info).
 
-On top of them, four families carry what only MTConnect knows. Sequence numbers, device uuids and
+On top of them, five families carry what only MTConnect knows. Sequence numbers, device uuids and
 data-item ids belong here, in the event's `context` — never as a metric dimension.
 
 | Type | Severity | Emitted when | `context` |
@@ -282,6 +286,7 @@ data-item ids belong here, in the event's `context` — never as a metric dimens
 | `MtconnectDataLossEvent` | warning | the agent's buffer overran the adapter's position, so observations are provably lost (resync ladder step 2) | `instance`, `agentId`, `skipped`, `firstSequence`, `nextSequence`, `bufferSize` |
 | `MtconnectModelDriftEvent` | warning | a re-probe returned a different device model: signals recompile and browse cursors are void | `instance`, `agentId`, `deviceUuid`, `oldDigest`, `newDigest` |
 | `MtconnectConditionEvent` | critical | a CONDITION data item **transitioned into** `Fault` | `instance`, `dataItemId`, `state`, `previousState`, `nativeCode`, `timestamp` |
+| `MtconnectSignalSetEvent` | info / warning | the `selection`-derived signal set changed shape — it followed a model change or a reload (info, with counts), or `maxSignals` truncated the derived set (warning; a cap is never silent) | `instance`, `deviceUuid`; set change: `added`, `removed`, `discovered`, `served`; truncation: `reason: "maxSignals"`, `maxSignals`, `matched`, `truncated` |
 
 A condition that is merely still asserted is not a new event, and a fault that clears and re-latches
 raises at most one event per data item per minute. The condition state itself is unaffected by that

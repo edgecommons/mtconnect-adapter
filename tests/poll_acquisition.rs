@@ -106,6 +106,15 @@ fn device(signals: Vec<SignalConfig>) -> DeviceConfig {
         agent_id: "line-a-agent".into(),
         device_uuid: "OKUMA.123456".into(),
         signals,
+        selection: None,
+    }
+}
+
+/// A device whose signal set is (partly) derived from the probe by a `selection` block (R1.1).
+fn selecting(signals: Vec<SignalConfig>, selection: serde_json::Value) -> DeviceConfig {
+    DeviceConfig {
+        selection: Some(serde_json::from_value(selection).unwrap()),
+        ..device(signals)
     }
 }
 
@@ -217,7 +226,7 @@ async fn a_configured_device_probes_polls_and_publishes_its_signals() {
 async fn a_bound_condition_degrades_the_value_it_guards() {
     let agent = FakeAgent::start().await;
     let mut guarded = signal("x-position", "Xabs");
-    guarded.condition_binding = vec!["Xtravel".into()];
+    guarded.condition_binding = Some(vec!["Xtravel".into()]);
     let (runtime, backend) = wire(&agent, vec![device(vec![guarded])]);
 
     let mut session = backend.connect(&connection()).await.expect("connect");
@@ -591,4 +600,256 @@ async fn a_reloaded_signal_set_reaches_a_live_session_without_a_reconnect() {
     let readings = session.snapshot_now().await.expect("repoll");
     assert_eq!(readings.len(), 1);
     assert_eq!(readings[0].signal_id, "spindle-speed");
+}
+
+// =================================================================================================
+// Probe-derived signal selection (R1.1) — the fake-agent end-to-end legs
+// =================================================================================================
+
+#[tokio::test]
+async fn a_minimal_selection_all_instance_publishes_the_whole_device() {
+    // The soak-style minimal instance: {id, connection, selection: {mode: "all"}} and not one
+    // hand-written signal. Every data item the agent reports publishes with a derived identity.
+    let agent = FakeAgent::start().await;
+    let (runtime, backend) = wire(&agent, vec![selecting(vec![], json!({ "mode": "all" }))]);
+
+    let mut session = backend.connect(&connection()).await.expect("connect");
+    runtime.poll_once().await.expect("poll");
+    let readings = session.read_signals().await.expect("read");
+    // The fixture's /current carries observations for 12 of the probe's 14 items.
+    assert_eq!(readings.len(), 12, "every observed data item published, none configured by hand");
+
+    // Identity derivation: lower-kebab id, probe name, componentPath/id channel.
+    let x = reading(&readings, "xabs");
+    assert_eq!(x.value, Some(json!(123.456)));
+    assert_eq!(x.name.as_deref(), Some("Xabs"));
+    assert_eq!(x.channel.as_deref(), Some("axes/linear-x/xabs"));
+    // Auto conditionBinding: Xtravel (this component's CONDITION) is in Fault, so the derived
+    // x-axis samples are degraded — exactly as a hand-bound signal would be.
+    assert_eq!(x.quality, Quality::Bad);
+    assert_eq!(x.quality_raw.as_deref(), Some("MTC_CONDITION:FAULT:ALM-1041"));
+
+    // The condition itself publishes its state as a derived signal.
+    let travel = reading(&readings, "xtravel");
+    assert_eq!(travel.value, Some(json!("FAULT")));
+
+    // A different component is untouched by that condition.
+    let spindle = reading(&readings, "sspeed");
+    assert_eq!(spindle.quality, Quality::Good);
+    assert_eq!(spindle.channel.as_deref(), Some("axes/rotary-c/sspeed"));
+
+    // camelCase ids sanitize to kebab; device-level items publish on their id alone.
+    assert_eq!(reading(&readings, "part-count").channel.as_deref(),
+        Some("controller/path-p1/part-count"));
+    assert_eq!(reading(&readings, "avail").channel.as_deref(), Some("avail"));
+
+    // signalsSubscribed counts the served union (14 derived, none unbound).
+    assert_eq!(session.served_signals(), Some(14));
+
+    // sb/signals sees the same union without a device round-trip.
+    let inventory = backend.inventory(&connection());
+    assert_eq!(inventory.len(), 14);
+    assert!(inventory.iter().any(|s| s.id == "xabs"));
+    session.close().await;
+}
+
+#[tokio::test]
+async fn selection_matchers_scope_the_derived_set_and_explicit_entries_override() {
+    let agent = FakeAgent::start().await;
+    let (runtime, backend) = wire(
+        &agent,
+        vec![selecting(
+            // The explicit entry claims Xabs with its own identity and NO condition binding.
+            vec![serde_json::from_value(json!({
+                "id": "x-position", "dataItemId": "Xabs", "conditionBinding": []
+            }))
+            .unwrap()],
+            json!({ "mode": "include",
+                    "include": [{ "path": "Axes/**", "category": "SAMPLE" }] }),
+        )],
+    );
+
+    let mut session = backend.connect(&connection()).await.expect("connect");
+    runtime.poll_once().await.expect("poll");
+    let readings = session.read_signals().await.expect("read");
+
+    // Axes samples only: Xabs (as the explicit x-position), Xload, Xfreq, Sspeed.
+    let mut ids: Vec<&str> = readings.iter().map(|r| r.signal_id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["sspeed", "x-position", "xfreq", "xload"]);
+
+    // The explicit entry overrode the derived one: its id, and its EMPTY conditionBinding beat
+    // the auto binding, so the Fault does not degrade it.
+    let x = reading(&readings, "x-position");
+    assert_eq!(x.quality, Quality::Good, "conditionBinding: [] cleared the auto binding");
+    // A derived sibling in the same component keeps the auto binding and IS degraded.
+    let load = reading(&readings, "xload");
+    assert_eq!(load.quality, Quality::Bad, "UNAVAILABLE stays BAD");
+    let freq = reading(&readings, "xfreq");
+    assert_eq!(freq.quality, Quality::Bad);
+    assert_eq!(freq.quality_raw.as_deref(), Some("MTC_CONDITION:FAULT:ALM-1041"));
+    session.close().await;
+}
+
+#[tokio::test]
+async fn max_signals_truncates_with_a_warning_event_never_silently() {
+    let agent = FakeAgent::start().await;
+    let (_runtime, backend) = wire(
+        &agent,
+        vec![selecting(vec![], json!({ "mode": "all", "maxSignals": 3 }))],
+    );
+    let mut session = backend.connect(&connection()).await.expect("connect");
+
+    let notices = session.take_notices();
+    let cut = notices
+        .iter()
+        .find(|n| n.event_type == "MtconnectSignalSetEvent")
+        .expect("the truncation warning event");
+    assert_eq!(cut.context["reason"], json!("maxSignals"));
+    assert_eq!(cut.context["maxSignals"], json!(3));
+    assert_eq!(cut.context["matched"], json!(14));
+    assert_eq!(cut.context["truncated"], json!(11));
+
+    // The kept three are the FIRST three in browse-tree order — deterministic, not arbitrary.
+    let inventory = backend.inventory(&connection());
+    let ids: Vec<&str> = inventory.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, vec!["avail", "asset-changed", "xabs"]);
+    assert_eq!(session.served_signals(), Some(3));
+    session.close().await;
+}
+
+#[tokio::test]
+async fn the_derived_set_follows_the_model_through_drift() {
+    // D-MTC-5 + R1.1: on model drift the derived set is recomputed inside the same generation
+    // bump — new matching items START publishing, removed ones STOP (no lingering BAD), and the
+    // change is announced with counts.
+    let agent = FakeAgent::start().await;
+    let (runtime, backend) = wire(
+        &agent,
+        vec![selecting(vec![], json!({ "mode": "include",
+            "include": [{ "category": "SAMPLE", "path": "Axes/**" }] }))],
+    );
+    let mut session = backend.connect(&connection()).await.expect("connect");
+    runtime.poll_once().await.expect("poll");
+    let before = session.read_signals().await.expect("read");
+    assert!(before.iter().any(|r| r.signal_id == "xabs"));
+    assert_eq!(session.served_signals(), Some(4), "Xabs, Xload, Xfreq, Sspeed");
+    session.take_notices();
+
+    // The machine is reconfigured: Xabs is gone, and a new Y axis appears.
+    agent.set(
+        "probe",
+        PROBE
+            .replace(
+                r#"<DataItem category="SAMPLE" id="Xabs" name="Xabs" nativeUnits="MILLIMETER" subType="ACTUAL" type="POSITION" units="MILLIMETER"/>"#,
+                "",
+            )
+            .replace(
+                "</Linear>",
+                r#"</Linear><Linear id="y-axis" name="Y"><DataItems><DataItem category="SAMPLE" id="Yabs" name="Yabs" type="POSITION" units="MILLIMETER"/></DataItems></Linear>"#,
+            ),
+    );
+    let (_model, changed) = runtime.refresh_model("OKUMA.123456").await.unwrap();
+    assert!(changed, "the digest moved");
+
+    // The session recompiles on its next read: the removed item is GONE (not BAD — it was
+    // discovered, not configured), the new one is served.
+    let readings = session.read_signals().await.expect("read");
+    assert!(
+        readings.iter().all(|r| r.signal_id != "xabs"),
+        "a removed derived signal stops publishing rather than lingering BAD: {readings:?}"
+    );
+    assert_eq!(session.served_signals(), Some(4), "Xload, Xfreq, Sspeed, and now Yabs");
+
+    let notices = session.take_notices();
+    let set_change = notices
+        .iter()
+        .find(|n| n.event_type == "MtconnectSignalSetEvent")
+        .expect("the set-change event");
+    assert_eq!(set_change.context["added"], json!(1), "Yabs");
+    assert_eq!(set_change.context["removed"], json!(1), "Xabs");
+
+    // The new axis publishes as soon as the agent reports it.
+    agent.set(
+        "current",
+        CURRENT.replace(
+            r#"<AccelerationTimeSeries dataItemId="Xfreq""#,
+            r#"<Position dataItemId="Yabs" name="Yabs" sequence="50" timestamp="2026-07-27T10:00:06.000000Z">7.5</Position>
+          <AccelerationTimeSeries dataItemId="Xfreq""#,
+        ),
+    );
+    runtime.poll_once().await.expect("poll");
+    let readings = session.read_signals().await.expect("read");
+    let y = reading(&readings, "yabs");
+    assert_eq!(y.value, Some(json!(7.5)));
+    assert_eq!(y.channel.as_deref(), Some("axes/linear-y/yabs"));
+    session.close().await;
+}
+
+#[tokio::test]
+async fn a_reloaded_selection_reaches_a_live_session_atomically() {
+    // A selection change is a signals-level change: it rides the same atomic swap as an explicit
+    // signals[] edit — no restart, no reconnect, no re-probe.
+    let agent = FakeAgent::start().await;
+    let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    let mut session = backend.connect(&connection()).await.expect("connect");
+    runtime.poll_once().await.unwrap();
+    assert_eq!(session.read_signals().await.unwrap().len(), 1);
+    let probes = agent.request_count("/probe");
+
+    // The operator turns on mode "all" without touching the explicit signal.
+    let reloaded = json!({
+        "component": {
+            "global": { "agents": [{ "id": "line-a-agent", "url": agent.url() }] },
+            "instances": [{
+                "id": "cnc-1",
+                "adapter": "mtconnect",
+                "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.123456" },
+                "signals": [{ "id": "x-position", "dataItemId": "Xabs" }],
+                "selection": { "mode": "all" }
+            }]
+        }
+    });
+    let changed = backend.signals().apply(&reloaded).expect("the candidate compiles");
+    assert_eq!(changed, vec!["cnc-1".to_string()]);
+
+    // The live session serves the union on its next read, from the cached model.
+    let readings = session.snapshot_now().await.expect("repoll");
+    assert_eq!(readings.len(), 12, "the whole observed device");
+    assert!(readings.iter().any(|r| r.signal_id == "x-position"), "the explicit id survives");
+    assert!(readings.iter().any(|r| r.signal_id == "sspeed"), "the derived half arrived");
+    assert_eq!(agent.request_count("/probe"), probes, "a reload re-probes nothing");
+    assert_eq!(session.served_signals(), Some(14));
+
+    // Dropping the selection again shrinks the served set back to the explicit signal.
+    let trimmed = json!({
+        "component": {
+            "global": { "agents": [{ "id": "line-a-agent", "url": agent.url() }] },
+            "instances": [{
+                "id": "cnc-1",
+                "adapter": "mtconnect",
+                "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.123456" },
+                "signals": [{ "id": "x-position", "dataItemId": "Xabs" }]
+            }]
+        }
+    });
+    backend.signals().apply(&trimmed).expect("the candidate compiles");
+    let readings = session.snapshot_now().await.expect("repoll");
+    assert_eq!(readings.len(), 1);
+    assert_eq!(readings[0].signal_id, "x-position");
+    assert_eq!(session.served_signals(), Some(1));
+    session.close().await;
+}
+
+#[tokio::test]
+async fn sb_read_resolves_derived_ids_like_configured_ones() {
+    let agent = FakeAgent::start().await;
+    let (_runtime, backend) = wire(&agent, vec![selecting(vec![], json!({ "mode": "all" }))]);
+    let mut session = backend.connect(&connection()).await.expect("connect");
+
+    let readings = session.read_named(&["sspeed".to_string()]).await.expect("read");
+    assert_eq!(readings.len(), 1, "a derived signal is readable by its derived id");
+    assert_eq!(readings[0].signal_id, "sspeed");
+    assert_eq!(readings[0].value, Some(json!(1200)));
+    session.close().await;
 }
