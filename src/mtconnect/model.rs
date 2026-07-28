@@ -228,6 +228,19 @@ impl ProbeModel {
         self.items.get(data_item_id)
     }
 
+    /// The full, slash-joined component path for a data item — `Axes/Linear[X]`, and the empty
+    /// string for a device-level item that hangs off no component. `None` when this model does not
+    /// describe the item.
+    ///
+    /// This is the **single source** of the canonical path: [`Self::address_of`] serves it as
+    /// `signal.address.componentPath` on `sb/signals` and `sb/browse`, and the publish path stamps
+    /// the very same value as the update-level `componentPath` extra on every
+    /// `SouthboundSignalUpdate` (D-MtconnectAdapter-L13). It is never formatted a second time.
+    #[must_use]
+    pub fn component_path_of(&self, data_item_id: &str) -> Option<&str> {
+        self.item(data_item_id).map(|m| m.component_path.as_str())
+    }
+
     /// The `signal.address` object for a data item (HLD §5.3) — round-trippable, non-secret, and
     /// stable across reconnects. `agent_id` and the device uuid come from configuration, so they are
     /// passed in rather than guessed.
@@ -242,7 +255,7 @@ impl ProbeModel {
             "category": m.category.as_str(),
             "type": m.type_,
             "subType": m.sub_type,
-            "componentPath": m.component_path,
+            "componentPath": self.component_path_of(data_item_id),
         }))
     }
 }

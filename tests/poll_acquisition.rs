@@ -14,7 +14,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mtconnect_adapter::app::build_sample;
+use edgecommons::messaging::{Message, MessageBuilder};
+use mtconnect_adapter::app::{build_sample, stamp_component_path};
 use mtconnect_adapter::device::{
     ConnectionConfig, DeviceBackend, MtcBackend, Quality, Reading,
 };
@@ -943,10 +944,38 @@ async fn a_deep_component_path_publishes_on_a_channel_that_fits_the_uns_topic() 
 
     // Nothing is lost: the untruncated component path is still what `sb/signals` addresses with.
     let model = runtime.model("Mazak").expect("the cached probe model");
+    let served =
+        model.address_of("line-a-agent", "stock").expect("an address")["componentPath"].clone();
+    assert_eq!(served, json!("Resources[resources]/Materials[materials]/Stock[stock]"));
+
+    // ...and it rides the wire on every update, so a consumer never has to call `sb/signals` to
+    // recover what the derived channel dropped (D-MtconnectAdapter-L13). Asserted on the *decoded*
+    // body, through the library's real protobuf envelope, at the update level.
     assert_eq!(
-        model.address_of("line-a-agent", "stock").expect("an address")["componentPath"],
-        json!("Resources[resources]/Materials[materials]/Stock[stock]")
+        stock.component_path.as_deref(),
+        served.as_str(),
+        "the update and sb/signals carry the same string"
     );
+    let mut body = json!({
+        "signal": { "id": stock.signal_id },
+        "samples": [ { "value": stock.value, "quality": "GOOD" } ],
+    });
+    stamp_component_path(&mut body, stock.component_path.as_deref());
+    let bytes = MessageBuilder::new("SouthboundSignalUpdate", "1.0")
+        .southbound_signal_update(body)
+        .build()
+        .to_vec()
+        .expect("the envelope serializes");
+    let decoded = Message::from_slice(&bytes).expect("the envelope deserializes").body;
+    assert_eq!(decoded["componentPath"], served, "the deep path, whole, on the wire");
+    assert!(decoded["samples"][0].get("componentPath").is_none(), "once, at the update level");
+
+    // Every signal of this device carries one — including the device-level `avail`, whose path is
+    // the empty string rather than a missing key.
+    for r in &readings {
+        assert!(r.component_path.is_some(), "{} carries no path", r.signal_id);
+    }
+    assert_eq!(reading(&readings, "avail").component_path.as_deref(), Some(""));
     session.close().await;
 }
 

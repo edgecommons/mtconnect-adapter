@@ -470,6 +470,39 @@ pub fn build_sample(r: &Reading) -> Sample {
     sample
 }
 
+/// The update-level extra key carrying the signal's canonical MTConnect component path.
+///
+/// It is not one of the library's reserved names at any level: the update body reserves only
+/// `signal` and `samples` (everything else round-trips through the protobuf `extra` map), and the
+/// seven reserved *sample* keys are `value`, `quality`, `qualityRaw`, `sourceTs`, `serverTs`,
+/// `sourceTsMs`, `serverTsMs`.
+pub const COMPONENT_PATH_KEY: &str = "componentPath";
+
+/// Stamp the signal's canonical component path onto a facade-built `SouthboundSignalUpdate` body
+/// as an **update-level** extra (D-MtconnectAdapter-L13).
+///
+/// * **Unconditional.** The key is written on every published update — for a derived channel that
+///   was truncated to the topic budget, for one that was not, and for an explicitly configured
+///   signal alike — so a consumer reads one place with no branch.
+/// * **Once per update, not per sample.** The path is per-signal-static, and a batched update is
+///   one signal's readings, so a flushed window carries exactly one `componentPath`.
+/// * The value is the untruncated path as
+///   [`ProbeModel::component_path_of`](crate::mtconnect::model::ProbeModel::component_path_of)
+///   holds it — the same string `sb/signals` serves in `signal.address.componentPath`, including
+///   the empty string for a device-level data item. `None` (no device model describes the signal)
+///   stamps JSON `null`, again matching what `sb/signals` reports.
+///
+/// A non-object body is left alone: there is nowhere to put the key, and the facade never produces
+/// one.
+pub fn stamp_component_path(body: &mut serde_json::Value, component_path: Option<&str>) {
+    let Some(obj) = body.as_object_mut() else { return };
+    let value = match component_path {
+        Some(path) => serde_json::Value::String(path.to_string()),
+        None => serde_json::Value::Null,
+    };
+    obj.insert(COMPONENT_PATH_KEY.to_string(), value);
+}
+
 /// Flip the paused flag, returning whether the state actually changed (idempotent — pausing an
 /// already-paused device is not an error). The event is emitted by the caller, which holds the
 /// `events()` facade.
@@ -889,6 +922,105 @@ mod tests {
         assert_eq!(s.value, Some(json!(1200)), "a warned value is still a value");
         assert_eq!(s.quality, Some(edgecommons::facades::Quality::Uncertain));
         assert_eq!(s.quality_raw.as_deref(), Some("MTC_CONDITION:WARNING:ALM-2"));
+    }
+
+    // --- the canonical componentPath, on every update (D-MtconnectAdapter-L13) ------------------
+
+    /// A body in the shape `DataFacade::build_body` produces — `{device, signal, samples}`.
+    fn facade_body() -> serde_json::Value {
+        json!({
+            "device": { "adapter": "mtconnect", "instance": "cnc-1", "endpoint": "http://agent" },
+            "signal": { "id": "x-position", "name": "X position" },
+            "samples": [ { "value": 1.0, "quality": "GOOD", "serverTs": "2026-07-27T10:00:00Z" } ]
+        })
+    }
+
+    #[test]
+    fn the_component_path_is_stamped_at_the_update_level_under_the_agreed_key() {
+        let mut body = facade_body();
+        stamp_component_path(&mut body, Some("Axes/Linear[X]"));
+        assert_eq!(body[COMPONENT_PATH_KEY], json!("Axes/Linear[X]"));
+        assert_eq!(COMPONENT_PATH_KEY, "componentPath", "the agreed key, not an alias");
+        // Beside the canonical members, never inside one of them.
+        assert_eq!(body["signal"]["id"], json!("x-position"));
+        assert_eq!(body["samples"].as_array().expect("samples").len(), 1);
+        assert!(
+            body["samples"][0].get(COMPONENT_PATH_KEY).is_none(),
+            "per-signal-static: it rides the update, not every sample"
+        );
+        assert!(body["signal"].get(COMPONENT_PATH_KEY).is_none());
+        assert!(body.get("device").is_some(), "the facade's own members are untouched");
+    }
+
+    #[test]
+    fn the_key_collides_with_no_reserved_name_at_any_level() {
+        // The library reserves `signal`/`samples` at the update level (everything else round-trips
+        // through the protobuf `extra` map) and these seven at the sample level.
+        const RESERVED_SAMPLE_KEYS: [&str; 7] = [
+            "value",
+            "quality",
+            "qualityRaw",
+            "sourceTs",
+            "serverTs",
+            "sourceTsMs",
+            "serverTsMs",
+        ];
+        assert!(!RESERVED_SAMPLE_KEYS.contains(&COMPONENT_PATH_KEY));
+        assert_ne!(COMPONENT_PATH_KEY, "signal");
+        assert_ne!(COMPONENT_PATH_KEY, "samples");
+        assert_ne!(COMPONENT_PATH_KEY, "device");
+    }
+
+    #[test]
+    fn a_device_level_item_stamps_the_empty_path_rather_than_omitting_it() {
+        // `sb/signals` serves `""` for a data item that hangs off no component. The update says
+        // the same thing, so presence is unconditional even at the root of the model.
+        let mut body = facade_body();
+        stamp_component_path(&mut body, Some(""));
+        assert_eq!(body[COMPONENT_PATH_KEY], json!(""));
+        assert!(body.as_object().expect("object").contains_key(COMPONENT_PATH_KEY));
+    }
+
+    #[test]
+    fn a_signal_no_model_describes_stamps_null_exactly_as_sb_signals_reports_it() {
+        // The permanent-BAD case: an explicit signal whose `dataItemId` is not in the probe.
+        // `sb/signals` answers `address.componentPath: null`; the update carries the same null,
+        // so the key is still there and a consumer never branches on its absence.
+        let mut body = facade_body();
+        stamp_component_path(&mut body, None);
+        assert_eq!(body[COMPONENT_PATH_KEY], json!(null));
+        assert!(body.as_object().expect("object").contains_key(COMPONENT_PATH_KEY));
+    }
+
+    #[test]
+    fn truncated_and_untruncated_and_explicit_signals_all_stamp_the_same_way() {
+        // The derived channel may be shortened to the topic budget (L12); the stamped path never
+        // is, and the three provenances are indistinguishable in the body.
+        let deep = "Resources[resources]/Materials[materials]/Stock[stock]";
+        for path in [deep, "Axes/Linear[X]", "Controller[cnc]"] {
+            let mut body = facade_body();
+            stamp_component_path(&mut body, Some(path));
+            assert_eq!(body[COMPONENT_PATH_KEY], json!(path), "the untruncated path, verbatim");
+        }
+    }
+
+    #[test]
+    fn stamping_twice_replaces_rather_than_duplicates() {
+        let mut body = facade_body();
+        stamp_component_path(&mut body, Some("Axes/Linear[X]"));
+        stamp_component_path(&mut body, Some("Axes/Rotary[C]"));
+        assert_eq!(body[COMPONENT_PATH_KEY], json!("Axes/Rotary[C]"));
+        assert_eq!(
+            body.as_object().expect("object").keys().filter(|k| *k == COMPONENT_PATH_KEY).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_non_object_body_is_left_alone_rather_than_replaced() {
+        let mut body = json!("not a body");
+        stamp_component_path(&mut body, Some("Axes/Linear[X]"));
+        assert_eq!(body, json!("not a body"));
     }
 
     #[test]
