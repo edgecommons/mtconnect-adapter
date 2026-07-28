@@ -1,148 +1,302 @@
-# MtconnectAdapter
+# MTConnect Adapter for EdgeCommons
 
-A **southbound MTConnect client**: it connects to one or more running MTConnect **Agents** over
-HTTP, reads each agent's device model and observations, and publishes normalized EdgeCommons
-signals onto the UNS in the shape the rest of the fleet expects — so a consumer can chart an
-MTConnect data item next to a Modbus register or an OPC UA node without knowing any of the three
-protocols. It is a client, not an agent: it serves no HTTP endpoints and keeps no sequence buffer of
-its own. A deployment with machine tools and no agent installs the canonical `mtconnect/agent` next
-to them; this component consumes it, the way the OPC UA adapter consumes a Kepware server.
+Connects machine tools sitting behind MTConnect agents to the EdgeCommons Unified Namespace, so a
+CNC's axis position charts next to a Modbus register and an OPC UA node without a consumer knowing
+any of the three protocols.
+
+Two things to know before you read further:
+
+- **It is a client of agents, never an agent itself.** It serves no HTTP endpoints and keeps no
+  sequence buffer; it reads `/probe`, `/current`, and `/sample` from agents you already run. If your
+  machines have no agent in front of them, install the canonical free
+  [`mtconnect/agent`](https://hub.docker.com/r/mtconnect/agent) Docker image next to them first —
+  this component consumes it, the way the OPC UA adapter consumes a Kepware server.
+- **It is read-only, by protocol design.** MTConnect agents serve observations and accept no writes
+  (Part 1 Fundamentals §5.1), so nothing here can command a machine. The `sb/write` verb exists only
+  to answer `WRITE_NOT_ALLOWED` instead of "unknown verb".
+
+## How it fits together
 
 ```text
-  connect (probe) ──► acquire (stream or poll) ──► publish SouthboundSignalUpdate ──► report health
-     ▲                                                                                    │
-     └───────────────────────── reconnect / resync with backoff ◄─────────────────────────┘
+   machine tools        MTConnect agent(s)        MtconnectAdapter          UNS broker
+  ──────────────  SHDR  ──────────────────  HTTP  ─────────────────  MQTT  ────────────────
+   CNC · robot    ────►  /probe /current    ────►  one instance      ────►  edge-console
+   cell · PLC            /sample (stream)          per machine              processors
+                                                   signals + health         historians
 ```
 
-> Full docs: [`docs/README.md`](docs/README.md). Design contract: [`DESIGN.md`](DESIGN.md).
+One `component.instances[]` entry is one machine — one MTConnect `Device/@uuid` — and its id becomes
+the `{instance}` token of every topic that machine publishes on. An agent, by contrast, is shared
+plumbing: you declare it once in `component.global.agents[]`, and every machine it serves attaches to
+that single acquisition rather than opening a socket of its own. A hundred machines behind one agent
+cost one HTTP connection and one document stream, and one machine's trouble never disturbs another's.
 
-## Run it
+## Quick start
 
-Against the built-in simulator — no agent, no hardware:
+Five minutes, no machine tools, no agent to install: the public MTConnect demo agent stands in for
+the plant.
+
+**Prerequisites.** Rust (1.85+), and a local MQTT broker:
+
+```bash
+docker run -d --name edgecommons-emqx -p 1883:1883 -p 18083:18083 emqx/emqx:latest
+```
+
+**The config.** Save this as `demo-agent.json` — an agent, a machine on it, and "publish everything":
+
+```json
+{
+  "hierarchy": { "levels": ["site", "device"] },
+  "identity": { "site": "factory-1" },
+  "component": {
+    "global": {
+      "agents": [
+        { "id": "demo-agent", "url": "https://demo.mtconnect.org" }
+      ]
+    },
+    "instances": [
+      {
+        "id": "okuma",
+        "connection": { "agentId": "demo-agent", "deviceUuid": "OKUMA.123456" },
+        "selection": { "mode": "all" }
+      }
+    ]
+  }
+}
+```
+
+`https://demo.mtconnect.org` is the MTConnect Institute's public agent; it serves two machines,
+`OKUMA.123456` and `Mazak`. Add a second instance pointed at `Mazak` and both stream through the same
+agent connection.
+
+**Run it.** The messaging file is separate from the component config — it tells the transport which
+broker to use, and the shipped one points at `localhost:1883`:
 
 ```bash
 cargo run -- \
   --platform HOST --transport MQTT ./test-configs/standalone-messaging.json \
-  -c FILE ./test-configs/config.json \
-  -t my-thing
+  -c FILE ./demo-agent.json \
+  -t demo-thing
 ```
 
-It publishes a moving `temperature-1` and a deliberately faulted `pressure-1` on
-`ecv1/{device}/mtconnect-adapter/device-1/data/{signal}`.
+**What you'll see.** Within a couple of seconds the adapter probes the agent, derives a signal for
+every data item the machine reports, and starts publishing — 105 topics for this device, updating as
+fast as the machine reports them:
 
-Against a real MTConnect agent, point `-c FILE` at `test-configs/mtconnect.json` instead (an
-`agents[]` entry plus one `mtconnect`-adapter instance bound to it — see
-[docs/sample-configurations.md](docs/sample-configurations.md)). `docker compose -f
-tests/compose.mtconnect-agent.yaml up -d` stands up the pinned reference agent (`mtconnect/agent`,
-the cppagent implementation) this repo's own test suite validates against.
-
-## The device seam
-
-`src/device.rs` defines the protocol boundary every backend implements:
-
-```rust
-#[async_trait]
-pub trait DeviceSession: Send + Sync {
-    async fn read_signals(&mut self) -> Result<Vec<Reading>>;
-    async fn read_named(&mut self, ids: &[String]) -> Result<Vec<Reading>>; // default: read-all, filter
-    async fn write_signal(&mut self, signal_id: &str, value: &Value) -> Result<()>;
-    async fn browse(&mut self, cursor: Option<String>, max: usize) -> Result<BrowsePage, BrowseError>; // default: Unsupported
-    async fn snapshot_now(&mut self) -> Result<Vec<Reading>>;   // default: read_signals  (`repoll`)
-    fn take_notices(&mut self) -> Vec<Notice>;                  // default: none          (`evt`)
-    fn served_signals(&self) -> Option<u64>;                    // default: the inventory size
-    async fn close(&mut self);
-}
-
-#[async_trait]
-pub trait DeviceBackend: Send + Sync {
-    fn kind(&self) -> &'static str;
-    fn inventory(&self, cfg: &ConnectionConfig) -> Vec<SignalInfo>; // default: empty
-    async fn connect(&self, cfg: &ConnectionConfig) -> Result<Box<dyn DeviceSession>>;
-}
+```text
+ecv1/demo-thing/MtconnectAdapter/okuma/data/axes-axes/linear-x/lx1actm
+ecv1/demo-thing/MtconnectAdapter/okuma/data/axes-axes/rotary-c1/ls1-chuck-state
+ecv1/demo-thing/MtconnectAdapter/okuma/data/controller-controller/lpexecution
+ecv1/demo-thing/MtconnectAdapter/okuma/data/systems-systems1/coolant-coolant-system1/lcoolant-system1-cond
+ecv1/demo-thing/MtconnectAdapter/okuma/data/lavail
 ```
 
-**The boundary rule, worth enforcing in review:** a backend knows *protocols*. It does not know
-EdgeCommons topics, the UNS, message envelopes, or metrics. `src/mtconnect/**` — the owned MTConnect
-HTTP/XML client — imports nothing from `edgecommons`, enforced by `tests/isolation.rs`.
-
-Two backends implement the pair today: `MtcBackend`/`MtcSession` (`adapter: "mtconnect"`, the
-default) is the real client, built on `src/mtconnect/**`; `SimBackend`/`SimSession`
-(`adapter: "sim"`) is the built-in simulator kept so the component runs on a laptop with no agent.
-`MtcSession::write_signal` always refuses — see below.
-
-## The contract this implements (`docs/SOUTHBOUND.md`)
-
-**Publish through the `data()` facade, never by hand.** It constructs the `SouthboundSignalUpdate`
-body (`{device, signal, samples}`), mints
-`ecv1/{device}/{component}/{instance}/data/{signal}`, and stamps identity. A hand-rolled topic is a
-topic that will eventually disagree with the envelope.
-
-**Quality on every sample**, normalized to `GOOD | BAD | UNCERTAIN`, with the protocol's own status
-code kept in `qualityRaw` for diagnosis. This is what lets a consumer gate on quality without
-knowing your protocol — and it is why **a failed read is published as `BAD`, not swallowed**. A
-signal that silently stops updating is indistinguishable from one that is simply not changing. The
-simulator's `pressure-1` demonstrates exactly this.
-
-**`southbound_health`, dimensioned by instance** — the canonical SOUTHBOUND.md §5 set:
-`connectionState`, `publishLatencyMs`, `pollLatencyMs`, `readErrors`, `staleSignals`, `reconnects`,
-`writeErrors`, `signalsSubscribed` — so an operator sees a link go down without reading logs. On top
-of it, `src/metrics.rs` ships the generic connect/reconnect and command-surface families
-(`MtconnectAdapterConnection`, `MtconnectAdapterCommand`) plus three MTConnect-specific families per
-HLD §9: `MtconnectStream` and `MtconnectProbe` (dimensioned `agentId`, emitted once per shared agent,
-not once per device), and `MtconnectParse` (dimensioned `instance`). See
-[reference/metrics.md](docs/reference/metrics.md) for every measure.
-
-**Per-instance connectivity, from one provider.** `App::run` registers an instance-connectivity
-provider reporting one entry per configured device. The library reads it twice: it pushes the
-sample into every `state` keepalive's `instances[]`, and it returns the same sample from the
-built-in `status` command verb when a console asks. A watcher and an asker cannot get different
-answers.
+The envelope on the X-axis position topic:
 
 ```json
-{ "instance": "device-1", "connected": true, "state": "ONLINE",
-  "detail": "sim://device-1", "attributes": { "adapter": "sim", "paused": false } }
+{
+  "header": { "name": "SouthboundSignalUpdate", "version": "1.0" },
+  "identity": {
+    "hier": [ { "level": "site", "value": "factory-1" },
+              { "level": "device", "value": "demo-thing" } ],
+    "path": "factory-1/demo-thing", "component": "MtconnectAdapter", "instance": "okuma"
+  },
+  "body": {
+    "signal": { "id": "lx1actm", "name": "X1actm" },
+    "samples": [
+      { "value": 4622.9039, "quality": "GOOD", "qualityRaw": "MTC_OK",
+        "serverTs": "2026-07-28T16:40:10.505404Z",
+        "receivedTs": "2026-07-28T16:40:17.7568664Z", "sequence": 1651597 }
+    ],
+    "device": { "adapter": "mtconnect", "instance": "okuma",
+                "endpoint": "mtconnect://demo.mtconnect.org/OKUMA.123456" }
+  }
+}
 ```
 
-`connected` is the **normalized** flag — always present, so a console renders a health dot without
-knowing your protocol. `state` is this adapter's **own** vocabulary (`CONNECTING` / `ONLINE` /
-`BACKOFF`), because a boolean cannot tell "reconnecting" from "administratively disabled".
-`attributes` is an **open** bag for domain data, so what only your adapter understands rides along
-without destabilizing the two fields every consumer relies on.
+Every field there is derived: the signal id from the machine's own `dataItemId`, the channel from its
+place in the component tree, the endpoint from the agent binding. Nothing was named by hand.
+[The tutorial](docs/tutorial.md) walks the same path with the built-in simulator and then a real
+agent; [the messaging reference](docs/reference/messaging-interface.md) is the full topic and payload
+contract.
 
-## Nothing is writable — MTConnect is a read-only protocol
+## Configuration at a glance
+
+The adapter reads one JSON document from `-c/--config`. Its own settings live under `component`;
+everything around them (`identity`, `hierarchy`, `messaging`, `logging`, `metricEmission`,
+`heartbeat`) is the standard EdgeCommons envelope. Every option below is specified in
+[the configuration reference](docs/reference/configuration.md).
+
+**Agents are declared once and referenced by id.** A real plant agent usually wants TLS and
+credentials, and both arrive as *references* resolved through the EdgeCommons vault — a secret never
+appears in the configuration, the logs, or a command reply:
+
+```json
+{ "id": "line-a-agent", "url": "https://agent.line-a.example.com",
+  "auth": { "type": "basic", "username": "svc-mtconnect", "secretRef": "line-a/agent-password" },
+  "tls": { "caSecretRef": "line-a/agent-ca" },
+  "streaming": "prefer", "heartbeatMs": 10000 }
+```
+
+`streaming: "prefer"` (the default) opens a long-lived multipart `/sample` stream and pushes
+observations as they happen; `"poll-only"` reads `/current` on `pollIntervalMs` instead, for an agent
+or a network that will not hold a stream open.
+
+**Instances name a machine on an agent, and nothing else.** The published endpoint is derived from
+those two values rather than configured, so the binding and the endpoint cannot drift apart:
 
 ```json
 { "id": "cnc-1", "adapter": "mtconnect",
-  "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.123456" },
-  "writes": { "allow": [] } }
+  "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.123456" } }
 ```
 
-MTConnect's API is read-only by specification (Part 1 Fundamentals §5.1): an agent serves
-observations, and there is nothing to write. `sb/write` stays registered — so a caller gets a
-standard, explanatory `WRITE_NOT_ALLOWED` instead of "unknown verb" — and the refusal precedes any
-inspection of the request, so no entry is ever resolved and nothing reaches a device. The same fact
-is advertised through command availability (`unsupported`), so a console disables the surface
-instead of offering a control that can never work, and `writes.allow` is pinned to the empty array
-by the configuration schema.
+**Choosing signals: derive them, or pin them.** A `selection` block publishes data items by matcher —
+or wholesale with `{ "mode": "all" }` — and follows the machine: an item that appears after a model
+change starts publishing, one that disappears stops. An explicit `signals[]` entry does the opposite:
+it fixes an identity that must survive a machine reconfiguration, and a `dataItemId` the model no
+longer has publishes a permanent BAD rather than vanishing. Use both — an explicit entry overrides
+the derived one for the same data item, field by field:
 
-`connection` is deliberately **open** — every protocol needs different keys (a unit id, a security
-policy, a slave address). Everything else in `config.schema.json` is closed, so a typo is caught.
+```json
+"signals": [ { "id": "x-position", "channel": "machining/x", "dataItemId": "Xabs" } ],
+"selection": {
+  "mode": "include",
+  "include": [ { "category": "SAMPLE", "path": "Axes/**" }, { "type": "EXECUTION|PROGRAM" } ],
+  "exclude": [ { "idMatch": ".*-debug" } ]
+}
+```
 
-## The command surface (`src/commands.rs`)
+Fields within one matcher are ANDed, matchers are ORed, exclude always wins, and regexes are anchored
+so `POSITION` cannot creep into `PATH_POSITION`. See
+[`selection`](docs/reference/configuration.md#componentinstancesselection) for the derivation rules.
 
-The adapter serves the generic southbound `sb/*` family on its `commands()` inbox (SOUTHBOUND.md
-§2.2): `sb/status`, `sb/read`, `sb/write`, `sb/signals`, `sb/browse`, `sb/pause`, `sb/resume`,
-`reconnect`, `repoll`. All nine declare scope `instance`, so the library resolves the addressing —
-the topic's instance token (`…/{instance}/cmd/{verb}`), else a body `instance`, a conflict between
-them refused with `BAD_ARGS` — and this module maps the resolved instance onto a configured device
-(unnamed means the sole one; required once more than one is configured). Every session-touching verb
-is handed to the device's own task over a control channel and confirmed through the reply that rides
-it, so the inbox never touches a live connection — while `sb/status` and `sb/browse` answer from the
-agent runtime's *published* state (its document headers and cached probe model), so neither queues
-behind acquisition and the address space stays browsable while the agent is unreachable.
+**Publish shaping controls what reaches the bus.** A fast axis does not need every reading as its own
+message, and a noisy sensor does not need to publish at all when it has not really moved:
 
-The same module registers five edge-console panels — `overview` (a status dashboard, the lifecycle
-action bar, and link-health metrics), `device-structure` (the probe tree over `sb/browse`'s `ref`
-mode), `signals` (a signal grid bound to `sb/signals`), `conditions` (condition/data-loss/agent
-events), and `diagnostics` (sequence and buffer state, agent events, stream metrics). None of them
-advertises a write surface. `repoll` is refused with `PAUSED` while the instance is paused.
+```json
+"publish": { "mode": "on-change", "batchMs": 1000, "deadband": 0.5 }
+```
+
+`batchMs` coalesces a window's readings into one update whose `samples[]` carries them all;
+`mode: "interval"` keeps only the latest per window; `deadband` suppresses numeric changes smaller
+than itself. A BAD or UNCERTAIN reading always flushes its window immediately — a quality transition
+never sits waiting. See [publish shaping](docs/reference/configuration.md#publish-shaping).
+
+## Operating it
+
+The adapter answers the generic southbound command family on its command inbox, addressed either to
+a machine on the topic (`…/{instance}/cmd/{verb}`) or to the component with the machine named in the
+body:
+
+| Verb | What it does |
+|---|---|
+| `sb/status` | The machine's live state plus what the agent has taught us — version, `instanceId`, buffer and sequence window, acquisition mode, heartbeat age, probe digest. |
+| `sb/signals` | The inventory this machine is serving, each row carrying its probe address and whether it was configured or discovered. |
+| `sb/browse` | The device's structure, paged or hierarchical, straight from the cached probe model — so it keeps working while the agent is unreachable. |
+| `sb/read` | A fresh scoped `/current` snapshot of named signals, with a per-entry reason when one cannot be read. |
+| `sb/pause` / `sb/resume` | Stop and restart publishing for one machine. Resume republishes the whole inventory first, so nobody consumes a stale picture. |
+| `reconnect` / `repoll` | Re-establish the session; force a fresh full read. |
+| `sb/write` | Always refuses with `WRITE_NOT_ALLOWED`, before it inspects the request. MTConnect has no write path, so there is nothing to allow-list — the verb stays registered so a caller gets an explanation instead of "unknown verb", and it is advertised `unsupported` so a console never renders a control that cannot work. |
+
+Five [edge-console](https://github.com/edgecommons/edge-console) panels ship with the component and
+mount automatically: **Overview** (state, lifecycle actions, link health), **Device Structure** (the
+probe tree), **Signals** (the served inventory), **Conditions & Events** (machine alarms, data loss,
+agent transitions), and **Diagnostics** (sequence and buffer state, stream metrics). None of them
+names a write surface.
+
+What to watch when something looks wrong:
+
+| Signal of trouble | Where it shows | Reading it |
+|---|---|---|
+| Link down | `southbound_health.connectionState` | `0` means this machine's session is not established. `MtconnectAgentEvent` says whether the agent went away or the stream degraded to polling. |
+| Fewer signals than expected | `southbound_health.signalsSubscribed` | What the session is actually serving. A drop means data items the configuration names are missing from the current device model. |
+| Values going quiet | `southbound_health.staleSignals` | Signals with no update for longer than `healthThresholds.staleSignalSecs`. |
+| Gaps in history | `MtconnectDataLossEvent` | The agent's ring buffer overran our position; the event names how many observations were provably lost and the sequence window they fell in. |
+| Ids or structure changed | `MtconnectModelDriftEvent`, `MtconnectSignalSetEvent` | The machine's model changed and the signal set was recomputed; the events name the digests and the added/removed counts. |
+| A machine alarm | `MtconnectConditionEvent` | A condition transitioned into `Fault`. Any signal bound to it through `conditionBinding` degrades to BAD at the same moment. |
+
+Every measure is defined in [the metrics reference](docs/reference/metrics.md); every event body in
+[the messaging reference](docs/reference/messaging-interface.md).
+
+## Behavior worth knowing
+
+**Acquisition heals itself.** The adapter prefers streaming and falls back to polling: after three
+consecutive failures to establish a stream it degrades to `/current` polling and keeps retrying the
+stream on a jittered backoff, so a plant full of adapters does not reconnect in lockstep. A missed
+heartbeat, or a broken frame, re-establishes the stream from the same position.
+
+**An agent restart or a buffer overrun is recovered and reported — never silent.** If the agent's
+buffer has moved past our position, the adapter reports how many observations were provably lost and
+republishes a fresh snapshot as current data. If the agent's `instanceId` changed — it restarted — it
+re-probes, surfaces any model drift, and resyncs. Each of those raises an event, because data you
+never received is a fact an operator needs, not a log line to find later.
+
+**Two timestamps, two meanings.** `serverTs` is when the machine's data was captured, as the agent
+reported it. `receivedTs` is when this adapter received it — the two differ by however long the
+observation sat in the agent's buffer, which is why both are published.
+
+**What it does not do.** MTConnect Assets (`/asset`) and the optional JSON representation are not
+read — only the XML `Devices`, `Streams`, and `Errors` documents. Consuming an agent's MQTT sink
+instead of its HTTP interface is not supported. And nothing is writable, ever.
+
+## Deployment
+
+Three packs ship in the repo, all driven by the same CLI contract
+(`--platform` / `--transport` / `-c` / `-t`):
+
+- **HOST** — `Dockerfile` plus `compose.yaml`, which brings up a throwaway EMQX broker and the
+  component together (`docker compose up --build`). This is the pack the quick start above exercises,
+  and it is validated live against a real broker and a real agent.
+- **Greengrass v2** — `recipe.yaml`, `gdk-config.json`, and `build.sh` for `gdk component build` /
+  `gdk component publish`. The pack is generated from the component's own configuration; it has not
+  been run on a Greengrass device.
+- **Kubernetes** — `k8s/deployment.yaml` and `k8s/configmap.yaml`; with `--platform auto` the library
+  detects Kubernetes and takes its config from the mounted ConfigMap and its identity from the
+  Downward API, so the container needs no arguments. The manifests are generated; they have not been
+  run on a cluster.
+
+[The deployment how-to](docs/how-to-guides.md) has the commands for each.
+
+## Contributing & development
+
+The repo:
+
+- `src/` — the component above the protocol: the device seam, the connect/acquire/publish supervisor,
+  the command surface, the metric families, the reload gate, and the publish-shaping engine.
+- `src/mtconnect/` — the owned MTConnect HTTP/XML client: probe model, observations, the sequence and
+  resync state machine, multipart streaming, and signal derivation.
+- `tests/` — the unit and integration suites, plus `compose.mtconnect-agent.yaml`, which stands up
+  the pinned canonical cppagent as a live test peer.
+- `docs/` — the full documentation set: tutorial, how-to guides, reference, and explanation.
+- `config.schema.json` and `test-configs/` — the configuration contract and runnable examples; the
+  deployment packs sit at the repo root and in `k8s/`.
+
+**The one boundary rule:** nothing under `src/mtconnect/` may import `edgecommons`. A backend knows
+protocols; it does not know UNS topics, envelopes, or metrics. `tests/isolation.rs` enforces this
+mechanically, so crossing the line fails the build rather than a review.
+
+Build and test:
+
+```bash
+cargo test                                    # no network, no broker, no agent needed
+cargo clippy --all-targets -- -D warnings
+cargo llvm-cov --fail-under-lines 90          # the coverage gate CI enforces
+```
+
+The live suites self-skip unless you point them at something. For the real-agent harness:
+
+```bash
+docker compose -f tests/compose.mtconnect-agent.yaml up -d
+EC_MTC_AGENT=http://localhost:5010 cargo test --test agent_integration -- --test-threads=1
+```
+
+That harness covers what a fake agent cannot: agent restart, `instanceId` resync, buffer wrap and
+`OUT_OF_RANGE` recovery, and multi-device demultiplexing on one stream.
+
+Where to look next: [`DESIGN.md`](DESIGN.md) for why the component is shaped this way and which
+decisions are binding, [`AGENTS.md`](AGENTS.md) for the invariants an agent or a contributor must not
+remove, and [`docs/`](docs/README.md) for the user-facing documentation set.
+
+## License
+
+Business Source License 1.1 — see [`LICENSE`](LICENSE).

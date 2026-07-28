@@ -22,6 +22,19 @@ lives. Everything above it (`src/supervisor.rs`'s connect/poll/backoff superviso
 new protocol is added. **The boundary rule:** a backend knows protocols; it does not know
 EdgeCommons topics, the UNS, envelopes, or metrics.
 
+`DeviceSession` is one live connection to one device. Two methods are required — `read_signals`
+(the acquisition cycle) and `write_signal` — and the rest carry defaults, so a new backend
+implements only what its protocol actually has: `read_named` (default: read all, filter) serves
+`sb/read`, `browse` (default: `Unsupported`) serves `sb/browse`, `snapshot_now` (default:
+`read_signals`) serves `repoll`, `take_notices` (default: none) drains the runtime facts that
+become `evt` messages, `served_signals` (default: the inventory size) feeds
+`southbound_health.signalsSubscribed`, and `close` releases the connection. `DeviceBackend` opens
+sessions: `kind` names the `adapter` token, `inventory` (default: empty) reports a device's
+configured signals before any connection exists, and `connect` returns a session. Two backends
+implement the pair: `MtcBackend`/`MtcSession` (`adapter: "mtconnect"`, the default) over the owned
+client in `src/mtconnect/**`, and `SimBackend`/`SimSession` (`adapter: "sim"`).
+`MtcSession::write_signal` always refuses.
+
 ## Config location
 
 This component's own settings live under `component.global` / `component.instances[]` in the
