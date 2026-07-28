@@ -1,0 +1,53 @@
+# Component config for Kubernetes, mounted as a DIRECTORY at /etc/edgecommons so the CONFIGMAP
+# source watches the kubelet ..data swap and hot-reloads in-process (no restart). config.json
+# carries BOTH the component config AND the messaging block (in-cluster broker via Service DNS).
+# Edit this and `kubectl apply -f k8s/` to drive a hot reload. Point host at your broker Service.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mtconnect-adapter-config
+  labels:
+    app.kubernetes.io/name: mtconnect-adapter
+data:
+  config.json: |-
+    {
+      "component": {
+        "global": {
+          "defaults": {
+            "pollIntervalMs": 5000
+          },
+          "timeouts": {
+            "connectMs": 5000,
+            "reconnectBackoffMinMs": 1000,
+            "reconnectBackoffMaxMs": 60000
+          },
+          "healthThresholds": {
+            "staleSignalSecs": 30
+          }
+        },
+        "instances": [
+          {
+            "id": "device-1",
+            "adapter": "sim",
+            "connection": {
+              "endpoint": "sim://device-1"
+            },
+            "pollIntervalMs": 5000,
+            "writes": {
+              "allow": []
+            }
+          }
+        ]
+      },
+      "messaging": {
+        "local": {
+          "type": "mqtt",
+          "host": "emqx.default.svc.cluster.local",
+          "port": 1883,
+          "clientId": "mtconnect-adapter"
+        }
+      },
+      "logging": {
+        "level": "INFO"
+      }
+    }

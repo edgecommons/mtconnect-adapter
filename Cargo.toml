@@ -1,0 +1,46 @@
+[package]
+name = "mtconnect-adapter"
+version = "1.0.0"
+edition = "2021"
+# Matches the edgecommons library's MSRV (edition-2024 crate).
+rust-version = "1.85"
+license = "BUSL-1.1"
+description = "The MtconnectAdapter component."
+publish = false
+
+[[bin]]
+name = "mtconnect-adapter"
+path = "src/main.rs"
+
+# Runtime selection mirrors the edgecommons library:
+#   - `standalone` (default): dual-broker MQTT — runs on a laptop/container, no C
+#     toolchain. Use this for `cargo run` / `cargo test` during development.
+#   - `greengrass`: Greengrass IPC — the on-device build. Linux-only (the SDK is a
+#     C-FFI crate needing libclang). `build.sh` builds the artifact with this feature.
+[features]
+default = ["standalone"]
+standalone = ["edgecommons/standalone"]
+greengrass = ["edgecommons/greengrass"]
+# Direct CloudWatch metric target (AWS SDK PutMetricData); combine with `greengrass`.
+cloudwatch = ["edgecommons/cloudwatch"]
+
+[dependencies]
+# edgecommons Rust library. The dependency form is chosen by `--dep-source` at generation:
+#   local    -> path = "<abs path to libs/rust>"   (a monorepo checkout; the dev default)
+#   registry -> git = "https://github.com/edgecommons/edgecommons", tag = "rust-lib/vX.Y.Z"
+#
+# `local` IS this template's local-dev override: a Cargo path dependency resolves straight from
+# the sibling checkout's current source, so a freshly generated component needs no extra override
+# step. `registry` pins the published tag. Move between them later with
+# `edgecommons component upgrade --to <version>`.
+edgecommons = { git = "https://github.com/edgecommons/edgecommons", rev = "a14a3285573ef2bb6a531e1e1936c6dc40a85ef4", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+serde_json = "1"
+tracing = "0.1"
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.edgecommons.mbreissi.com/schemas/MtconnectAdapter/config.schema.json",
+  "title": "MtconnectAdapter component configuration",
+  "description": "The configuration MtconnectAdapter itself understands: the object at `component.global`, with each entry of `component.instances[]` validated against `#/$defs/device`. A southbound adapter models ONE DEVICE PER INSTANCE — how to reach it, how often to read it, and what it is permitted to write. See docs/SOUTHBOUND.md for the contract this implements. The library envelope (logging, messaging, metricEmission, heartbeat, streaming, credentials, parameters, health, hierarchy, identity, topic, tags) is owned by the canonical schema and is deliberately not redeclared here.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Defaults applied to every device that does not override them.",
+      "properties": {
+        "pollIntervalMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5000,
+          "description": "How often each device is read."
+        }
+      }
+    },
+    "timeouts": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Connection lifecycle timings.",
+      "properties": {
+        "connectMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5000,
+          "description": "How long a connect attempt may take before it is treated as failed."
+        },
+        "reconnectBackoffMinMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1000,
+          "description": "The first reconnect window. Each attempt doubles it, up to the max."
+        },
+        "reconnectBackoffMaxMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 60000,
+          "description": "The reconnect ceiling. Backoff is jittered within the window, so a plant full of adapters does not reconnect in lockstep when a PLC reboots."
+        }
+      }
+    },
+    "healthThresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Thresholds feeding the `southbound_health` metric (SOUTHBOUND.md §5).",
+      "properties": {
+        "staleSignalSecs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30,
+          "description": "A signal with no update for longer than this counts toward `southbound_health.staleSignals` (SOUTHBOUND.md §5). A signal that silently stops updating is otherwise indistinguishable from one that is simply not changing — which is why staleness is measured rather than assumed."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "instance": { "$ref": "#/$defs/device" },
+    "device": {
+      "title": "One device",
+      "description": "One entry of `component.instances[]`. Each device gets its own task and its own connection lifecycle.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "connection"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+          "description": "Unique device id. It is the `{instance}` token of this device's UNS topics and the `instance` dimension of its health metric, so it must be a valid UNS token (lower-kebab) and it must be stable."
+        },
+        "adapter": {
+          "type": "string",
+          "default": "sim",
+          "description": "Which protocol backend to use. Matches `DeviceBackend::kind()` in `src/device.rs`, and is published in the `device.adapter` field of every SouthboundSignalUpdate."
+        },
+        "connection": {
+          "type": "object",
+          "required": ["endpoint"],
+          "additionalProperties": true,
+          "description": "How to reach the device. Deliberately OPEN — every protocol needs different keys (a unit id, a security policy, a slave address), and this is the one place the adapter should not be strict. Everything else stays `additionalProperties: false`.",
+          "properties": {
+            "endpoint": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The endpoint, in whatever form the protocol uses. Published in the `device.endpoint` field."
+            }
+          }
+        },
+        "pollIntervalMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Per-device override of the read cadence."
+        },
+        "writes": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The write allow-list.",
+          "properties": {
+            "allow": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "default": [],
+              "description": "Signal ids this adapter may write, matched on the STABLE `signal.id` (never a volatile index). Anything not listed is refused, whatever a command asks for. An empty list — the default — means the adapter is read-only, which is the correct posture for anything touching a control system."
+            }
+          }
+        }
+      }
+    }
+  }
+}

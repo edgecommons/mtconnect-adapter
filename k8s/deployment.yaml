@@ -1,0 +1,61 @@
+# Minimal Kubernetes Deployment for a edgecommons component. With --platform auto the library detects
+# KUBERNETES from the ServiceAccount token; config source defaults to CONFIGMAP, transport to MQTT
+# (broker config from the mounted ConfigMap), identity from the Downward API — so NO args are needed.
+# Build the image from ./Dockerfile and push to your registry (e.g. ghcr.io/<owner>/mtconnect-adapter)
+# or `kind load` it for a local cluster, then set `image:` below.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mtconnect-adapter
+  labels:
+    app.kubernetes.io/name: mtconnect-adapter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mtconnect-adapter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mtconnect-adapter
+    spec:
+      automountServiceAccountToken: true   # the projected SA token is the platform=KUBERNETES auto-detect signal
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: component
+          image: REPLACE_ME   # e.g. ghcr.io/<owner>/mtconnect-adapter:latest (build ./Dockerfile)
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          ports:
+            - { name: health, containerPort: 8081 }
+            - { name: metrics, containerPort: 9090 }
+          startupProbe:
+            httpGet: { path: /startupz, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/edgecommons, readOnly: true }   # WHOLE volume, never subPath (hot-reload)
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap: { name: mtconnect-adapter-config }
+        - name: tmp
+          emptyDir: {}

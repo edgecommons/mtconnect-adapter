@@ -1,0 +1,59 @@
+{
+  "logging": {
+    "level": "DEBUG",
+    "rust_format": "{timestamp} [{level}] [{component}] {target} - {message}"
+  },
+  "hierarchy": {
+    "levels": [
+      "site",
+      "device"
+    ]
+  },
+  "identity": {
+    "site": "factory-1"
+  },
+  "heartbeat": {
+    "enabled": true,
+    "intervalSecs": 5,
+    "measures": {
+      "cpu": true,
+      "memory": true
+    },
+    "destination": "local"
+  },
+  "metricEmission": {
+    "target": "log",
+    "namespace": "edgecommons"
+  },
+  "tags": {
+    "site": "factory-1"
+  },
+  "component": {
+    "global": {
+      "defaults": {
+        "pollIntervalMs": 5000
+      },
+      "timeouts": {
+        "connectMs": 5000,
+        "reconnectBackoffMinMs": 1000,
+        "reconnectBackoffMaxMs": 60000
+      },
+      "healthThresholds": {
+        "staleSignalSecs": 30
+      }
+    },
+    "instances": [
+      {
+        "id": "device-1",
+        "adapter": "sim",
+        "connection": {
+          "endpoint": "sim://device-1"
+        },
+        "pollIntervalMs": 5000,
+        "writes": {
+          "allow": []
+        }
+      }
+    ]
+  }
+}

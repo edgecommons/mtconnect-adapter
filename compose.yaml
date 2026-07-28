@@ -1,0 +1,81 @@
+# HOST platform pack for MtconnectAdapter.
+#
+# Runs the component exactly the way the README's "Run locally (HOST platform, MQTT transport)"
+# section does — --platform HOST --transport MQTT <messaging config> -c FILE <config> -t <thing> —
+# but containerized, against a throw-away EMQX broker on the compose network.
+#
+#   docker compose up --build          # build the image (./Dockerfile) and start broker + component
+#   docker compose logs -f mtconnect-adapter
+#   docker compose down -v
+#
+# Watch the bus (the library publishes the state keepalive automatically):
+#   mosquitto_sub -h localhost -p 1883 -t 'ecv1/+/+/+/state' -t 'ecv1/+/+/+/app/#' -v
+#
+# The device (thing) name defaults to mtconnect-adapter-dev; override with THING_NAME=... docker compose up.
+name: mtconnect-adapter
+
+services:
+  # Local MQTT broker — the HOST platform's `messaging.local` target.
+  emqx:
+    image: emqx/emqx:latest
+    container_name: mtconnect-adapter-emqx
+    ports:
+      - "1883:1883"     # MQTT
+      - "18083:18083"   # EMQX dashboard (default login admin / public)
+    healthcheck:
+      test: ["CMD", "/opt/emqx/bin/emqx", "ctl", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  mtconnect-adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile          # multi-stage: cargo build --release --bin mtconnect-adapter
+      # The cargo git dep on the private edgecommons repo needs credentials at build time; pass a
+      # token through if your dep source is a git URL:
+      #   args:
+      #     GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    image: mtconnect-adapter:dev
+    container_name: mtconnect-adapter
+    depends_on:
+      emqx:
+        condition: service_healthy
+    # The image ENTRYPOINT is /usr/local/bin/component (the built mtconnect-adapter binary); these are the
+    # standard runtime CLI args appended to it.
+    command:
+      - "--platform"
+      - "HOST"
+      - "--transport"
+      - "MQTT"
+      - "/etc/edgecommons/messaging.json"
+      - "-c"
+      - "FILE"
+      - "/etc/edgecommons/test-configs/config.json"
+      - "-t"
+      - "${THING_NAME:-mtconnect-adapter-dev}"
+    volumes:
+      # The component config source (-c FILE ...). Edit test-configs/ on the host and restart.
+      - ./test-configs:/etc/edgecommons/test-configs:ro
+    configs:
+      - source: messaging
+        target: /etc/edgecommons/messaging.json
+    restart: unless-stopped
+
+configs:
+  # The --transport MQTT messaging config. test-configs/standalone-messaging.json is the same thing
+  # for a bare `cargo run` on your workstation (host: localhost); this inline copy points at the
+  # `emqx` service on the compose network instead.
+  messaging:
+    content: |
+      {
+        "messaging": {
+          "local": {
+            "host": "emqx",
+            "port": 1883,
+            "clientId": "mtconnect-adapter-local"
+          }
+        }
+      }

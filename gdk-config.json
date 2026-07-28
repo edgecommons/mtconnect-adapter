@@ -1,0 +1,17 @@
+{
+  "component": {
+    "com.mbreissi.edgecommons.MtconnectAdapter": {
+      "author": "",
+      "version": "NEXT_PATCH",
+      "build": {
+        "build_system": "custom",
+        "custom_build_command": ["bash", "build.sh"]
+      },
+      "publish": {
+        "bucket": "edgecommons-set-artifact-bucket",
+        "region": "us-east-1"
+      }
+    }
+  },
+  "gdk_version": "1.0.0"
+}

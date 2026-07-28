@@ -1,0 +1,8 @@
+/target
+/greengrass-build
+*.metric.log
+# LOCAL DEV ONLY — the pinned-rev .cargo/config.toml patch override points at your sibling
+# checkout and must not be committed to your component repo.
+/.cargo/
+# Cargo.lock is committed for binary components; the template ships without one so
+# the first build generates it for your crate.
