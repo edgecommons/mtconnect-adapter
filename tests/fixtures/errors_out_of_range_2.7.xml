@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MTConnectError xmlns="urn:mtconnect.org:MTConnectError:2.7" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:mtconnect.org:MTConnectError:2.7 http://schemas.mtconnect.org/schemas/MTConnectError_2.7.xsd">
+  <Header creationTime="2026-07-27T10:01:00Z" sender="mtc-agent" instanceId="1749000000" version="2.7.0.12" bufferSize="131072" firstSequence="153" lastSequence="131224"/>
+  <Errors>
+    <Error errorCode="OUT_OF_RANGE">'from' must be greater than or equal to 153: 'from' is out of range</Error>
+  </Errors>
+</MTConnectError>

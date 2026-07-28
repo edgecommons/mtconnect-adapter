@@ -1,0 +1,95 @@
+{
+  "logging": {
+    "level": "DEBUG",
+    "rust_format": "{timestamp} [{level}] [{component}] {target} - {message}"
+  },
+  "hierarchy": {
+    "levels": [
+      "site",
+      "device"
+    ]
+  },
+  "identity": {
+    "site": "factory-1"
+  },
+  "heartbeat": {
+    "enabled": true,
+    "intervalSecs": 5,
+    "measures": {
+      "cpu": true,
+      "memory": true
+    },
+    "destination": "local"
+  },
+  "metricEmission": {
+    "target": "log",
+    "namespace": "edgecommons"
+  },
+  "tags": {
+    "site": "factory-1"
+  },
+  "component": {
+    "global": {
+      "agents": [
+        {
+          "id": "line-a-agent",
+          "url": "http://127.0.0.1:5000",
+          "streaming": "poll-only",
+          "pollIntervalMs": 1000,
+          "requestTimeoutMs": 10000,
+          "heartbeatMs": 10000
+        }
+      ],
+      "defaults": {
+        "pollIntervalMs": 1000,
+        "publishMode": "on-change",
+        "maxDocumentBytes": 16777216
+      },
+      "healthThresholds": {
+        "staleSignalSecs": 30
+      }
+    },
+    "instances": [
+      {
+        "id": "cnc-1",
+        "adapter": "mtconnect",
+        "connection": {
+          "agentId": "line-a-agent",
+          "deviceUuid": "OKUMA.123456"
+        },
+        "pollIntervalMs": 1000,
+        "signals": [
+          {
+            "id": "x-position",
+            "name": "X axis actual position",
+            "dataItemId": "Xabs",
+            "conditionBinding": ["Xtravel"]
+          },
+          {
+            "id": "x-load",
+            "name": "X axis load",
+            "dataItemId": "Xload"
+          },
+          {
+            "id": "spindle-speed",
+            "name": "Spindle speed",
+            "dataItemId": "Sspeed"
+          },
+          {
+            "id": "execution",
+            "name": "Execution state",
+            "dataItemId": "execution"
+          },
+          {
+            "id": "x-travel-condition",
+            "name": "X axis travel condition",
+            "dataItemId": "Xtravel"
+          }
+        ],
+        "writes": {
+          "allow": []
+        }
+      }
+    ]
+  }
+}

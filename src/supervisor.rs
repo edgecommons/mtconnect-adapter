@@ -14,6 +14,7 @@
 //! `ethernet-ip-adapter`'s `supervisor.rs`/`poll_driver.rs` seams are. Everything they call stays in
 //! the denominator and is tested.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -23,11 +24,15 @@ use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::app::{
-    connectivity_of, sample_timestamps, set_paused, stamp_received, Backoff, DeviceConfig,
-    DeviceControl, Health, LinkState,
+    build_sample, compile_mtconnect, connectivity_of, set_paused, stamp_received, Backoff,
+    DeviceConfig, DeviceControl, Health, LinkState,
 };
-use crate::device::{BrowseError, DeviceBackend, Quality, SimBackend};
+use crate::device::{
+    resolve_agent_credentials, BrowseError, DeviceBackend, MtcBackend, SimBackend,
+};
 use crate::metrics::DeviceMetrics;
+use crate::mtconnect::config::parse_agents;
+use crate::mtconnect::AgentRuntime;
 
 /// How often the periodic metrics emit runs, in the poll loop.
 const METRICS_INTERVAL: Duration = Duration::from_secs(30);
@@ -44,6 +49,11 @@ pub struct App {
     devices: Vec<DeviceConfig>,
     /// `component.global.healthThresholds.staleSignalSecs`.
     stale_signal_secs: u64,
+    /// One shared runtime per `component.global.agents[]` entry (D-MTC-3). Built before any
+    /// instance supervisor starts, so an instance's `connect` only has to attach.
+    agents: HashMap<String, Arc<AgentRuntime>>,
+    /// The MTConnect backend, wired to those runtimes.
+    mtconnect: Arc<MtcBackend>,
 }
 
 struct ConfigListener;
@@ -83,10 +93,48 @@ impl App {
         }
         anyhow::ensure!(!devices.is_empty(), "no valid devices in component.instances[]");
 
-        Ok(Self { config, metrics, devices, stale_signal_secs })
+        // The agents come first: an MTConnect instance is one device of an agent that is declared
+        // once and shared (D-MTC-3), and its endpoint is derived from that pairing.
+        let needs_agents = devices.iter().any(|d| d.adapter == crate::device::KIND);
+        let agent_configs =
+            if needs_agents { parse_agents(config.global())? } else { Vec::new() };
+        let mtc_devices = compile_mtconnect(&mut devices, &agent_configs)?;
+
+        // Vault references become values exactly once, here — the protocol client never sees a
+        // reference, and never learns the credential service exists.
+        let credential_service = gg.credentials();
+        let mut agents = HashMap::new();
+        for cfg in agent_configs {
+            let creds = resolve_agent_credentials(&cfg, credential_service.as_deref())
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let id = cfg.id.clone();
+            tracing::info!(agent = %id, url = %cfg.url, mode = ?cfg.streaming, "agent runtime configured");
+            agents.insert(id, AgentRuntime::new(cfg, &creds)?);
+        }
+        let mtconnect = Arc::new(MtcBackend::new(agents.clone(), mtc_devices));
+
+        Ok(Self { config, metrics, devices, stale_signal_secs, agents, mtconnect })
+    }
+
+    /// The backend serving one device's `adapter`.
+    fn backend_for(&self, cfg: &DeviceConfig) -> Option<Arc<dyn DeviceBackend>> {
+        match cfg.adapter.as_str() {
+            "sim" => Some(Arc::new(SimBackend)),
+            crate::device::KIND => Some(Arc::clone(&self.mtconnect) as Arc<dyn DeviceBackend>),
+            other => {
+                tracing::error!(instance = %cfg.id, adapter = %other, "unknown adapter");
+                None
+            }
+        }
     }
 
     pub async fn run(&self, gg: &EdgeCommons) -> anyhow::Result<()> {
+        // The shared acquisition tasks start BEFORE any instance supervisor: an instance attaches
+        // to a running agent runtime, it does not start one.
+        for agent in self.agents.values() {
+            agent.spawn();
+        }
+
         // Each device's health, shared with its task and read by the connectivity provider.
         let mut reported: Vec<(DeviceConfig, Arc<Health>)> = Vec::new();
         // The per-device handles the command surface routes on.
@@ -109,9 +157,8 @@ impl App {
 
             // The signal inventory `sb/signals` shows — a config/backend view, no device round-trip.
             // Its size drives the `southbound_health.signalsSubscribed` gauge while the link is up.
-            let signals = make_backend(device)
-                .map(|b| b.inventory(&device.connection))
-                .unwrap_or_default();
+            let Some(backend) = self.backend_for(device) else { continue };
+            let signals = backend.inventory(&device.connection);
             health.set_signal_inventory(signals.len() as u64);
 
             let (control_tx, control_rx) = mpsc::channel::<DeviceControl>(16);
@@ -126,6 +173,7 @@ impl App {
 
             tokio::spawn(run_device(
                 device.clone(),
+                backend,
                 instance.data(),
                 instance.events(),
                 dm,
@@ -150,19 +198,11 @@ impl App {
 
         gg.shutdown_signal().await;
         tracing::info!("shutdown signal received");
+        for agent in self.agents.values() {
+            agent.shutdown().await;
+        }
         self.metrics.flush_metrics().await.ok();
         Ok(())
-    }
-}
-
-/// Instantiate the backend for a device's `adapter`. A real adapter matches its protocol(s) here.
-fn make_backend(cfg: &DeviceConfig) -> Option<Box<dyn DeviceBackend>> {
-    match cfg.adapter.as_str() {
-        "sim" => Some(Box::new(SimBackend)),
-        other => {
-            tracing::error!(instance = %cfg.id, adapter = %other, "unknown adapter");
-            None
-        }
     }
 }
 
@@ -176,15 +216,13 @@ fn make_backend(cfg: &DeviceConfig) -> Option<Box<dyn DeviceBackend>> {
 /// drops out of the poll loop and back into connect — the only place that knows how to back off.
 async fn run_device(
     cfg: DeviceConfig,
+    backend: Arc<dyn DeviceBackend>,
     data: DataFacade,
     events: EventsFacade,
     dm: Arc<DeviceMetrics>,
     health: Arc<Health>,
     mut control: mpsc::Receiver<DeviceControl>,
 ) {
-    let Some(backend) = make_backend(&cfg) else {
-        return;
-    };
     let backoff = Backoff::default();
     let mut attempt: u32 = 0;
     // A `reconnect` command's reply, held until the next connect settles it.
@@ -415,32 +453,16 @@ async fn poll_once(
     let mut published = 0u64;
     for r in readings {
         // The data() facade builds the SouthboundSignalUpdate body, mints the topic, and stamps
-        // identity. Do not hand-build any of the three.
-        let quality = match r.quality {
-            Quality::Good => edgecommons::facades::Quality::Good,
-            Quality::Bad => edgecommons::facades::Quality::Bad,
-            Quality::Uncertain => edgecommons::facades::Quality::Uncertain,
-        };
-        let mut sample = Sample::with_quality(r.value.clone(), quality);
-        if let Some(raw) = &r.quality_raw {
-            sample = sample.quality_raw(raw);
-        }
-        // The four-slot mapping (docs/SOUTHBOUND.md §2): capture -> serverTs (falling back to the
-        // receive moment — a direct client's receive IS capture); sourceTs only when the device
-        // supplied it (never synthesized); receivedTs as a per-sample extra only when a mediating
-        // server makes it differ from the effective serverTs.
-        let (server_ts, received_extra) = sample_timestamps(&r);
-        sample.source_ts = r.source_ts.clone();
-        if let Some(ts) = server_ts {
-            sample = sample.server_ts(ts);
-        }
-        if let Some(received) = received_extra {
-            sample = sample.extra("receivedTs", received);
-        }
+        // identity. Do not hand-build any of the three. The whole value/quality/timestamp/extras
+        // mapping lives in the unit-tested `build_sample` (docs/SOUTHBOUND.md §2).
+        let sample = build_sample(&r);
 
         let mut signal = data.signal(&r.signal_id);
         if let Some(name) = &r.name {
             signal = signal.name(name);
+        }
+        if let Some(channel) = &r.channel {
+            signal = signal.signal_path(channel);
         }
         let update = signal
             .device_parts(&backend_adapter, &cfg.id, &cfg.connection.endpoint)

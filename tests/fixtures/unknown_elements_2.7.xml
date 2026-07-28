@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MTConnectDevices xmlns="urn:mtconnect.org:MTConnectDevices:2.7">
+  <Header creationTime="2026-07-27T10:00:00Z" sender="mtc-agent" instanceId="1749000000" version="2.8.0.1" bufferSize="131072"/>
+  <Devices>
+    <Device id="okuma" name="OKUMA-CNC" uuid="OKUMA.123456" mtconnectVersion="2.7">
+      <DataItems>
+        <DataItem category="EVENT" id="avail" name="avail" type="AVAILABILITY"/>
+        <DataItem category="SAMPLE" id="Xabs" name="Xabs" subType="ACTUAL" type="POSITION" units="MILLIMETER"/>
+      </DataItems>
+      <VendorExtension vendor="acme" payload="whatever a future schema adds"/>
+      <Components>
+        <Linear id="x-axis" name="X">
+          <VendorTag key="k" value="v"/>
+          <DataItems>
+            <DataItem category="SAMPLE" id="Xload" name="Xload" type="LOAD" units="PERCENT"/>
+          </DataItems>
+        </Linear>
+      </Components>
+    </Device>
+    <FutureCatalogThing id="whatever"/>
+  </Devices>
+</MTConnectDevices>

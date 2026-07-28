@@ -3,50 +3,128 @@
 > Treat this document as the **design-fidelity contract** for this component: before changing
 > behavior, update the relevant section here in the same change, and review new work against what
 > is written here — not against a summary of it.
+>
+> The full design lives in the core repo: `docs/adapters/mtconnect-adapter.md` (HLD, decision
+> register D-MTC-1..10) and `docs/adapters/mtconnect-adapter-implementation.md` (LLD). This file
+> records what is built here and what is not yet.
 
 ## What it is
 
-`com.mbreissi.edgecommons.MtconnectAdapter` is a southbound protocol adapter: it connects to devices, reads signals, and
-publishes them onto the UNS in the shape the rest of the fleet expects. This scaffold ships a
-simulated device backend as a worked example; fill in the sections below as you replace it with a
-real protocol.
+`com.mbreissi.edgecommons.MtconnectAdapter` is a southbound **MTConnect client**. It connects to one
+or more running MTConnect **Agents** over HTTP, reads each agent's device model (`/probe`), acquires
+observations (`/current` today, `/sample?interval=…` streaming next), and publishes normalized
+EdgeCommons signals.
+
+It is **not** an MTConnect Agent (it serves no HTTP endpoints, keeps no sequence buffer) and **not**
+an MTConnect Adapter in the standard's sense (it ingests no SHDR). A deployment with machine tools
+and no agent installs the canonical `mtconnect/agent` next to them; this component consumes it, the
+way the OPC UA adapter consumes a Kepware server.
+
+One `component.instances[]` entry is one MTConnect **device** (`Device/@uuid`) served by a
+configured agent. Several devices on one agent share one runtime and one acquisition.
 
 ## Decisions
 
-Record each real design decision here as you make it, numbered so later sessions can cite it —
-mirror the `D-<PREFIX>-<n>` convention used across the EdgeCommons repos (e.g. `D-MtconnectAdapter-1`).
+The HLD's register is binding; these are this repository's own notes against it.
 
-- **D-MtconnectAdapter-1.** *(example — replace)* Which protocol(s) this adapter speaks, and why.
-- **D-MtconnectAdapter-2.** *(example — replace)* What a transient vs. permanent connect failure
-  means for this protocol (drives the supervisor's backoff-vs-ceiling choice in `src/supervisor.rs`).
+- **D-MTC-1.** Client role only; agent and SHDR-adapter roles are permanently out of scope.
+- **D-MTC-2.** Rust, an owned thin client on stock crates (`reqwest`/rustls, `quick-xml`, `sha2`);
+  no third-party MTConnect runtime dependency exists in any EdgeCommons language.
+- **D-MTC-3.** `component.global.agents[]` declares each agent once. An instance owns **no socket**:
+  it attaches to the agent's shared runtime and drains a bounded queue. One device's failure cannot
+  tear down another's session.
+- **D-MTC-4.** Streaming is the primary acquisition with polling fallback and the three-step resync
+  ladder. **Built so far: the polling path** (`/current` at `pollIntervalMs`, demultiplexed per
+  device, deduplicated per data item) plus the sequence/`instanceId` bookkeeping the ladders use.
+  `streaming: prefer` acquires by polling until the multipart stream reader lands.
+- **D-MTC-5.** Signals bind by `dataItemId`; the probe tree backs `sb/browse` from cache; probe-model
+  drift is surfaced (a digest change raises `ModelDrift`, signals recompile, and a signal whose data
+  item disappeared is published BAD `MTC_NO_SUCH_DATAITEM`), never silently remapped.
+- **D-MTC-6.** `UNAVAILABLE` is a BAD explicit null; the observation timestamp is the agent's capture
+  stamp (published as `serverTs`), `sourceTs` is absent, the adapter's receive moment rides the
+  `receivedTs` extra, and `sequence` rides every sample's extras.
+- **D-MTC-7.** MTConnect is read-only (Part 1 Fundamentals §5.1): the schema pins
+  `writes.allow: {maxItems: 0}` and the device seam refuses every write permanently. No
+  `sb/discover`.
+- **D-MTC-8.** Conditions are signals (state as value); `conditionBinding` degrades bound signals —
+  `Warning` → UNCERTAIN, `Fault` → BAD, with the alarm's native code in `qualityRaw`.
+- **D-MTC-9.** cppagent is the canonical free test peer; a third-party-agent qualification is a
+  recorded deferred gate, not a release blocker.
+- **D-MTC-10.** Assets, the JSON representation, and MQTT-sink consumption are follow-on
+  capabilities with their own designs.
+
+Local decisions, recorded so later sessions do not re-litigate them:
+
+- **D-MtconnectAdapter-L1.** The owned client is an in-crate module tree (`src/mtconnect/`), not a
+  workspace crate. `src/mtconnect/**` imports nothing from `edgecommons`, enforced by
+  `tests/isolation.rs`.
+- **D-MtconnectAdapter-L2.** A namespace version below 1.3 is refused; a version **above** 2.7
+  parses (local-name matching is forward-compatible) and is flagged, because refusing a newer agent
+  would be a worse failure than reading it.
+- **D-MtconnectAdapter-L3.** The published endpoint is derived
+  (`mtconnect://<host>[:<port>]/<uuid>`), never configured, so the agent binding and the endpoint
+  cannot disagree.
+- **D-MtconnectAdapter-L4.** The simulator (`adapter: "sim"`) stays in the component: it needs no
+  agent and keeps the scaffold runnable on a laptop.
+
+## Module layout
+
+```text
+src/
+  app.rs         config types, backoff, health, connectivity, the publish mapping (`build_sample`)
+  supervisor.rs  the live drivers: agent runtimes, per-instance connect/poll/publish/reconnect
+  device.rs      the device seam + the MTConnect backend/session + credential resolution
+  commands.rs    the `sb/*` verbs and the panel descriptors
+  metrics.rs     `southbound_health` + the operational families
+  mtconnect/     the owned client — NO edgecommons imports
+    mod.rs config.rs client.rs xml.rs model.rs observations.rs sequence.rs stream.rs
+    multipart.rs error.rs
+```
 
 ## Config
 
-`config.schema.json` is the source of truth for `component.global`/`component.instances[]`; describe
-here *why* each new key exists as you add it, not just its shape (the schema's `description` fields
-cover shape). Note any device-specific keys you add to `connection` (deliberately open in the
-shipped schema) and what they mean for your protocol.
+`config.schema.json` is the source of truth. Why the keys exist:
+
+- `agents[]` — an agent is shared infrastructure, so it is declared once and referenced by id.
+  Credentials are **references** (`auth.secretRef`, `tls.*SecretRef`) resolved through the
+  EdgeCommons vault at the `device.rs` boundary; the protocol client only ever sees values.
+- `instances[].connection` — `{agentId, deviceUuid}` and nothing else: the endpoint is derived.
+  (`adapter: "sim"` uses `endpoint` instead, having no agent.)
+- `instances[].signals[]` — signals are explicit: a data item that is not configured is browsable
+  but not published. `conditionBinding` is what makes a value's quality reflect the machine's own
+  alarms.
+- `writes.allow` — pinned empty; the protocol has no write path.
+
+Cross-object invariants JSON Schema cannot express (every `agentId` resolves, uuids unique per
+agent, `conditionBinding` never naming the signal's own data item) are enforced at startup by
+`mtconnect::config::validate_bindings`.
 
 ## Command surface
 
-The generic `sb/*` family (`src/commands.rs`) ships unchanged: `sb/status`, `sb/read`, `sb/write`,
-`sb/signals`, `sb/browse`, `sb/pause`, `sb/resume`, `reconnect`, `repoll`. Record here any verb whose
-*behavior* becomes protocol-specific (e.g. what `sb/browse` enumerates once you override the
-seam's default), and any new verb you add beyond this set.
+The generic `sb/*` family ships from the scaffold. MTConnect-specific behavior built so far: the
+device seam refuses every write; `sb/browse` enumerates the cached probe tree
+(`mtc:/component/<path>`, `mtc:/item/<dataItemId>`) and works while the agent is unreachable;
+`sb/read` takes a live `/current` snapshot through the agent's control channel. The full verb
+surface (the closed `sb/status.protocol` object, the hierarchical browse mode, the `sb/write`
+availability advertisement) and the panel descriptors are the next milestone.
 
 ## Metrics
 
-`southbound_health` (the canonical floor) and the two worked operational families
-(`MtconnectAdapterConnection`, `MtconnectAdapterCommand`) ship unchanged. Record here the
-protocol-specific families you add (`MtconnectAdapterInventory` / `Poll` / `Publish` or your own
-names) — their dimensions, measures, and what each one is *for*, so a later reader does not have to
-reverse-engineer intent from `src/metrics.rs` alone.
+`southbound_health` and the two worked operational families ship unchanged. The MTConnect families
+(`MtconnectStream`, `MtconnectProbe`, `MtconnectParse`) and the events
+(`MtconnectAgentEvent`, `MtconnectDataLossEvent`, `MtconnectModelDriftEvent`,
+`MtconnectConditionEvent`) are not wired yet; the runtime already carries their inputs
+(`PollReport`, `ParseCounters`, `AgentRuntime::dropped_events`).
 
 ## Validation
 
-- `cargo test` — unit/integration tests against the simulator and mocked control channel.
+- `cargo test` — the unit suite plus `tests/poll_acquisition.rs` (poll acquisition end to end
+  against a fake agent serving canned documents), `tests/config_schema.rs` (every shipped
+  configuration validated against `config.schema.json` and through the semantic validator) and
+  `tests/isolation.rs` (the seam rule).
+- `cargo clippy --all-targets -- -D warnings`.
 - `cargo llvm-cov --fail-under-lines 90` — the coverage gate.
-- `tests/live_sim.rs` (`EC_LIVE_SIM=<endpoint>`) — the live path against a real
-  simulator/device, skipped otherwise.
-- Record here any additional validation this protocol needs (a vendor simulator, a specific lab
-  device) and where it runs.
+- `tests/live_sim.rs` (`EC_LIVE_SIM=<endpoint>`) — the live simulator path, skipped otherwise.
+- Still to run for a release: the canonical cppagent container (agent restart, buffer wrap,
+  multi-device streams), the wire gate over local MQTT, and the HOST/Greengrass/Kubernetes platform
+  gates.

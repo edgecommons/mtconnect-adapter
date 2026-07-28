@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MTConnectDevices xmlns="urn:mtconnect.org:MTConnectDevices:2.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:mtconnect.org:MTConnectDevices:2.0 http://schemas.mtconnect.org/schemas/MTConnectDevices_2.0.xsd">
+  <Header creationTime="2026-07-27T10:00:00Z" sender="mtc-agent" instanceId="1749000000" version="2.0.0.5" bufferSize="131072" assetBufferSize="1024" assetCount="0"/>
+  <Devices>
+    <Device id="okuma" name="OKUMA-CNC" uuid="OKUMA.123456" mtconnectVersion="2.0">
+      <Description manufacturer="OKUMA" model="GENOS" serialNumber="123456">Vertical machining center</Description>
+      <DataItems>
+        <DataItem category="EVENT" id="avail" name="avail" type="AVAILABILITY"/>
+        <DataItem category="EVENT" id="asset-changed" type="ASSET_CHANGED"/>
+      </DataItems>
+      <Components>
+        <Axes id="axes">
+          <Components>
+            <Linear id="x-axis" name="X" nativeName="X1">
+              <DataItems>
+                <DataItem category="SAMPLE" id="Xabs" name="Xabs" nativeUnits="MILLIMETER" subType="ACTUAL" type="POSITION" units="MILLIMETER"/>
+                <DataItem category="SAMPLE" id="Xload" name="Xload" type="LOAD" units="PERCENT"/>
+                <DataItem category="SAMPLE" id="Xfreq" name="Xfreq" representation="TIME_SERIES" type="ACCELERATION" units="MILLIMETER/SECOND^2"/>
+                <DataItem category="CONDITION" id="Xtravel" name="Xtravel" type="POSITION"/>
+              </DataItems>
+            </Linear>
+            <Rotary id="c-axis" name="C">
+              <DataItems>
+                <DataItem category="SAMPLE" id="Sspeed" name="Sspeed" subType="ACTUAL" type="ROTARY_VELOCITY" units="REVOLUTION/MINUTE"/>
+              </DataItems>
+            </Rotary>
+          </Components>
+        </Axes>
+        <Controller id="controller">
+          <DataItems>
+            <DataItem category="EVENT" id="estop" name="estop" type="EMERGENCY_STOP"/>
+          </DataItems>
+          <Components>
+            <Path id="path" name="P1">
+              <DataItems>
+                <DataItem category="EVENT" id="execution" name="execution" type="EXECUTION"/>
+                <DataItem category="EVENT" id="program" name="program" type="PROGRAM"/>
+                <DataItem category="EVENT" id="part-count" name="partCount" type="PART_COUNT"/>
+                <DataItem category="EVENT" id="tool-offsets" name="toolOffsets" representation="DATA_SET" type="TOOL_OFFSET"/>
+                <DataItem category="SAMPLE" id="Ppos" name="Ppos" type="PATH_POSITION" units="MILLIMETER_3D"/>
+                <DataItem category="CONDITION" id="logic" name="logic" type="LOGIC_PROGRAM"/>
+              </DataItems>
+            </Path>
+          </Components>
+        </Controller>
+      </Components>
+    </Device>
+  </Devices>
+</MTConnectDevices>

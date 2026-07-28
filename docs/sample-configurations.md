@@ -49,7 +49,7 @@ The adapter loads **one JSON document** from `-c/--config`. The top level carrie
 | `component.global.timeouts.*` | Connect timeout and reconnect backoff window (currently informational in the scaffold's fixed `Backoff::default()` — wire them through if you make backoff configurable). |
 | `component.global.healthThresholds.staleSignalSecs` | A signal with no update for longer than this counts toward `southbound_health.staleSignals`. |
 | `instances[].id` | The `{instance}` token of every UNS topic for this device, and the `instance` metric dimension. |
-| `instances[].adapter` | Which `DeviceBackend` to use (`"sim"` ships; add your protocol's string when you register a real backend in `src/supervisor.rs::make_backend`). |
+| `instances[].adapter` | Which `DeviceBackend` serves the instance: `mtconnect` (the real client, configured in `test-configs/mtconnect.json`) or `sim` (the built-in simulator, which needs no agent). |
 | `instances[].connection.endpoint` | Opaque to the framework; the simulator only checks it is non-empty. A real protocol reads whatever else it needs from this **open** object. |
 | `instances[].pollIntervalMs` | Per-device override of the global default. |
 | `instances[].writes.allow` | Empty — read-only by default. See variant 2 for opening it up. |

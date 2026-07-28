@@ -338,9 +338,11 @@ impl Commander {
                 Ok(id) => match readings.get(&id) {
                     Some(r) => json!({
                         "signal": { "id": id },
-                        "value": r.value,
+                        // A protocol null is published as an explicit null, not as a missing key.
+                        "value": r.value.clone().unwrap_or(Value::Null),
                         "quality": quality_str(r.quality),
                         "qualityRaw": r.quality_raw,
+                        "extra": r.extra,
                     }),
                     None => bad_read(&id, "NO_DATA"),
                 },
@@ -837,14 +839,8 @@ mod tests {
                             let rs = ids
                                 .iter()
                                 .map(|id| Reading {
-                                    signal_id: id.clone(),
-                                    name: None,
-                                    value: json!(42.0),
-                                    quality: Quality::Good,
                                     quality_raw: Some("OK".into()),
-                                    source_ts: None,
-                                    capture_ts: None,
-                                    received_ts: None,
+                                    ..Reading::good(id.clone(), json!(42.0))
                                 })
                                 .collect();
                             let _ = reply.send(Ok(rs));

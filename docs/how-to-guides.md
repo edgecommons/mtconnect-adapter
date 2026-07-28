@@ -34,7 +34,7 @@ pub trait DeviceBackend: Send + Sync {
 
 1. Implement `DeviceBackend`/`DeviceSession` for your protocol (a new `mod` next to `device.rs`, or
    inline — the scaffold keeps `SimBackend`/`SimSession` there as the worked example).
-2. Register it in `src/supervisor.rs`'s `make_backend()`, matching on `cfg.adapter` (the config `adapter`
+2. Register it in `src/supervisor.rs`'s `App::backend_for()`, matching on `cfg.adapter` (the config `adapter`
    field, e.g. `"modbus"`, `"opcua"` — whatever string you choose).
 3. Decide what a **transient** vs **permanent** [`DeviceError`] is for your protocol —
    `connect` returning `Permanent` (a bad endpoint, a rejected credential) makes the supervisor back
