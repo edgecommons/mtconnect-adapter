@@ -131,14 +131,15 @@ pub fn compile(config: &Value) -> Result<Vec<MtcDeviceConfig>, String> {
     let needs_agents = devices.iter().any(|d| d.adapter == crate::device::KIND);
     if !needs_agents {
         // Still refuse a `sim` instance carrying a `selection` — there is no probe behind it.
-        crate::app::compile_mtconnect(&mut devices, &[], 0).map_err(|e| e.to_string())?;
+        crate::app::compile_mtconnect(&mut devices, &[], crate::app::PublishDefaults::default())
+            .map_err(|e| e.to_string())?;
         return Ok(Vec::new());
     }
     let global = agent_host(config);
     let agents =
         crate::mtconnect::config::parse_agents(&global).map_err(|e| e.to_string())?;
-    let batch_ms = crate::app::default_batch_ms_of(&global);
-    crate::app::compile_mtconnect(&mut devices, &agents, batch_ms).map_err(|e| e.to_string())
+    let defaults = crate::app::publish_defaults_of(&global);
+    crate::app::compile_mtconnect(&mut devices, &agents, defaults).map_err(|e| e.to_string())
 }
 
 /// `parse_agents` reads `component.global`; hand it exactly that subtree.
@@ -241,6 +242,7 @@ pub fn generation_of(signals: &[SignalConfig], selection: Option<&SelectionConfi
         hasher.update(sel.max_signals.to_le_bytes());
         hasher.update([u8::from(sel.auto_condition_binding)]);
         hasher.update(sel.default_batch_ms.to_le_bytes());
+        hasher.update(format!("{:?}", sel.default_publish_mode).as_bytes());
     }
     let digest = hasher.finalize();
     digest[..8].iter().fold(String::with_capacity(16), |mut acc, b| {

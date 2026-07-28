@@ -63,6 +63,21 @@ pre-defined at startup so the dimension set is fixed and discoverable.
 | `commandErrorsTotal` / `commandErrorsInterval` | Count | Invocations that returned a coded error (mirrors the `error`-result rows of `commandRequests`, kept separate for a quick numerator). |
 | `commandLatencyMs` | Milliseconds | Accumulated handler latency for this `(verb, result)` combination. |
 
+## `MtconnectAdapterShaping`
+
+What the per-signal publish-shaping engine (the `publish` policy —
+[configuration.md](configuration.md#publish-shaping)) did to the instance's flow. Per **instance**,
+not per agent: shaping is a property of one device's publication path, above the session — where
+`MtconnectStream` measures the shared acquisition below it.
+
+Dimensions: `instance`.
+
+| Measure | Unit | Purpose |
+|---|---:|---|
+| `publishedTotal` / `publishedInterval` | Count | `SouthboundSignalUpdate`s the engine released to the wire — immediate publishes and window flushes alike. Forced snapshots (`repoll`, the resume snapshot) bypass the engine and are not counted here. |
+| `coalescedTotal` / `coalescedInterval` | Count | Readings deferred into a batch window instead of publishing immediately. |
+| `deadbandDroppedTotal` / `deadbandDroppedInterval` | Count | Readings a deadband suppressed on entry. |
+
 ## `MtconnectStream`
 
 One **agent**'s acquisition — streaming or polling, whichever is currently active — emitted once per

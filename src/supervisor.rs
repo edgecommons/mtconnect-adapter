@@ -35,6 +35,7 @@ use crate::metrics::{AgentMetrics, AgentTelemetry, DeviceMetrics};
 use crate::mtconnect::config::parse_agents;
 use crate::mtconnect::AgentRuntime;
 use crate::reload::SignalRegistry;
+use crate::shaping::{policies_from_signals, Shaper};
 
 /// How often the periodic metrics emit runs, in the poll loop.
 const METRICS_INTERVAL: Duration = Duration::from_secs(30);
@@ -128,8 +129,8 @@ impl App {
         let needs_agents = devices.iter().any(|d| d.adapter == crate::device::KIND);
         let agent_configs =
             if needs_agents { parse_agents(config.global())? } else { Vec::new() };
-        let batch_ms = crate::app::default_batch_ms_of(config.global());
-        let mtc_devices = compile_mtconnect(&mut devices, &agent_configs, batch_ms)?;
+        let defaults = crate::app::publish_defaults_of(config.global());
+        let mtc_devices = compile_mtconnect(&mut devices, &agent_configs, defaults)?;
 
         // Vault references become values exactly once, here — the protocol client never sees a
         // reference, and never learns the credential service exists.
@@ -383,13 +384,22 @@ enum PollExit {
     Closed,
 }
 
-/// Read on the poll interval and publish, servicing the control channel, until the link breaks or a
+/// Read on the poll interval and publish — through the per-signal shaping engine
+/// ([`crate::shaping::Shaper`]) — servicing the control channel, until the link breaks or a
 /// reconnect is requested.
 ///
 /// **Pause semantics (HLD §7 / D-MTC-7):** the read keeps running while paused — the backend's
 /// stream keeps draining and its latest-value/condition caches keep updating — but nothing is
-/// published. Resuming publishes a fresh snapshot of the whole configured inventory first
-/// (`read_named`, a live read), then normal flow resumes.
+/// published, and the shaping buffers are **cleared** (the resume-time snapshot republishes the
+/// current truth, so flushing pre-pause readings after it would publish stale data out of order).
+/// Resuming publishes a fresh snapshot of the whole configured inventory first (`read_named`, a
+/// live read, bypassing the shaper), then normal, shaped flow resumes with the deadband re-armed.
+///
+/// **Shaping lifecycle:** the engine is rebuilt with each session (so the first reading after a
+/// connect passes the deadband); its policy table follows the session's shaping generation, so a
+/// signal reload or a model drift swaps the policies atomically with the signal-set swap and
+/// flushes the changed signals' windows with their old policy; every exit path — shutdown, link
+/// loss, reconnect — flushes the open windows so no buffered reading is lost.
 #[allow(clippy::too_many_arguments)]
 async fn run_polling(
     cfg: &DeviceConfig,
@@ -404,12 +414,31 @@ async fn run_polling(
     let mut ticker = tokio::time::interval(Duration::from_millis(cfg.poll_interval_ms));
     let mut since_metrics = Instant::now();
 
+    // The shaping engine, fresh per session. The session's compiled policy table wins (it knows
+    // the model — deadband only on numeric SAMPLE items); a backend with no compile step (the
+    // simulator) is shaped from its static signal configuration — identically, above the session.
+    let mut shaper = Shaper::new();
+    let mut shaping_gen = session.shaping_generation();
+    let _ = shaper.set_policies(if shaping_gen.is_some() {
+        session.shaping_policies()
+    } else {
+        policies_from_signals(&cfg.signals)
+    });
+
     loop {
+        // ONE deadline per instance task: the earliest open batch window.
+        let batch_deadline = shaper.next_deadline();
         tokio::select! {
             // Poll and control share this one task, so a write can never race a read on the same
             // connection — most device protocols are a single request/response channel.
             ctrl = control.recv() => {
-                let Some(ctrl) = ctrl else { return PollExit::Closed; };
+                let Some(ctrl) = ctrl else {
+                    // Component shutdown: flush the open batch windows — a SIGTERM must not lose
+                    // the readings a window was still coalescing.
+                    publish_shaped(cfg, shaper.flush_all(), data, dm, health).await;
+                    drain_shaping(dm, &mut shaper);
+                    return PollExit::Closed;
+                };
                 match ctrl {
                     DeviceControl::Write(req) => {
                         let result = session
@@ -431,6 +460,16 @@ async fn run_polling(
                     DeviceControl::Pause { reply } => {
                         let changed = set_paused(health, true);
                         if changed {
+                            // Pause gates the wire, so the open windows are CLEARED, not flushed:
+                            // the resume-time snapshot republishes the current truth, and flushing
+                            // pre-pause readings after it would publish stale data out of order.
+                            let discarded = shaper.clear_buffers();
+                            if discarded > 0 {
+                                tracing::info!(
+                                    instance = %cfg.id, discarded,
+                                    "pause discarded buffered readings; resume snapshots the current truth"
+                                );
+                            }
                             let _ = events
                                 .emit(
                                     Severity::Warning,
@@ -458,7 +497,9 @@ async fn run_polling(
                         // Resume snapshots FIRST (HLD §7): while paused, drained updates were
                         // deliberately not published, so the fleet's last view of every signal is
                         // stale. A live read of the whole inventory republishes the current truth
-                        // before on-change flow resumes.
+                        // before on-change flow resumes — BYPASSING the shaper (a forced snapshot
+                        // is a fresh full publish, not on-change flow), which is then re-armed:
+                        // the first shaped reading after a resume always passes the deadband.
                         if changed && !inventory.is_empty() {
                             let outcome = session.read_named(inventory).await;
                             emit_notices(cfg, &mut session, events).await;
@@ -475,8 +516,14 @@ async fn run_polling(
                                 }
                             }
                         }
+                        if changed {
+                            shaper.reset_deadband();
+                        }
                     }
                     DeviceControl::Reconnect { reply } => {
+                        // Buffered readings are data: flush them before dropping the session.
+                        publish_shaped(cfg, shaper.flush_all(), data, dm, health).await;
+                        drain_shaping(dm, &mut shaper);
                         session.close().await;
                         return PollExit::Reconnect(reply);
                     }
@@ -486,6 +533,8 @@ async fn run_polling(
                         } else {
                             // A forced FRESH snapshot, not a drain of what happened to arrive
                             // (LLD §7): `polled` counts what was published, BAD results included.
+                            // It BYPASSES the shaper — a repoll exists precisely to say the whole
+                            // current truth again, now.
                             let result = session.snapshot_now().await;
                             emit_notices(cfg, &mut session, events).await;
                             match result {
@@ -499,6 +548,8 @@ async fn run_polling(
                                     tracing::warn!(instance = %cfg.id, error = %e, "repoll failed");
                                     health.read_errors.fetch_add(1, Ordering::Relaxed);
                                     let _ = reply.send(Err(e.to_string()));
+                                    publish_shaped(cfg, shaper.flush_all(), data, dm, health).await;
+                                    drain_shaping(dm, &mut shaper);
                                     session.close().await;
                                     return PollExit::LinkLost;
                                 }
@@ -512,13 +563,50 @@ async fn run_polling(
             // instance's stream cache stays current — HLD §7), and only PUBLICATION is gated.
             _ = ticker.tick() => {
                 let publish = !health.is_paused();
-                let outcome = poll_once(cfg, &mut session, data, dm, health, publish).await;
+                let outcome = poll_once(cfg, &mut session, health, publish).await;
                 emit_notices(cfg, &mut session, events).await;
                 sync_served_signals(session.as_ref(), health);
-                if outcome.is_err() {
-                    session.close().await;
-                    return PollExit::LinkLost;
+                match outcome {
+                    Err(()) => {
+                        // The link broke: flush the open windows so nothing buffered is lost.
+                        publish_shaped(cfg, shaper.flush_all(), data, dm, health).await;
+                        drain_shaping(dm, &mut shaper);
+                        session.close().await;
+                        return PollExit::LinkLost;
+                    }
+                    Ok(None) => {} // paused: drained, nothing to publish
+                    Ok(Some(readings)) => {
+                        // A drained snapshot re-baselined the view (attach, resync ladder): the
+                        // next reading of every signal must pass the deadband as fresh.
+                        if session.take_resync() {
+                            shaper.reset_deadband();
+                        }
+                        // A reload or model drift recompiled the served set inside the read: swap
+                        // the policy table with it, flushing changed windows on the OLD policy.
+                        if let Some(next) = session.shaping_generation() {
+                            if shaping_gen.as_deref() != Some(next.as_str()) {
+                                shaping_gen = Some(next);
+                                let flushed = shaper.set_policies(session.shaping_policies());
+                                publish_shaped(cfg, flushed, data, dm, health).await;
+                            }
+                        }
+                        let now = Instant::now();
+                        let mut updates = Vec::new();
+                        for reading in readings {
+                            updates.extend(shaper.offer(reading, now));
+                        }
+                        publish_shaped(cfg, updates, data, dm, health).await;
+                        drain_shaping(dm, &mut shaper);
+                    }
                 }
+            }
+
+            // A batch window expired: flush it — ONE update whose samples[] carries the window's
+            // readings in arrival order. One deadline serves every window (no per-signal timers).
+            () = sleep_until_deadline(batch_deadline), if batch_deadline.is_some() => {
+                let due = shaper.due(Instant::now());
+                publish_shaped(cfg, due, data, dm, health).await;
+                drain_shaping(dm, &mut shaper);
             }
         }
 
@@ -529,18 +617,16 @@ async fn run_polling(
     }
 }
 
-/// One poll: read, publish each reading, record latencies + staleness. `Ok(n)` = signals published;
-/// `Err(())` = the *connection* broke (caller reconnects). With `publish` false (the instance is
-/// paused) the read still runs — the backend drains and its caches update — but nothing reaches
-/// the wire and the staleness tracker is not fed.
+/// One poll: read and hand the readings back for shaping. `Ok(Some(readings))` = publish these
+/// (through the shaper); `Ok(None)` = the instance is paused (the read still ran — the backend
+/// drains and its caches update — but nothing may reach the wire); `Err(())` = the *connection*
+/// broke (caller reconnects).
 async fn poll_once(
     cfg: &DeviceConfig,
     session: &mut Box<dyn crate::device::DeviceSession>,
-    data: &DataFacade,
-    dm: &Arc<DeviceMetrics>,
     health: &Arc<Health>,
     publish: bool,
-) -> std::result::Result<u64, ()> {
+) -> std::result::Result<Option<Vec<crate::device::Reading>>, ()> {
     let started = Instant::now();
     let mut readings = match session.read_signals().await {
         Ok(r) => r,
@@ -554,12 +640,71 @@ async fn poll_once(
     health.poll_latency_ms.store(latency, Ordering::Relaxed);
     if !publish {
         // Paused: the drain above kept the caches current; publication stays gated (HLD §7).
-        return Ok(0);
+        return Ok(None);
     }
     // The read just completed: this is the adapter's receive moment for the whole batch
     // (docs/SOUTHBOUND.md §2) — stamped here, not at publish, so batching cannot skew it.
     stamp_received(&mut readings, &now_iso());
-    Ok(publish_readings(cfg, &readings, data, dm, health).await)
+    Ok(Some(readings))
+}
+
+/// Sleep until a batch window's deadline. Only ever awaited behind an `is_some()` select guard.
+async fn sleep_until_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Publish the shaper's released updates: each is ONE `SouthboundSignalUpdate` whose `samples[]`
+/// carries one signal's readings in arrival order — the wire's batching shape
+/// (docs/SOUTHBOUND.md §2). Records publish latency and feeds the staleness tracker, exactly as
+/// the unshaped path does.
+async fn publish_shaped(
+    cfg: &DeviceConfig,
+    updates: Vec<crate::shaping::Update>,
+    data: &DataFacade,
+    dm: &Arc<DeviceMetrics>,
+    health: &Arc<Health>,
+) -> u64 {
+    if updates.is_empty() {
+        return 0;
+    }
+    let publish_started = Instant::now();
+    let mut published = 0u64;
+    for readings in &updates {
+        let Some(first) = readings.first() else { continue };
+        // The data() facade builds the SouthboundSignalUpdate body, mints the topic, and stamps
+        // identity. Every reading becomes one sample via the unit-tested `build_sample`.
+        let mut signal = data.signal(&first.signal_id);
+        if let Some(name) = &first.name {
+            signal = signal.name(name);
+        }
+        if let Some(channel) = &first.channel {
+            signal = signal.signal_path(channel);
+        }
+        let update = signal
+            .device_parts(&cfg.adapter, &cfg.id, &cfg.connection.endpoint)
+            .samples(readings.iter().map(build_sample))
+            .build();
+
+        if let Err(e) = data.publish(update).await {
+            tracing::warn!(instance = %cfg.id, signal = %first.signal_id, error = %e, "publish failed");
+        } else {
+            published += 1;
+            dm.on_signal_update(&first.signal_id, Instant::now());
+        }
+    }
+    let publish_latency = u64::try_from(publish_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    health.publish_latency_ms.store(publish_latency, Ordering::Relaxed);
+    published
+}
+
+/// Move the shaper's counters into the `MtconnectAdapterShaping` family's feed.
+fn drain_shaping(dm: &Arc<DeviceMetrics>, shaper: &mut Shaper) {
+    if let Some(counters) = shaper.take_counters() {
+        dm.on_shaping(counters);
+    }
 }
 
 /// Publish a batch of readings through the `data()` facade, recording publish latency and feeding

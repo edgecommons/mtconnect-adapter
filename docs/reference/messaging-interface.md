@@ -113,6 +113,12 @@ effective `serverTs`, it rides as a per-sample `receivedTs` extra:
                "receivedTs": "2026-07-19T00:00:00.9Z" } ]
 ```
 
+`samples[]` is an array because a signal whose `publish.batchMs` is above `0` coalesces a whole
+batch window into one update ([configuration.md](configuration.md#publish-shaping)): the array then
+carries every reading of the window in arrival order, each sample keeping its own `serverTs`,
+quality, and extras (`sequence`, `receivedTs`, ...). An unbatched signal publishes one sample per
+update.
+
 ### `sb/write` (command)
 
 ```jsonc

@@ -115,6 +115,36 @@ Local decisions, recorded so later sessions do not re-litigate them:
   collisions get deterministic `-2`, `-3`, … suffixes in browse-tree order; provenance is
   surfaced as `provenance: "configured" | "discovered"` on `sb/signals` rows and browse data-item
   entries, with the browse `configured` flag covering the served union.
+- **D-MtconnectAdapter-L11 (publish shaping).** A signal's `publish` policy (`mode`, `batchMs`,
+  `deadband`) is enforced by a per-signal shaping engine (`src/shaping.rs`) that sits **above**
+  the device session (ADP-5), so the `mtconnect` and `sim` backends are shaped identically.
+  `batchMs: 0` — the default — publishes each reading immediately as its own update, so
+  unconfigured signals are untouched; `batchMs > 0` buffers GOOD readings and flushes on window
+  expiry as ONE `SouthboundSignalUpdate` whose `samples[]` carries the window's readings in
+  arrival order, each keeping its own timestamps and extras. `mode: "interval"` keeps only the
+  **latest** reading per window (one sample per flush; an empty window publishes nothing) —
+  `on-change` + `batchMs` is the keep-everything coalescer, `interval` + `batchMs` the
+  latest-value cadence. A BAD/UNCERTAIN reading flushes its window immediately — a quality
+  transition never sits in a window. The deadband applies on **entry**, against the last
+  **accepted** value; quality/`qualityRaw` changes, non-numeric/array values, and the first
+  reading after connect/resync/resume always pass. The session compiles the policy table (so a
+  `deadband` is granted only to SAMPLE-category items, per the documented contract); a backend
+  with no compile step (the sim) is shaped from its static signal configuration, where no
+  category exists and a configured deadband applies to any numeric value. Lifecycle, decided
+  here: **pause CLEARS open windows** (nothing may reach the wire while paused, and the resume
+  snapshot republishes the current truth — flushing pre-pause readings after it would publish
+  stale data out of order); **shutdown, reconnect and link loss FLUSH them** (buffered readings
+  are data); `repoll` and the resume snapshot **bypass** shaping (a forced snapshot is a fresh
+  full publish); a reload or model drift swaps the policy table atomically with the signal-set
+  swap (its generation is `probeDigest.signalGeneration`), and changed signals' windows flush
+  with the readings their old policy collected. Timing is ONE deadline per instance task — the
+  earliest open window — never per-signal timers, and the engine takes explicit `Instant`s so it
+  is virtual-clock testable. Observability is a new `MtconnectAdapterShaping` family
+  (`instance`-dimensioned `published`/`coalesced`/`deadbandDropped` pairs) rather than an
+  extension of `MtconnectStream`, whose `agentId` dimension and shared-acquisition scope cannot
+  carry a per-instance publication fact. `defaults.publishMode` resolves at compile exactly like
+  `defaults.batchMs` (L10) and scopes to derived SAMPLE signals only — explicit signals declare
+  their own `publish` block, and an absent block outside a selection stays the immediate default.
 
 ## Module layout
 
@@ -126,6 +156,8 @@ src/
   commands.rs    the `sb/*` verbs and the panel descriptors
   metrics.rs     `southbound_health` + the operational families + the HLD §9 families
   reload.rs      the pre-commit reload verdict + the live, swappable per-instance signal set
+  shaping.rs     the per-signal publish-shaping engine (batch windows + deadband), pure and
+                 virtual-clock tested; `supervisor.rs` drives it above the session (L11)
   mtconnect/     the owned client — NO edgecommons imports
     mod.rs config.rs client.rs xml.rs model.rs observations.rs sequence.rs stream.rs
     multipart.rs error.rs stats.rs selection.rs
@@ -189,8 +221,9 @@ is really **serving** — the configured set minus signals whose `dataItemId` th
 does not have — which is the same number in stream mode and poll mode, because the compiled set is
 what is served and the mode only decides how it arrives.
 
-Beside it: the two generic families (`MtconnectAdapterConnection`, `MtconnectAdapterCommand`) and the
-three of HLD §9. `MtconnectStream` and `MtconnectProbe` are dimensioned `agentId` and emitted **once
+Beside it: the three generic families (`MtconnectAdapterConnection`, `MtconnectAdapterCommand`, and
+`MtconnectAdapterShaping` — the publish-shaping engine's `published`/`coalesced`/`deadbandDropped`
+pairs, dimensioned `instance` per L11) and the three of HLD §9. `MtconnectStream` and `MtconnectProbe` are dimensioned `agentId` and emitted **once
 per agent** — an agent is shared infrastructure and its document flow exists once however many
 devices attach to it — while `MtconnectParse` is dimensioned `instance`. The runtime accumulates
 monotonic totals (`src/mtconnect/stats.rs`, EdgeCommons-free like everything under `mtconnect/`) and
@@ -226,7 +259,9 @@ signal configuration (explicit + selection), the browse `viewGeneration` compose
 ## Validation
 
 - `cargo test` — the unit suite (including `mtconnect::selection`'s matcher/derivation/precedence
-  tables) plus `tests/poll_acquisition.rs` (poll acquisition end to end against a fake agent
+  tables and `shaping`'s window/deadband/lifecycle tables on a virtual clock, plus
+  `tests/publish_shaping.rs` — the batched `samples[]` wire shape and the sim/mtconnect shaping
+  parity) plus `tests/poll_acquisition.rs` (poll acquisition end to end against a fake agent
   serving canned documents, including the R1.1 legs: the minimal `selection: {mode: "all"}`
   instance, matcher scoping with explicit overrides, `maxSignals` truncation, drift add/remove of
   derived signals, and the live selection reload), `tests/config_schema.rs` (every shipped
