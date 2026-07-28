@@ -197,6 +197,13 @@ level's value **except** the last (which is always the resolved Thing name, `-t`
 // -> identity.path = "plant1/pumphouse/<thing>"
 ```
 
+`component.token` supplies the `{component}` segment of those topics and the `identity.component`
+field of every message. It is `mtconnect-adapter` in every shipped configuration and in the recipe:
+UNS tokens are lower-kebab, while the Greengrass component name is the reverse-DNS
+`com.mbreissi.edgecommons.MtconnectAdapter`. Leave it set — dropping it makes the library fall back
+to the short form of the component name, `MtconnectAdapter`, and the topics in this documentation
+stop matching what the adapter publishes.
+
 ## Precedence
 
 `pollIntervalMs` resolves **device `pollIntervalMs`** ▸ **`global.defaults.pollIntervalMs`** ▸
@@ -213,6 +220,7 @@ agent is not streaming.
   "messaging": { "local": { "type": "mqtt", "host": "localhost", "port": 1883 } },
   "metricEmission": { "target": "messaging" },
   "component": {
+    "token": "mtconnect-adapter",
     "global": {
       "agents": [
         {

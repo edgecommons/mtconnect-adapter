@@ -25,6 +25,7 @@ The quickest way to see the adapter running with no agent at all:
   "metricEmission": { "target": "log", "namespace": "edgecommons" },
   "tags": { "site": "factory-1" },
   "component": {
+    "token": "mtconnect-adapter",
     "global": {
       "defaults": { "pollIntervalMs": 5000 },
       "timeouts": { "connectMs": 5000, "reconnectBackoffMinMs": 1000, "reconnectBackoffMaxMs": 60000 },
@@ -58,6 +59,7 @@ cargo run -- --platform HOST --transport MQTT ./test-configs/standalone-messagin
   "metricEmission": { "target": "log", "namespace": "edgecommons" },
   "tags": { "site": "factory-1" },
   "component": {
+    "token": "mtconnect-adapter",
     "global": {
       "agents": [
         {
@@ -127,6 +129,7 @@ Two devices behind one TLS/authenticated agent, one polling and one streaming:
   "messaging": { "local": { "type": "mqtt", "host": "localhost", "port": 1883, "clientId": "mtconnect-adapter-pumphouse" } },
   "metricEmission": { "target": "messaging" },
   "component": {
+    "token": "mtconnect-adapter",
     "global": {
       "agents": [
         {
@@ -204,6 +207,7 @@ non-condition signal is automatically bound to its own component's CONDITION ite
   "identity": { "site": "factory-1" },
   "messaging": { "local": { "type": "mqtt", "host": "localhost", "port": 1883 } },
   "component": {
+    "token": "mtconnect-adapter",
     "global": {
       "agents": [ { "id": "line-a-agent", "url": "http://127.0.0.1:5000" } ]
     },

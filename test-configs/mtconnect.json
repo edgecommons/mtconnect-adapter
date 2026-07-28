@@ -29,6 +29,7 @@
     "site": "factory-1"
   },
   "component": {
+    "token": "mtconnect-adapter",
     "global": {
       "agents": [
         {

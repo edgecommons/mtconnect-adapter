@@ -49,6 +49,7 @@ docker run -d --name edgecommons-emqx -p 1883:1883 -p 18083:18083 emqx/emqx:late
   "hierarchy": { "levels": ["site", "device"] },
   "identity": { "site": "factory-1" },
   "component": {
+    "token": "mtconnect-adapter",
     "global": {
       "agents": [
         { "id": "demo-agent", "url": "https://demo.mtconnect.org" }
@@ -84,11 +85,11 @@ every data item the machine reports, and starts publishing — 105 topics for th
 fast as the machine reports them:
 
 ```text
-ecv1/demo-thing/MtconnectAdapter/okuma/data/axes-axes/linear-x/lx1actm
-ecv1/demo-thing/MtconnectAdapter/okuma/data/axes-axes/rotary-c1/ls1-chuck-state
-ecv1/demo-thing/MtconnectAdapter/okuma/data/controller-controller/lpexecution
-ecv1/demo-thing/MtconnectAdapter/okuma/data/systems-systems1/coolant-coolant-system1/lcoolant-system1-cond
-ecv1/demo-thing/MtconnectAdapter/okuma/data/lavail
+ecv1/demo-thing/mtconnect-adapter/okuma/data/axes-axes/linear-x/lx1actm
+ecv1/demo-thing/mtconnect-adapter/okuma/data/axes-axes/rotary-c1/ls1-chuck-state
+ecv1/demo-thing/mtconnect-adapter/okuma/data/controller-controller/lpexecution
+ecv1/demo-thing/mtconnect-adapter/okuma/data/systems-systems1/coolant-coolant-system1/lcoolant-system1-cond
+ecv1/demo-thing/mtconnect-adapter/okuma/data/lavail
 ```
 
 The envelope on the X-axis position topic:
@@ -99,7 +100,7 @@ The envelope on the X-axis position topic:
   "identity": {
     "hier": [ { "level": "site", "value": "factory-1" },
               { "level": "device", "value": "demo-thing" } ],
-    "path": "factory-1/demo-thing", "component": "MtconnectAdapter", "instance": "okuma"
+    "path": "factory-1/demo-thing", "component": "mtconnect-adapter", "instance": "okuma"
   },
   "body": {
     "signal": { "id": "lx1actm", "name": "X1actm" },
@@ -124,8 +125,10 @@ contract.
 
 The adapter reads one JSON document from `-c/--config`. Its own settings live under `component`;
 everything around them (`identity`, `hierarchy`, `messaging`, `logging`, `metricEmission`,
-`heartbeat`) is the standard EdgeCommons envelope. Every option below is specified in
-[the configuration reference](docs/reference/configuration.md).
+`heartbeat`) is the standard EdgeCommons envelope. One key inside `component` belongs to that
+envelope too: `component.token` is the adapter's UNS token, `mtconnect-adapter` — the `{component}`
+segment of every topic it publishes and the `identity.component` field of every message. Every
+option below is specified in [the configuration reference](docs/reference/configuration.md).
 
 **Agents are declared once and referenced by id.** A real plant agent usually wants TLS and
 credentials, and both arrive as *references* resolved through the EdgeCommons vault — a secret never

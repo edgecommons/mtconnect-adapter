@@ -6,14 +6,20 @@ data/control plane model, see [explanation.md](../explanation.md); for client re
 [how-to guides](../how-to-guides.md).
 
 - `{device}` — the resolved Thing name (`-t`, or the last `hierarchy` level).
-- `{component}` — the component UNS token, `mtconnect-adapter`.
+- `{component}` — the component UNS token, `mtconnect-adapter`, set by `component.token`. It is a
+  separate identifier from the Greengrass component name (`com.mbreissi.edgecommons.MtconnectAdapter`),
+  which never appears on the wire.
 - `{instance}` — a configured device id (`device-1`, …). It always appears on `data`/`evt` topics,
   and optionally on a `cmd` topic to address one device (`…/{instance}/cmd/{verb}`); the `state`
   keepalive is component-scoped (no instance token in its topic).
 
 ## Envelope
 
-All messages use the EdgeCommons JSON envelope: `{header, identity, tags, body}`. The library stamps
+The envelope is documented here in its JSON projection — the canonical field names and shapes; the
+MQTT/IPC wire encoding is the protobuf envelope (`proto/edgecommons/v1`), which round-trips this
+projection exactly.
+
+All messages use the EdgeCommons envelope: `{header, identity, tags, body}`. The library stamps
 the top-level `identity` (`{hier, path, component, instance}`) on every message built from a facade.
 Request/reply carries `header.reply_to` + `header.correlation_id`; the reply publishes to `reply_to`
 with the same `correlation_id`.
