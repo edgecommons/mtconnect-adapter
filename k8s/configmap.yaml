@@ -12,6 +12,7 @@ data:
   config.json: |-
     {
       "component": {
+        "token": "mtconnect-adapter",
         "global": {
           "defaults": {
             "pollIntervalMs": 5000

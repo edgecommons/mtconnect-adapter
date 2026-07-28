@@ -26,6 +26,9 @@ ComponentConfiguration:
         appId: Test
         site: Chantilly
       component:
+        # UNS component token. The Greengrass ComponentName is reverse-DNS PascalCase; the token the
+        # wire carries is lower-kebab, so it is set explicitly rather than derived from the name.
+        token: mtconnect-adapter
         global:
           defaults:
             pollIntervalMs: 5000
