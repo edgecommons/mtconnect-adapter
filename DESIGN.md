@@ -168,9 +168,9 @@ Local decisions, recorded so later sessions do not re-litigate them:
     unique per instance (`validate_bindings` enforces it for the explicit half, the `-2`/`-3`
     suffix chain for the derived half), so however much path is dropped, two derived channels
     cannot collide. No additional suffix rule is needed and none is added.
-  - **Nothing is lost.** The full, untruncated component path stays in the `ProbeModel` and is
-    served as `signal.address.componentPath` on `sb/signals` and on `sb/browse`. Only the topic is
-    shaped.
+  - **Nothing is lost.** The full, untruncated component path stays in the `ProbeModel`, is served
+    as `signal.address.componentPath` on `sb/signals` and on `sb/browse`, and rides every published
+    update as `componentPath` (L13). Only the topic is shaped.
   - **Ordinary truncation is not an event.** It is normal derivation on a deep machine: counted in
     `ServedSet::channel_truncated` and logged once per recompile at DEBUG. The **only** warning is
     the pathological floor — `k = 0` (the id alone) still does not fit, i.e. the instance's own
@@ -183,11 +183,50 @@ Local decisions, recorded so later sessions do not re-litigate them:
   - The budget is hashed into the signal-set generation (L9), because it changes what every derived
     channel is and therefore what a browse cursor was minted against.
 
+- **D-MtconnectAdapter-L13 (the canonical `componentPath`, unconditionally, at update level).**
+  Every published `SouthboundSignalUpdate` carries the signal's full, untruncated MTConnect
+  component path as `componentPath` on the **update-level** extra map. Decided by the user; this
+  records the shape and the two alternatives that were weighed and rejected.
+  - **Unconditional.** The key is stamped on *every* update — a truncated derived channel (L12), an
+    untruncated one, and an explicitly configured signal alike — so an MTConnect-aware consumer has
+    one place to read the canonical value and no branch to write. Rejected alternative **(a):
+    stamp it only when the channel was truncated.** It is cheaper on the wire and strictly worse to
+    consume: presence becomes a function of the instance's topic budget, so every reader needs a
+    conditional and the field's meaning changes with configuration. A field that is sometimes there
+    is a field nobody trusts.
+  - **Update level, not per sample.** The path is per-signal-static and one update is one signal's
+    readings, so a batched window (L11) carries exactly one `componentPath` rather than repeating it
+    on every sample. The library's `SouthboundSignalUpdate` reserves only `signal` and `samples` at
+    that level and round-trips every other body key through the protobuf `extra` map
+    (`map<string, EcValue> extra = 100`), so the placement is a first-class round-trip, not a
+    tolerated unknown. `componentPath` collides with nothing: the seven reserved *sample* keys are
+    `value`, `quality`, `qualityRaw`, `sourceTs`, `serverTs`, `sourceTsMs`, `serverTsMs`.
+  - **One source of truth for the value.** `ProbeModel::component_path_of` is the only formatter;
+    `address_of` (what `sb/signals` and `sb/browse` serve) and the publish path both read it, so the
+    update and the control plane cannot drift apart. Three values are possible and all three are
+    *present*: the slash-joined path; `""` for a device-level data item that hangs off no component;
+    and `null` for a signal no device model describes — the permanent-BAD case of an explicit
+    `signals[]` entry whose `dataItemId` is absent from the probe, where `sb/signals` reports
+    `address.componentPath: null` from `unlearned_address` and the update says exactly the same
+    thing. There is no case in which the key is omitted.
+  - **Confined to this adapter — no core change.** Rejected alternative **(b): promote the
+    component path to a first-class `address` block on the southbound contract.** That is a
+    four-language wire-contract change (`docs/SOUTHBOUND.md`, the protobuf schema, the interop
+    matrix) to serve one protocol's shape. Reconsider only if a second deep-path protocol appears
+    and wants the same thing; until then the additive extra costs the ecosystem nothing.
+  - **How it is reached without hand-building the body.** The `SignalUpdate` builder has no
+    update-level `extra` setter, so `supervisor.rs` uses the facade's own two-step form:
+    `DataFacade::build_body` applies the whole §2.1 contract (quality defaulting, the `qualityRaw`
+    marker, the `serverTs` fill, the samples wrapper), `app::stamp_component_path` adds the one
+    additive key, and `DataFacade::publish_body_via` mints the `data/{channel}` topic and stamps
+    identity from the same `effective_signal_path`. The adapter still formats no body and no topic.
+
 ## Module layout
 
 ```text
 src/
-  app.rs         config types, backoff, health, connectivity, the publish mapping (`build_sample`)
+  app.rs         config types, backoff, health, connectivity, the publish mapping (`build_sample`,
+                 `stamp_component_path`)
   supervisor.rs  the live drivers: agent runtimes, per-instance connect/poll/publish/reconnect
   device.rs      the device seam + the MTConnect backend/session + credential resolution
   commands.rs    the `sb/*` verbs and the panel descriptors

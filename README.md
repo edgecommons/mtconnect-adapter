@@ -104,6 +104,7 @@ The envelope on the X-axis position topic:
   },
   "body": {
     "signal": { "id": "lx1actm", "name": "X1actm" },
+    "componentPath": "Axes[Axes]/Linear[X]",
     "samples": [
       { "value": 4622.9039, "quality": "GOOD", "qualityRaw": "MTC_OK",
         "serverTs": "2026-07-28T16:40:10.505404Z",
@@ -117,6 +118,8 @@ The envelope on the X-axis position topic:
 
 Every field there is derived: the signal id from the machine's own `dataItemId`, the channel from its
 place in the component tree, the endpoint from the agent binding. Nothing was named by hand.
+`componentPath` is that place in full — the untruncated component chain, on every update — so a
+consumer never has to reconstruct it from a topic that may have had to be shortened.
 [The tutorial](docs/tutorial.md) walks the same path with the built-in simulator and then a real
 agent; [the messaging reference](docs/reference/messaging-interface.md) is the full topic and payload
 contract.

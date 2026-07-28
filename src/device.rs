@@ -68,6 +68,14 @@ pub struct Reading {
     /// An explicit `signal_path` (channel) for this signal, when its configuration overrides the
     /// default. `None` publishes on the signal's own id.
     pub channel: Option<String>,
+    /// The signal's **full, untruncated** MTConnect component path — the very value `sb/signals`
+    /// serves as `signal.address.componentPath`, taken from
+    /// [`ProbeModel::component_path_of`](crate::mtconnect::model::ProbeModel::component_path_of).
+    /// `Some("")` for a device-level data item that hangs off no component; `None` when no device
+    /// model describes the signal (an explicit signal whose `dataItemId` is absent from the probe,
+    /// or a backend with no probe model at all). It is per-signal-static, so it is stamped once on
+    /// the **update**, never per sample (D-MtconnectAdapter-L13).
+    pub component_path: Option<String>,
 }
 
 impl Reading {
@@ -85,6 +93,7 @@ impl Reading {
             received_ts: None,
             extra: None,
             channel: None,
+            component_path: None,
         }
     }
 
@@ -104,6 +113,7 @@ impl Reading {
             received_ts: None,
             extra: None,
             channel: None,
+            component_path: None,
         }
     }
 
@@ -1237,7 +1247,10 @@ impl MtcSession {
         out
     }
 
-    /// The BAD readings for signals with no data item in the model.
+    /// The BAD readings for signals with no data item in the model. Their `component_path` stays
+    /// `None` — the model that would supply one does not describe the item — so they publish
+    /// `componentPath: null`, which is exactly what `sb/signals` reports for the same signal in
+    /// `address.componentPath` (L13).
     fn unbound_readings(&self) -> Vec<Reading> {
         self.unbound
             .iter()
@@ -1527,6 +1540,9 @@ pub fn reading_from_observation(
         received_ts: None,
         extra: Some(extra),
         channel: sig.channel.clone(),
+        // The canonical path, straight from the model that serves `sb/signals` — the derived
+        // channel above may be truncated to the topic budget, this never is (L12/L13).
+        component_path: model.component_path_of(&obs.data_item_id).map(str::to_string),
     }
 }
 
@@ -1852,6 +1868,82 @@ mod mtconnect_seam_tests {
         let readings = session.map_batch(&[obs("Xabs")]);
         assert_eq!(readings.len(), 1);
         assert_eq!(readings[0].signal_id, "x-position");
+    }
+
+    // --- the canonical componentPath (D-MtconnectAdapter-L13) -----------------------------------
+
+    #[test]
+    fn every_reading_carries_the_component_path_sb_signals_serves() {
+        // One source of truth: whatever `signal.address.componentPath` says on `sb/signals` is the
+        // string the reading carries — for a component-borne item and a device-level one alike.
+        let m = model();
+        for (signal_id, data_item_id) in [("x-position", "Xabs"), ("availability", "avail")] {
+            let r = reading_from_observation(
+                &obs(data_item_id),
+                &signal(signal_id, data_item_id),
+                &m,
+                &HashMap::new(),
+            );
+            let served = m.address_of("line-a-agent", data_item_id).expect("an address")
+                ["componentPath"]
+                .clone();
+            assert_eq!(
+                serde_json::Value::from(r.component_path.clone()),
+                served,
+                "the update and sb/signals cannot disagree about {data_item_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_level_item_carries_the_empty_path_not_a_missing_one() {
+        let r = reading_from_observation(
+            &obs("avail"),
+            &signal("availability", "avail"),
+            &model(),
+            &HashMap::new(),
+        );
+        assert_eq!(r.component_path.as_deref(), Some(""), "known, and hanging off no component");
+    }
+
+    #[test]
+    fn a_derived_signal_carries_the_untruncated_path_its_channel_was_shortened_from() {
+        // L12 shortens the *channel* to the topic budget; the stamped path is never shortened.
+        let agent = runtime("http://127.0.0.1:9");
+        let (_tx, rx) = mpsc::channel(4);
+        let mut session = MtcSession::new(
+            agent,
+            selecting(vec![], serde_json::json!({ "mode": "all" })),
+            model(),
+            rx,
+        );
+        let readings = session.map_batch(&[obs("Sspeed")]);
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].channel.as_deref(), Some("axes/rotary-c/sspeed"));
+        assert_eq!(
+            readings[0].component_path.as_deref(),
+            model().component_path_of("Sspeed"),
+            "the full path, whatever the channel became"
+        );
+    }
+
+    #[test]
+    fn a_signal_the_model_does_not_describe_carries_no_path_and_publishes_null() {
+        // The permanent-BAD case. `sb/signals` answers `address.componentPath: null` for it
+        // (`unlearned_address`), and the reading agrees by carrying `None`.
+        let agent = runtime("http://127.0.0.1:9");
+        let (_tx, rx) = mpsc::channel(4);
+        let session =
+            MtcSession::new(agent, device(vec![signal("ghost", "no-such-item")]), model(), rx);
+        let unbound = session.unbound_readings();
+        assert_eq!(unbound.len(), 1, "the explicit signal is unbound against this model");
+        assert_eq!(unbound[0].signal_id, "ghost");
+        assert_eq!(unbound[0].quality, Quality::Bad);
+        assert_eq!(unbound[0].component_path, None);
+        assert!(
+            model().address_of("line-a-agent", "no-such-item").is_none(),
+            "the model has nothing to serve, which is why the update says null"
+        );
     }
 
     // --- publish shaping at the seam ----------------------------------------------------------

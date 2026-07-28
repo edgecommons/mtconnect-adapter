@@ -505,11 +505,18 @@ async fn selection_mode_all_derives_the_tiny_devices_signals_live() {
         .expect("the derived lower-kebab id of dataItemId `t1-Tpos`");
     assert_eq!(tpos.value, Some(json!(3.25)), "the live fed value, under a derived identity");
     assert!(tpos.channel.is_some(), "a derived channel from the live component path");
+    // Every reading off a live agent carries the canonical component path (L13) — the untruncated
+    // string the derived channel above was shaped from.
+    for r in &readings {
+        assert!(r.component_path.is_some(), "{} carries no componentPath", r.signal_id);
+    }
     println!(
-        "EVIDENCE selection: served={served} derived ids={:?} t1-tpos value={:?} channel={:?}",
+        "EVIDENCE selection: served={served} derived ids={:?} t1-tpos value={:?} channel={:?} \
+         componentPath={:?}",
         readings.iter().map(|r| r.signal_id.as_str()).collect::<Vec<_>>(),
         tpos.value,
-        tpos.channel
+        tpos.channel,
+        tpos.component_path
     );
     session.close().await;
 }

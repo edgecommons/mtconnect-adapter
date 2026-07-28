@@ -661,6 +661,39 @@ async fn sleep_until_deadline(deadline: Option<Instant>) {
     }
 }
 
+/// Publish one built `SouthboundSignalUpdate` with the signal's canonical component path stamped
+/// on the update-level extra (D-MtconnectAdapter-L13).
+///
+/// The body is still the **facade's**: `DataFacade::build_body` applies the whole §2.1 contract
+/// (quality defaulting, the `qualityRaw` marker, the `serverTs` fill, the samples wrapper), and
+/// `publish_body_via` mints the `data/{channel}` topic and stamps identity. This adapter adds one
+/// additive key to that body and hand-builds nothing — the `SignalUpdate` builder has no
+/// update-level `extra` setter, and the update-level extra map is the placement the design calls
+/// for, so the facade's own two-step form is how it is reached. Everything the library's
+/// `publish` does beyond this is preserved: the channel comes from the same
+/// `effective_signal_path`, the per-call channel override rides through unchanged, and the two
+/// fail-fast structural checks `publish` makes are re-made here rather than dropped.
+async fn publish_with_component_path(
+    data: &DataFacade,
+    update: &SignalUpdate,
+    component_path: Option<&str>,
+) -> edgecommons::Result<()> {
+    if update.signal_id.as_deref().unwrap_or_default().is_empty() {
+        return Err(EdgeCommonsError::Facade(
+            "data publish requires a stable signal.id (the consumer key)".to_string(),
+        ));
+    }
+    if update.samples.is_empty() {
+        return Err(EdgeCommonsError::Facade(
+            "data publish requires at least one sample".to_string(),
+        ));
+    }
+    let mut body = data.build_body(update)?;
+    crate::app::stamp_component_path(&mut body, component_path);
+    let path = update.effective_signal_path().unwrap_or_default().to_string();
+    data.publish_body_via(&path, body, update.via.clone()).await
+}
+
 /// Publish the shaper's released updates: each is ONE `SouthboundSignalUpdate` whose `samples[]`
 /// carries one signal's readings in arrival order — the wire's batching shape
 /// (docs/SOUTHBOUND.md §2). Records publish latency and feeds the staleness tracker, exactly as
@@ -693,7 +726,11 @@ async fn publish_shaped(
             .samples(readings.iter().map(build_sample))
             .build();
 
-        if let Err(e) = data.publish(update).await {
+        // ONE componentPath for the whole flushed window: the path is per-signal-static and a
+        // window is one signal's readings, so it belongs on the update, not on every sample.
+        if let Err(e) = publish_with_component_path(data, &update, first.component_path.as_deref())
+            .await
+        {
             tracing::warn!(instance = %cfg.id, signal = %first.signal_id, error = %e, "publish failed");
         } else {
             published += 1;
@@ -741,7 +778,8 @@ async fn publish_readings(
             .sample(sample)
             .build();
 
-        if let Err(e) = data.publish(update).await {
+        if let Err(e) = publish_with_component_path(data, &update, r.component_path.as_deref()).await
+        {
             tracing::warn!(instance = %cfg.id, signal = %r.signal_id, error = %e, "publish failed");
         } else {
             published += 1;

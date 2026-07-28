@@ -142,10 +142,16 @@ depth rather than quietly breaking the topic.
 
 Two properties make this safe to rely on. The signal id is always the terminal segment, and signal
 ids are unique within an instance — so however much path is dropped, two signals can never land on
-the same channel. And the machine's full component path is not discarded: it stays in the probe
-model and is served as `signal.address.componentPath` on `sb/signals` and on every browse entry. A
-consumer that needs the exact position in the machine tree asks the address; the topic is an
-address on the bus, not a copy of the machine.
+the same channel. And the machine's full component path is not discarded: every published
+`SouthboundSignalUpdate` carries it as `componentPath`, the same string `sb/signals` serves in
+`signal.address.componentPath` and every browse entry shows. A consumer that needs the exact
+position in the machine tree reads it off the message it already has; the topic is an address on
+the bus, not a copy of the machine.
+
+That field is on **every** update, not only the ones whose channel was shortened. A path that
+appears when it was truncated and vanishes when it was not is worse than useless: it makes the
+common case the exception, and every reader has to write the branch. Presence costs one small
+string per message; absence costs a conditional in every consumer, forever.
 
 The alternative — publishing the whole path and letting the topic be refused — is what the ceiling
 does on its own, and it is the worst outcome: the signal simply never appears, which is

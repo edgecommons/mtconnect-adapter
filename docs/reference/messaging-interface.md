@@ -97,15 +97,16 @@ topic:
 
 ```jsonc
 "body": {
-  "device": { "adapter": "sim", "instance": "device-1", "endpoint": "sim://device-1" },
-  "signal": { "id": "temperature-1", "name": "Ambient temperature" },
-  "samples": [ { "value": 21.7, "quality": "GOOD", "qualityRaw": "unspecified", "serverTs": "2026-07-19T00:00:00Z" } ]
+  "device": { "adapter": "mtconnect", "instance": "cnc-1", "endpoint": "http://agent:5000" },
+  "signal": { "id": "x-position", "name": "X position" },
+  "componentPath": "Axes/Linear[X]",
+  "samples": [ { "value": 123.456, "quality": "GOOD", "qualityRaw": "MTC_OK", "serverTs": "2026-07-19T00:00:00Z" } ]
 }
 ```
 
 An omitted `quality` defaults to `GOOD` with `qualityRaw: "unspecified"` (a synthesized-vs-reported
-marker); a failed read (the simulator's `pressure-1`) publishes an explicit `BAD` with the native
-fault text as `qualityRaw` and `value: null`.
+marker); a failed read publishes an explicit `BAD` with the native fault text as `qualityRaw` and
+`value: null`.
 
 The sample's `serverTs` is the **capture** moment: the seam's `capture_ts` when the backend
 supplies one, else the worker's read-completion receive stamp (a direct client's receive moment IS
@@ -124,6 +125,38 @@ batch window into one update ([configuration.md](configuration.md#publish-shapin
 carries every reading of the window in arrival order, each sample keeping its own `serverTs`,
 quality, and extras (`sequence`, `receivedTs`, ...). An unbatched signal publishes one sample per
 update.
+
+#### `componentPath` — the canonical address, on every update
+
+Every `SouthboundSignalUpdate` carries a `componentPath` member beside `signal` and `samples`. It
+is the signal's **full, untruncated** MTConnect component path — the same string `sb/signals`
+serves in `signal.address.componentPath` — so a consumer that needs to know where on the machine a
+value came from reads one field and never calls the control plane.
+
+| Value | Meaning |
+|---|---|
+| `"Axes/Linear[X]"` | The component chain holding the signal's data item, slash-joined, exactly as the probe declares it. |
+| `""` | The data item hangs off the device itself and belongs to no component (`avail` and friends). |
+| `null` | No device model describes this signal — an explicit `signals[]` entry whose `dataItemId` is not in the probe (published `BAD` with `qualityRaw: "MTC_NO_SUCH_DATAITEM"`), or a backend with no probe model. `sb/signals` reports the same `null`. |
+
+It is **always present**, with no exception: unconditional presence is the point, so reader code
+never branches on whether the key is there. It is stamped **once per update**, never per sample —
+the path is a property of the signal, and a batched update is one signal's readings:
+
+```jsonc
+"body": {
+  "signal": { "id": "stock" },
+  "componentPath": "Resources[resources]/Materials[materials]/Stock[stock]",
+  "samples": [ { "value": "ALUMINUM-6061", "quality": "GOOD", "serverTs": "2026-07-19T00:00:00Z", "sequence": 41 },
+               { "value": "ALUMINUM-7075", "quality": "GOOD", "serverTs": "2026-07-19T00:00:01Z", "sequence": 44 } ]
+}
+```
+
+The topic's channel is a different thing and may be shorter: a component path deeper than the UNS
+topic budget is shortened to its leaf-most segments when the channel is derived
+([configuration.md](configuration.md#deep-component-paths)). `componentPath` is never shortened, which
+is what makes the two safe to have side by side — the topic addresses the signal, this states where
+it lives.
 
 ### `sb/write` (command)
 
