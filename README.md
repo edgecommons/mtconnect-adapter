@@ -1,19 +1,24 @@
 # MtconnectAdapter
 
-A **southbound protocol adapter**: it connects to devices, reads signals, and publishes them onto
-the UNS in the shape the rest of the fleet expects — so a consumer can chart a Modbus register and
-an OPC UA node without knowing either protocol.
+A **southbound MTConnect client**: it connects to one or more running MTConnect **Agents** over
+HTTP, reads each agent's device model and observations, and publishes normalized EdgeCommons
+signals onto the UNS in the shape the rest of the fleet expects — so a consumer can chart an
+MTConnect data item next to a Modbus register or an OPC UA node without knowing any of the three
+protocols. It is a client, not an agent: it serves no HTTP endpoints and keeps no sequence buffer of
+its own. A deployment with machine tools and no agent installs the canonical `mtconnect/agent` next
+to them; this component consumes it, the way the OPC UA adapter consumes a Kepware server.
 
 ```text
-  connect ──► poll ──► publish SouthboundSignalUpdate ──► report health
-     ▲                                                         │
-     └──────────── reconnect with backoff ◄────────────────────┘
+  connect (probe) ──► acquire (stream or poll) ──► publish SouthboundSignalUpdate ──► report health
+     ▲                                                                                    │
+     └───────────────────────── reconnect / resync with backoff ◄─────────────────────────┘
 ```
 
-> Full docs: [`docs/README.md`](docs/README.md). This template ships without a `Cargo.lock` (the
-> scaffold generates offline, without a toolchain or network); commit it after your first build.
+> Full docs: [`docs/README.md`](docs/README.md). Design contract: [`DESIGN.md`](DESIGN.md).
 
 ## Run it
+
+Against the built-in simulator — no agent, no hardware:
 
 ```bash
 cargo run -- \
@@ -22,35 +27,48 @@ cargo run -- \
   -t my-thing
 ```
 
-It ships a **simulated backend**, so it runs with no hardware: it publishes a moving
-`temperature-1` and a deliberately faulted `pressure-1` on
+It publishes a moving `temperature-1` and a deliberately faulted `pressure-1` on
 `ecv1/{device}/mtconnect-adapter/device-1/data/{signal}`.
 
-## Where your code goes
+Against a real MTConnect agent, point `-c FILE` at `test-configs/mtconnect.json` instead (an
+`agents[]` entry plus one `mtconnect`-adapter instance bound to it — see
+[docs/sample-configurations.md](docs/sample-configurations.md)). `docker compose -f
+tests/compose.mtconnect-agent.yaml up -d` stands up the pinned reference agent (`mtconnect/agent`,
+the cppagent implementation) this repo's own test suite validates against.
 
-`src/device.rs`. A protocol implements two traits:
+## The device seam
+
+`src/device.rs` defines the protocol boundary every backend implements:
 
 ```rust
 #[async_trait]
 pub trait DeviceSession: Send + Sync {
     async fn read_signals(&mut self) -> Result<Vec<Reading>>;
+    async fn read_named(&mut self, ids: &[String]) -> Result<Vec<Reading>>; // default: read-all, filter
     async fn write_signal(&mut self, signal_id: &str, value: &Value) -> Result<()>;
+    async fn browse(&mut self, cursor: Option<String>, max: usize) -> Result<BrowsePage, BrowseError>; // default: Unsupported
+    async fn snapshot_now(&mut self) -> Result<Vec<Reading>>;   // default: read_signals  (`repoll`)
+    fn take_notices(&mut self) -> Vec<Notice>;                  // default: none          (`evt`)
+    fn served_signals(&self) -> Option<u64>;                    // default: the inventory size
     async fn close(&mut self);
 }
 
 #[async_trait]
 pub trait DeviceBackend: Send + Sync {
     fn kind(&self) -> &'static str;
+    fn inventory(&self, cfg: &ConnectionConfig) -> Vec<SignalInfo>; // default: empty
     async fn connect(&self, cfg: &ConnectionConfig) -> Result<Box<dyn DeviceSession>>;
 }
 ```
 
 **The boundary rule, worth enforcing in review:** a backend knows *protocols*. It does not know
-EdgeCommons topics, the UNS, message envelopes, or metrics. If your `impl DeviceSession` imports
-`edgecommons::uns`, the seam has leaked.
+EdgeCommons topics, the UNS, message envelopes, or metrics. `src/mtconnect/**` — the owned MTConnect
+HTTP/XML client — imports nothing from `edgecommons`, enforced by `tests/isolation.rs`.
 
-Replace `SimBackend` with your protocol. Everything above the seam — the connection lifecycle,
-backoff, publishing, health, the command surface — is written against the traits and does not change.
+Two backends implement the pair today: `MtcBackend`/`MtcSession` (`adapter: "mtconnect"`, the
+default) is the real client, built on `src/mtconnect/**`; `SimBackend`/`SimSession`
+(`adapter: "sim"`) is the built-in simulator kept so the component runs on a laptop with no agent.
+`MtcSession::write_signal` always refuses — see below.
 
 ## The contract this implements (`docs/SOUTHBOUND.md`)
 
@@ -67,10 +85,12 @@ simulator's `pressure-1` demonstrates exactly this.
 
 **`southbound_health`, dimensioned by instance** — the canonical SOUTHBOUND.md §5 set:
 `connectionState`, `publishLatencyMs`, `pollLatencyMs`, `readErrors`, `staleSignals`, `reconnects`,
-`writeErrors`, `signalsSubscribed` — so an operator sees a link go down without reading logs. On top of it, `src/metrics.rs` ships the
-**operational-family pattern** two families deep (`MtconnectAdapterConnection`,
-`MtconnectAdapterCommand`) as worked examples, with a signposted place to add your protocol's own
-`Inventory` / `Poll` / `Publish` families.
+`writeErrors`, `signalsSubscribed` — so an operator sees a link go down without reading logs. On top
+of it, `src/metrics.rs` ships the generic connect/reconnect and command-surface families
+(`MtconnectAdapterConnection`, `MtconnectAdapterCommand`) plus three MTConnect-specific families per
+HLD §9: `MtconnectStream` and `MtconnectProbe` (dimensioned `agentId`, emitted once per shared agent,
+not once per device), and `MtconnectParse` (dimensioned `instance`). See
+[reference/metrics.md](docs/reference/metrics.md) for every measure.
 
 **Per-instance connectivity, from one provider.** `App::run` registers an instance-connectivity
 provider reporting one entry per configured device. The library reads it twice: it pushes the
@@ -89,21 +109,21 @@ knowing your protocol. `state` is this adapter's **own** vocabulary (`CONNECTING
 `attributes` is an **open** bag for domain data, so what only your adapter understands rides along
 without destabilizing the two fields every consumer relies on.
 
-## Writes are allow-listed, and the list is empty by default
+## Nothing is writable — MTConnect is a read-only protocol
 
 ```json
-{ "id": "device-1", "adapter": "sim",
-  "connection": { "endpoint": "sim://device-1" },
-  "pollIntervalMs": 5000,
+{ "id": "cnc-1", "adapter": "mtconnect",
+  "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.123456" },
   "writes": { "allow": [] } }
 ```
 
-Only signal ids in `writes.allow` can be written, matched on the **stable `signal.id`** and checked
-before the write ever reaches the device. Anything else is refused, whatever the command asks for.
-An adapter that will write any address it is handed is a control-system vulnerability, not a
-convenience — so the default is read-only, and opening it is a deliberate act.
-
-A write is **confirmed**: the command's reply is the device's answer, not "we sent it".
+MTConnect's API is read-only by specification (Part 1 Fundamentals §5.1): an agent serves
+observations, and there is nothing to write. `sb/write` stays registered — so a caller gets a
+standard, explanatory `WRITE_NOT_ALLOWED` instead of "unknown verb" — and the refusal precedes any
+inspection of the request, so no entry is ever resolved and nothing reaches a device. The same fact
+is advertised through command availability (`unsupported`), so a console disables the surface
+instead of offering a control that can never work, and `writes.allow` is pinned to the empty array
+by the configuration schema.
 
 `connection` is deliberately **open** — every protocol needs different keys (a unit id, a security
 policy, a slave address). Everything else in `config.schema.json` is closed, so a typo is caught.
@@ -116,9 +136,13 @@ The adapter serves the generic southbound `sb/*` family on its `commands()` inbo
 the topic's instance token (`…/{instance}/cmd/{verb}`), else a body `instance`, a conflict between
 them refused with `BAD_ARGS` — and this module maps the resolved instance onto a configured device
 (unnamed means the sole one; required once more than one is configured). Every session-touching verb
-is handed to the device's own task over a
-control channel and confirmed through the reply that rides it, so the inbox never touches a live
-connection. The same module registers three edge-console panels — `overview`, `signals`,
-`diagnostics` — an adapter-overview summary with lifecycle bindings, a signal grid bound to
-`sb/signals`, and a hierarchical inventory tree driving `sb/browse`'s `ref` mode. `repoll` is
-refused with `PAUSED` while the instance is paused.
+is handed to the device's own task over a control channel and confirmed through the reply that rides
+it, so the inbox never touches a live connection — while `sb/status` and `sb/browse` answer from the
+agent runtime's *published* state (its document headers and cached probe model), so neither queues
+behind acquisition and the address space stays browsable while the agent is unreachable.
+
+The same module registers five edge-console panels — `overview` (a status dashboard, the lifecycle
+action bar, and link-health metrics), `device-structure` (the probe tree over `sb/browse`'s `ref`
+mode), `signals` (a signal grid bound to `sb/signals`), `conditions` (condition/data-loss/agent
+events), and `diagnostics` (sequence and buffer state, agent events, stream metrics). None of them
+advertises a write surface. `repoll` is refused with `PAUSED` while the instance is paused.

@@ -44,7 +44,8 @@ pub struct DeviceConfig {
     /// The instance id. It is the `{instance}` token of this device's UNS topics, so it must be a
     /// valid UNS token (lower-kebab).
     pub id: String,
-    /// Which backend to use. Matches [`crate::device::DeviceBackend::kind`].
+    /// Which backend to use. Matches [`crate::device::DeviceBackend::kind`]: `mtconnect` (the
+    /// default) or `sim`.
     #[serde(default = "default_adapter")]
     pub adapter: String,
     pub connection: ConnectionConfig,
@@ -52,9 +53,55 @@ pub struct DeviceConfig {
     #[serde(default = "default_poll_ms")]
     pub poll_interval_ms: u64,
     /// Writes are **allow-listed by stable `signal.id`**. An empty list means this adapter is
-    /// read-only, which is the correct default for anything touching a control system.
+    /// read-only, which is the correct default for anything touching a control system. For
+    /// MTConnect the schema pins it to the empty list: the protocol has no write path (D-MTC-7).
     #[serde(default)]
     pub writes: Writes,
+    /// The signals this device publishes, each binding one MTConnect `dataItemId` (HLD §5.3).
+    #[serde(default)]
+    pub signals: Vec<crate::mtconnect::config::SignalConfig>,
+}
+
+/// Compile the configured instances against the configured agents: bind each MTConnect device to
+/// its agent and derive its published endpoint.
+///
+/// The endpoint is **derived, never configured** (HLD §5.1): an instance names an agent and a
+/// device uuid, and `mtconnect://<host>[:<port>]/<uuid>` follows from them, so the two can never
+/// disagree.
+///
+/// # Errors
+/// [`MtcError::Config`] naming the offending instance when a binding is missing, an agent is
+/// unknown, or two devices claim the same uuid on one agent.
+pub fn compile_mtconnect(
+    devices: &mut [DeviceConfig],
+    agents: &[crate::mtconnect::config::AgentConfig],
+) -> std::result::Result<Vec<crate::mtconnect::config::DeviceConfig>, crate::mtconnect::MtcError>
+{
+    use crate::mtconnect::MtcError;
+
+    let mut compiled = Vec::new();
+    for device in devices.iter_mut().filter(|d| d.adapter == crate::device::KIND) {
+        let (agent_id, device_uuid) = crate::device::connection_binding(&device.connection)
+            .map_err(|e| MtcError::Config(format!("instance `{}`: {e}", device.id)))?;
+        let agent = agents.iter().find(|a| a.id == agent_id).ok_or_else(|| {
+            MtcError::Config(format!(
+                "instance `{}` references unknown agent `{agent_id}`",
+                device.id
+            ))
+        })?;
+        if device.connection.endpoint.is_empty() {
+            device.connection.endpoint =
+                crate::device::endpoint_description(&agent.url, &device_uuid);
+        }
+        compiled.push(crate::mtconnect::config::DeviceConfig {
+            id: device.id.clone(),
+            agent_id,
+            device_uuid,
+            signals: device.signals.clone(),
+        });
+    }
+    crate::mtconnect::config::validate_bindings(agents, &compiled)?;
+    Ok(compiled)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -74,7 +121,9 @@ impl Writes {
 }
 
 fn default_adapter() -> String {
-    "sim".into()
+    // This component's own protocol. The simulator is opt-in (`"sim"`), matching the schema's
+    // default so configuration and code cannot disagree about what an unset `adapter` means.
+    crate::device::KIND.into()
 }
 fn default_poll_ms() -> u64 {
     5_000
@@ -235,6 +284,52 @@ pub fn sample_timestamps(r: &Reading) -> (Option<String>, Option<String>) {
         _ => None,
     };
     (server_ts, received_extra)
+}
+
+/// Build the wire [`Sample`] for one reading — the whole publish mapping, in one tested place so
+/// the live poll loop only has to call it.
+///
+/// * a reading with a value publishes it; a reading **without** one publishes an explicit JSON
+///   `null` ([`Sample::null_value`]) beside its quality — the MTConnect `UNAVAILABLE` case, which
+///   is a *bad* null and must not be confused with a good one;
+/// * quality and the protocol-native `qualityRaw` always ride along;
+/// * the four-slot timestamp mapping is [`sample_timestamps`]: capture → `serverTs`, a distinct
+///   receive moment → the `receivedTs` extra, `sourceTs` verbatim and never synthesized;
+/// * protocol extras (MTConnect's `sequence`, `resetTriggered`, …) are copied last.
+#[must_use]
+pub fn build_sample(r: &Reading) -> Sample {
+    let quality = match r.quality {
+        crate::device::Quality::Good => edgecommons::facades::Quality::Good,
+        crate::device::Quality::Bad => edgecommons::facades::Quality::Bad,
+        crate::device::Quality::Uncertain => edgecommons::facades::Quality::Uncertain,
+    };
+    let mut sample = match &r.value {
+        Some(value) => Sample::with_quality(value.clone(), quality),
+        None => {
+            // The explicit-null opt-in gates the null's PERMISSION, not its quality: this is a
+            // published `"value": null` with a BAD quality and the agent's own reason.
+            let mut s = Sample::null_value();
+            s.quality = Some(quality);
+            s
+        }
+    };
+    if let Some(raw) = &r.quality_raw {
+        sample = sample.quality_raw(raw);
+    }
+    let (server_ts, received_extra) = sample_timestamps(r);
+    sample.source_ts = r.source_ts.clone();
+    if let Some(ts) = server_ts {
+        sample = sample.server_ts(ts);
+    }
+    if let Some(received) = received_extra {
+        sample = sample.extra("receivedTs", received);
+    }
+    if let Some(extra) = &r.extra {
+        for (key, value) in extra {
+            sample = sample.extra(key.clone(), value.clone());
+        }
+    }
+    sample
 }
 
 /// Flip the paused flag, returning whether the state actually changed (idempotent — pausing an
@@ -439,16 +534,7 @@ mod tests {
     // --- timestamps: the four-slot mapping (docs/SOUTHBOUND.md §2) -------------------------------
 
     fn reading(id: &str) -> Reading {
-        Reading {
-            signal_id: id.into(),
-            name: None,
-            value: json!(1.0),
-            quality: crate::device::Quality::Good,
-            quality_raw: None,
-            source_ts: None,
-            capture_ts: None,
-            received_ts: None,
-        }
+        Reading::good(id, json!(1.0))
     }
 
     #[test]
@@ -503,6 +589,65 @@ mod tests {
     #[test]
     fn a_reading_with_no_timestamp_slots_maps_to_nothing_synthesized() {
         assert_eq!(sample_timestamps(&reading("a")), (None, None));
+    }
+
+    // --- the publish mapping ------------------------------------------------------------------
+
+    #[test]
+    fn a_reading_with_a_value_publishes_it_with_its_quality_and_native_code() {
+        let r = Reading {
+            quality_raw: Some("MTC_OK".into()),
+            capture_ts: Some("2026-07-27T10:00:04.250000Z".into()),
+            received_ts: Some("2026-07-27T10:00:04.900000Z".into()),
+            ..Reading::good("x-position", json!(123.456))
+        };
+        let s = build_sample(&r);
+        assert_eq!(s.value, Some(json!(123.456)));
+        assert_eq!(s.quality, Some(edgecommons::facades::Quality::Good));
+        assert_eq!(s.quality_raw.as_deref(), Some("MTC_OK"));
+        assert!(!s.explicit_null);
+        // The agent's capture stamp is the serverTs; the adapter's receive moment differs (a
+        // mediated protocol) and rides as the extra.
+        assert_eq!(s.server_ts.as_deref(), Some("2026-07-27T10:00:04.250000Z"));
+        assert_eq!(
+            s.extra.as_ref().unwrap()["receivedTs"],
+            json!("2026-07-27T10:00:04.900000Z")
+        );
+        assert!(s.source_ts.is_none(), "MTConnect has no device-authored time");
+    }
+
+    #[test]
+    fn an_unavailable_reading_publishes_an_explicit_null_with_bad_quality() {
+        // The §2 explicit-null rule gates the null's PERMISSION; the quality stays the protocol's.
+        let r = Reading::bad("x-load", "UNAVAILABLE");
+        let s = build_sample(&r);
+        assert_eq!(s.value, None);
+        assert!(s.explicit_null, "a legitimate protocol null, deliberately published");
+        assert_eq!(s.quality, Some(edgecommons::facades::Quality::Bad));
+        assert_eq!(s.quality_raw.as_deref(), Some("UNAVAILABLE"));
+    }
+
+    #[test]
+    fn protocol_extras_ride_the_sample() {
+        let r = Reading::good("x-position", json!(1.0))
+            .with_extra("sequence", json!(37))
+            .with_extra("resetTriggered", json!("MANUAL"));
+        let extra = build_sample(&r).extra.expect("extras");
+        assert_eq!(extra["sequence"], json!(37), "exact once-only ordering, on every sample");
+        assert_eq!(extra["resetTriggered"], json!("MANUAL"));
+    }
+
+    #[test]
+    fn an_uncertain_reading_keeps_its_value_and_says_why() {
+        let r = Reading {
+            quality: crate::device::Quality::Uncertain,
+            quality_raw: Some("MTC_CONDITION:WARNING:ALM-2".into()),
+            ..Reading::good("spindle-speed", json!(1200))
+        };
+        let s = build_sample(&r);
+        assert_eq!(s.value, Some(json!(1200)), "a warned value is still a value");
+        assert_eq!(s.quality, Some(edgecommons::facades::Quality::Uncertain));
+        assert_eq!(s.quality_raw.as_deref(), Some("MTC_CONDITION:WARNING:ALM-2"));
     }
 
     #[test]

@@ -1,16 +1,17 @@
-# Tutorial — From scaffold to live values
+# Tutorial — From simulator to a real MTConnect agent
 
-*This documents the generated scaffold; rewrite it as you build the component out.*
-
-By the end you will have built `com.mbreissi.edgecommons.MtconnectAdapter`, run it against its built-in device
-simulator, watched a signal update flow onto the Unified Namespace (UNS), and read a value back
-through the command surface. No hardware required — the scaffold ships with a **simulated backend**
-(`SimBackend`, in `src/device.rs`) for exactly this reason.
+By the end you will have built `com.mbreissi.edgecommons.MtconnectAdapter`, run it first against its
+built-in device simulator, watched a signal update flow onto the Unified Namespace (UNS), read a
+value back through the command surface, then pointed the same binary at a real MTConnect agent and
+watched its probe/observation model come to life — browsing the device structure, reading the
+agent's own capability, and seeing a bound condition degrade a signal's quality.
 
 ## 1. Prerequisites
 
 - A Rust toolchain (edition 2021, `rust-version = "1.85"` — matches the `edgecommons` library's MSRV).
-- A local MQTT broker on `localhost:1883` (`docker run -d -p 1883:1883 emqx/emqx`).
+- A local MQTT broker on `localhost:1883` (`docker run -d -p 1883:1883 emqx/emqx`, or
+  `docker compose up -d` from this repo's own `compose.yaml`).
+- For the second half: Docker, to run a real MTConnect agent.
 
 ## 2. Build it
 
@@ -18,11 +19,9 @@ through the command surface. No hardware required — the scaffold ships with a 
 cargo build
 ```
 
-The `standalone` feature (dual-broker MQTT) is the default — this is the HOST-platform build you
-use for local development. The Greengrass IPC build (`--features greengrass`) is Linux-only and is
-what `build.sh` uses for the on-device artifact; you do not need it for this tutorial.
+## 3. Run it against the simulator
 
-## 3. Run it
+No agent, no hardware:
 
 ```bash
 cargo run -- \
@@ -66,17 +65,20 @@ The `state` keepalive's `instances[]` array carries one entry for `device-1` —
 
 ## 5. Read a signal on demand
 
-The read/write/status surface rides the library's command inbox
-(`ecv1/{device}/mtconnect-adapter/cmd/{verb}`). With a raw MQTT client, set `header.name` to the verb and
-`header.reply_to`/`header.correlation_id` for the reply:
+The read/status/browse surface rides the library's command inbox
+(`ecv1/{device}/mtconnect-adapter/cmd/{verb}`). With a raw MQTT client, set `header.name` to the verb
+and `header.reply_to`/`header.correlation_id` for the reply:
 
 ```text
 publish ecv1/my-thing/mtconnect-adapter/cmd/sb/read
   {"header":{"name":"sb/read","reply_to":"app/r","correlation_id":"1"},
    "body":{"signals":[{"signalId":"temperature-1"}]}}
-subscribe app/r  →  {"ok":true,"result":{"id":"device-1","reads":[
-  {"signal":{"id":"temperature-1"},"value":21.7,"quality":"GOOD","qualityRaw":"unspecified"}]}}
+subscribe app/r  →  {"ok":true,"result":{"id":"device-1","mode":"current","reads":[
+  {"signal":{"id":"temperature-1"},"value":21.7,"quality":"GOOD","qualityRaw":"OK"}]}}
 ```
+
+Only one device is configured, so `instance` is optional in the request body — the command surface
+routes to the sole configured device automatically (add a second instance and it becomes required).
 
 ## 6. Check status
 
@@ -87,20 +89,81 @@ subscribe app/r  →  {"ok":true,"result":{"id":"device-1","adapter":"sim","conn
   "state":"ONLINE","paused":false,"endpoint":"sim://device-1","metrics":{...}}}
 ```
 
-Only one device is configured, so `instance` is optional in the request body — the command surface
-routes to the sole configured device automatically (add a second instance and it becomes required).
+The reply has no `protocol` object here — that field only appears for an `mtconnect`-adapter
+instance, since it carries the agent's own capability and standard version.
 
-## 7. Prove it end-to-end
+## 7. Run it against a real MTConnect agent
+
+Stand up the pinned reference agent (cppagent) this repo's own integration suite validates
+against:
+
+```bash
+docker compose -f tests/compose.mtconnect-agent.yaml up -d
+```
+
+This starts an MTConnect agent on `localhost:5010` serving two simulated devices, including one with
+uuid `MTC-E2E-001`. Point the adapter at `test-configs/mtconnect.json` instead, which declares one
+agent (`line-a-agent`, `http://127.0.0.1:5000` in the shipped file — change its `url` to
+`http://127.0.0.1:5010` to reach the compose agent, or edit the file to match whatever agent you have
+running) and one instance (`cnc-1`) bound to it, with five signals including a condition binding:
+
+```bash
+cargo run -- \
+  --platform HOST --transport MQTT ./test-configs/standalone-messaging.json \
+  -c FILE ./test-configs/mtconnect.json \
+  -t my-thing
+```
+
+Watch the same `data` topics as before — now carrying real MTConnect observations, e.g.
+`ecv1/my-thing/mtconnect-adapter/cnc-1/data/x-position` with `qualityRaw: "MTC_OK"` and a
+`serverTs` taken from the agent's own capture timestamp, plus `extra.sequence` — the agent's
+once-only ordering key, carried on every sample.
+
+## 8. Ask the agent what it knows
+
+`sb/status` now returns a `protocol` object once the agent has answered its first `/probe`:
+
+```text
+publish ecv1/my-thing/mtconnect-adapter/cnc-1/cmd/sb/status
+  {"header":{"name":"sb/status","reply_to":"app/r","correlation_id":"3"},"body":{}}
+subscribe app/r  →  {"ok":true,"result":{"id":"cnc-1","adapter":"mtconnect","connected":true,
+  "state":"ONLINE","paused":false,"endpoint":"mtconnect://127.0.0.1:5010/MTC-E2E-001",
+  "protocol":{"capability":"MTCONNECT_CLIENT","standardVersion":"2.0",
+  "agentId":"line-a-agent","agentVersion":"2.7.0.12","instanceId":..., "mode":"poll",
+  "probeDigest":"sha256:...","limitations":["READ_ONLY","XML_ONLY","NO_ASSETS"]}}}
+```
+
+`sb/browse` walks the same device's probe tree — try it with no body for the first page, or with
+`{"ref":"root","depth":1}` for the hierarchical panel shape (see
+[reference/messaging-interface.md](reference/messaging-interface.md) for both response shapes).
+
+## 9. See a bound condition degrade a signal
+
+`test-configs/mtconnect.json`'s `x-position` signal declares `"conditionBinding": ["Xtravel"]`. Drive
+the agent's `Xtravel` CONDITION data item into `Warning` or `Fault` (through the agent's own adapter
+feed, or `tests/agent_integration.rs` if you are reading the code) and watch `x-position`'s next
+published sample carry `quality: "UNCERTAIN"` or `"BAD"` with the alarm's own code in `qualityRaw`
+(`MTC_CONDITION:WARNING:<code>` / `MTC_CONDITION:FAULT:<code>`) — the value itself is unchanged; only
+the quality reflects the machine's own alarm state. The `x-travel-condition` signal in the same
+config publishes the condition's own state (`NORMAL`/`WARNING`/`FAULT`) directly, as its own reading.
+
+## 10. Prove it end-to-end
 
 ```bash
 cargo test
 ```
 
-Every module ships its own tests against the simulator and a mocked device-control channel — no
-network, no broker, no device required. `src/commands.rs` covers every `sb/*` verb's happy path and
-error code; `src/metrics.rs` proves `southbound_health` emits exactly the canonical measure set;
-`src/device.rs` proves the simulator's contract (a failed read is `BAD`, not omitted).
+Every module ships its own tests — the XML parser against malformed and hostile input
+(`tests/fuzz_style.rs`), the probe model and its digest, the polling path end to end against a fake
+agent (`tests/poll_acquisition.rs`), the streaming path and all three resync ladder steps
+(`tests/stream_acquisition.rs`, `tests/stream_sequence.rs`), every configuration shipped in
+`test-configs/` against `config.schema.json` (`tests/config_schema.rs`), the `src/mtconnect/**`
+isolation rule (`tests/isolation.rs`), and the full `sb/*` command surface through a real
+`CommandInbox` (`tests/scoped_delivery.rs`) — no network, no broker, no live agent required.
+`tests/agent_integration.rs` additionally drives the real cppagent container from step 7 (probe,
+stream, restart/`instanceId` resync, buffer-wrap recovery) when `EC_MTC_AGENT` is set; it self-skips
+otherwise, so the ordinary gate stays green with no Docker.
 
-Next: the [how-to guides](how-to-guides.md) for replacing the simulator with a real protocol,
-tuning polling, and deploying; the [reference](reference/) for every option, topic, and metric; the
+Next: the [how-to guides](how-to-guides.md) for tuning streaming/polling, binding conditions, and
+deploying; the [reference](reference/) for every option, topic, and metric; the
 [explanation](explanation.md) for why the code is shaped the way it is.

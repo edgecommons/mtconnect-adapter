@@ -1,0 +1,36 @@
+# The pinned MTConnect reference agent (cppagent) for the env-gated integration suite
+# (tests/agent_integration.rs — LLD §12 row 6).
+#
+#   docker compose -f tests/compose.mtconnect-agent.yaml up -d
+#   EC_MTC_AGENT=http://localhost:5010 cargo test --test agent_integration -- --test-threads=1
+#
+# The agent image ships an EMPTY /mtconnect/config, so the simulator configuration is mounted
+# from tests/fixtures/agent-e2e/. The SHDR data feed itself is served by the test process on the
+# host (the cppagent in-tree simulator's adapter protocol, port-per-device), which the containers
+# reach via host.docker.internal.
+#
+#   agent       : two simulated devices, default buffer  — probe/stream E2E, restart/instanceId
+#                 resync, multi-device demultiplexing.
+#   agent-tiny  : one device, BufferSize = 7 (2^7 = 128 observations) — buffer-wrap / OUT_OF_RANGE
+#                 recovery.
+services:
+  agent:
+    image: mtconnect/agent:2.7.0.12
+    container_name: mtc-e2e-agent
+    ports:
+      - "5010:5000"
+    volumes:
+      - ./fixtures/agent-e2e/agent.cfg:/mtconnect/config/agent.cfg:ro
+      - ./fixtures/agent-e2e/devices.xml:/mtconnect/config/devices.xml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+  agent-tiny:
+    image: mtconnect/agent:2.7.0.12
+    container_name: mtc-e2e-agent-tiny
+    ports:
+      - "5011:5000"
+    volumes:
+      - ./fixtures/agent-e2e/tiny-agent.cfg:/mtconnect/config/agent.cfg:ro
+      - ./fixtures/agent-e2e/tiny-devices.xml:/mtconnect/config/devices.xml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

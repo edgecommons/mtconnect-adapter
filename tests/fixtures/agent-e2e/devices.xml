@@ -1,0 +1,44 @@
+<MTConnectDevices xmlns="urn:mtconnect.org:MTConnectDevices:1.7">
+  <Header creationTime="2026-07-27T00:00:00Z" sender="e2e" instanceId="1" bufferSize="131072" version="1.7.0"/>
+  <Devices>
+    <Device id="d1" uuid="MTC-E2E-001" name="dev-one">
+      <Description manufacturer="EdgeCommons" serialNumber="E2E-1">Simulated CNC one</Description>
+      <DataItems>
+        <DataItem category="EVENT" id="d1-avail" name="avail" type="AVAILABILITY"/>
+      </DataItems>
+      <Components>
+        <Axes id="d1-axes" name="axes">
+          <Components>
+            <Linear id="d1-x" name="X">
+              <DataItems>
+                <DataItem category="SAMPLE" id="d1-Xabs" name="Xabs" subType="ACTUAL" type="POSITION" units="MILLIMETER" nativeUnits="MILLIMETER"/>
+              </DataItems>
+            </Linear>
+          </Components>
+        </Axes>
+        <Controller id="d1-ctrl" name="controller">
+          <DataItems>
+            <DataItem category="EVENT" id="d1-exec" name="exec" type="EXECUTION"/>
+          </DataItems>
+        </Controller>
+      </Components>
+    </Device>
+    <Device id="d2" uuid="MTC-E2E-002" name="dev-two">
+      <Description manufacturer="EdgeCommons" serialNumber="E2E-2">Simulated mill two</Description>
+      <DataItems>
+        <DataItem category="EVENT" id="d2-avail" name="avail2" type="AVAILABILITY"/>
+      </DataItems>
+      <Components>
+        <Axes id="d2-axes" name="axes">
+          <Components>
+            <Linear id="d2-y" name="Y">
+              <DataItems>
+                <DataItem category="SAMPLE" id="d2-Ypos" name="Ypos" subType="ACTUAL" type="POSITION" units="MILLIMETER" nativeUnits="MILLIMETER"/>
+              </DataItems>
+            </Linear>
+          </Components>
+        </Axes>
+      </Components>
+    </Device>
+  </Devices>
+</MTConnectDevices>

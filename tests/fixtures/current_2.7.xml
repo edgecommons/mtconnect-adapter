@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MTConnectStreams xmlns="urn:mtconnect.org:MTConnectStreams:2.7" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:mtconnect.org:MTConnectStreams:2.7 http://schemas.mtconnect.org/schemas/MTConnectStreams_2.7.xsd">
+  <Header creationTime="2026-07-27T10:00:05Z" sender="mtc-agent" instanceId="1749000000" version="2.7.0.12" bufferSize="131072" firstSequence="1" lastSequence="41" nextSequence="42"/>
+  <Streams>
+    <DeviceStream name="OKUMA-CNC" uuid="OKUMA.123456">
+      <ComponentStream component="Device" name="OKUMA-CNC" componentId="okuma">
+        <Events>
+          <Availability dataItemId="avail" name="avail" sequence="1" timestamp="2026-07-27T10:00:00.100000Z">AVAILABLE</Availability>
+        </Events>
+      </ComponentStream>
+      <ComponentStream component="Linear" name="X" componentId="x-axis">
+        <Samples>
+          <Position dataItemId="Xabs" name="Xabs" subType="ACTUAL" sequence="37" timestamp="2026-07-27T10:00:04.250000Z">123.456</Position>
+          <Load dataItemId="Xload" name="Xload" sequence="12" timestamp="2026-07-27T10:00:01.000000Z">UNAVAILABLE</Load>
+          <AccelerationTimeSeries dataItemId="Xfreq" name="Xfreq" sampleCount="4" sampleRate="1000" sequence="38" timestamp="2026-07-27T10:00:04.300000Z">0.1 0.2 0.35 0.4</AccelerationTimeSeries>
+        </Samples>
+        <Condition>
+          <Fault dataItemId="Xtravel" name="Xtravel" nativeCode="ALM-1041" nativeSeverity="2" qualifier="HIGH" sequence="39" timestamp="2026-07-27T10:00:04.400000Z" type="POSITION">X axis travel limit exceeded</Fault>
+        </Condition>
+      </ComponentStream>
+      <ComponentStream component="Rotary" name="C" componentId="c-axis">
+        <Samples>
+          <RotaryVelocity dataItemId="Sspeed" name="Sspeed" subType="ACTUAL" resetTriggered="MANUAL" duration="1.5" sequence="40" timestamp="2026-07-27T10:00:04.500000Z">1200</RotaryVelocity>
+        </Samples>
+      </ComponentStream>
+      <ComponentStream component="Path" name="P1" componentId="path">
+        <Events>
+          <Execution dataItemId="execution" name="execution" sequence="30" timestamp="2026-07-27T10:00:03.000000Z">ACTIVE</Execution>
+          <Program dataItemId="program" name="program" sequence="31" timestamp="2026-07-27T10:00:03.100000Z">O1234-PART-A</Program>
+          <PartCount dataItemId="part-count" name="partCount" sequence="32" timestamp="2026-07-27T10:00:03.200000Z">42</PartCount>
+          <ToolOffsetDataSet dataItemId="tool-offsets" name="toolOffsets" count="2" sequence="33" timestamp="2026-07-27T10:00:03.300000Z">
+            <Entry key="T1">12.5</Entry>
+            <Entry key="T2">7.25</Entry>
+          </ToolOffsetDataSet>
+        </Events>
+        <Samples>
+          <PathPosition dataItemId="Ppos" name="Ppos" sequence="41" timestamp="2026-07-27T10:00:04.600000Z">10.5 20.25 30</PathPosition>
+        </Samples>
+        <Condition>
+          <Normal dataItemId="logic" name="logic" sequence="20" timestamp="2026-07-27T10:00:02.000000Z" type="LOGIC_PROGRAM"/>
+        </Condition>
+      </ComponentStream>
+    </DeviceStream>
+    <DeviceStream name="MAZAK-LATHE" uuid="MAZAK.999">
+      <ComponentStream component="Device" name="MAZAK-LATHE" componentId="mazak">
+        <Events>
+          <Availability dataItemId="m-avail" name="avail" sequence="2" timestamp="2026-07-27T10:00:00.200000Z">AVAILABLE</Availability>
+        </Events>
+      </ComponentStream>
+    </DeviceStream>
+  </Streams>
+</MTConnectStreams>

@@ -1,0 +1,22 @@
+<MTConnectDevices xmlns="urn:mtconnect.org:MTConnectDevices:1.7">
+  <Header creationTime="2026-07-27T00:00:00Z" sender="e2e-tiny" instanceId="1" bufferSize="128" version="1.7.0"/>
+  <Devices>
+    <Device id="t1" uuid="MTC-E2E-TINY" name="dev-tiny">
+      <Description manufacturer="EdgeCommons" serialNumber="E2E-T">Tiny-buffer device</Description>
+      <DataItems>
+        <DataItem category="EVENT" id="t1-avail" name="tavail" type="AVAILABILITY"/>
+      </DataItems>
+      <Components>
+        <Axes id="t1-axes" name="axes">
+          <Components>
+            <Linear id="t1-z" name="Z">
+              <DataItems>
+                <DataItem category="SAMPLE" id="t1-Tpos" name="Tpos" subType="ACTUAL" type="POSITION" units="MILLIMETER" nativeUnits="MILLIMETER"/>
+              </DataItems>
+            </Linear>
+          </Components>
+        </Axes>
+      </Components>
+    </Device>
+  </Devices>
+</MTConnectDevices>

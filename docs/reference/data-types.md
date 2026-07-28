@@ -1,86 +1,139 @@
 # Reference — Data Types
 
-*This documents the generated scaffold; rewrite it as you build the component out.*
+How an MTConnect observation becomes a published `Reading`, and how a `Reading` becomes the JSON on
+the wire. For the config keys that select what gets read, see
+[reference/configuration.md](configuration.md); for the message shapes,
+[reference/messaging-interface.md](messaging-interface.md).
 
-Unlike a fixed-register protocol (Modbus's bits and 16-bit registers, say), this scaffold's device
-seam (`src/device.rs`) does not impose a wire type system of its own — a [`Reading`]'s `value` is an
-opaque `serde_json::Value`, and it is **your protocol's job** to define what that means. This page
-documents the seam's own types (what every backend must produce and consume) and what a real
-protocol typically adds on top.
+## The seam's type: `Reading`
 
-## The seam's types
+Every backend — the real MTConnect client and the built-in simulator alike — produces
+`Vec<Reading>` from `DeviceSession::read_signals`/`read_named`. Its fields:
 
-| Type | Field | Meaning |
-|------|-------|---------|
-| [`Reading`] | `signal_id` | The canonical, stable id the rest of the fleet keys on. Never a volatile index — it is what `writes.allow` matches against and what `sb/read`/`sb/write` address. |
-| | `name` | An optional human label. |
-| | `value` | The decoded value, as JSON: `number`, `boolean`, `string`, or `null` (a failed read — see below). |
-| | `quality` | Normalized [`Quality`]: `Good` \| `Bad` \| `Uncertain`. |
-| | `quality_raw` | The protocol-native status/code, kept verbatim for diagnosis. |
-| | `source_ts` | Optional ISO-8601 UTC. The **machine** timestamp — device/field-authored time, set only when the protocol supplies it. Published as `sourceTs`, never synthesized. |
-| | `capture_ts` | Optional ISO-8601 UTC. The **capture** timestamp — the moment the protocol read the value (a mediating server's stamp, e.g. an OPC UA server's). Published as the sample's `serverTs`. |
-| | `received_ts` | Optional ISO-8601 UTC. The **adapter receive** timestamp — auto-stamped by the worker at read completion when the backend leaves it `None`. |
-| [`SignalInfo`] | `id`, `name` | One entry of the **inventory** (`sb/signals`) — known from config/backend without a device round-trip. |
-| [`BrowsedSignal`] | `id`, `name`, `type_name` | One entry discovered by [`browse`] — a signal the device *offers*, whether or not it is configured. `type_name` is the device-native type string, kept verbatim (`"REAL"`, `"holding/uint16"`, whatever your protocol calls it). |
+| Field | Meaning |
+|---|---|
+| `signal_id` | The canonical, stable id the rest of the fleet keys on — the configured `signal.id`, never the MTConnect `dataItemId` directly (though they are commonly equal). |
+| `name` | An optional human label. |
+| `value` | The decoded value, as JSON — see "Value typing by MTConnect category" below. |
+| `quality` | Normalized `Good` \| `Bad` \| `Uncertain`. |
+| `quality_raw` | The protocol-native status/code, kept verbatim for diagnosis — see the table below. |
+| `source_ts` | Always absent for MTConnect: there is no device-authored timestamp distinct from the agent's own capture stamp. |
+| `capture_ts` | The agent's own observation timestamp (the `timestamp` attribute on the `Streams`/`Current` element) — published as the sample's `serverTs`. |
+| `received_ts` | Auto-stamped by the worker at read completion for every reading the backend does not stamp itself. |
+| `extra` | Protocol extras that ride every sample: `sequence` (the agent's once-only ordering key) always; `resetTriggered`, `nativeCode`, `sampleRate`, `statistic`, `duration` when the observation carries them. |
+| `channel` | An explicit UNS channel override, from `signal.channel`. |
+
+## Value typing by MTConnect category
+
+MTConnect's `SAMPLE`/`EVENT`/`CONDITION` categories decode to different JSON shapes:
+
+- **SAMPLE** (a measured quantity — position, speed, load, temperature): a single JSON number, or a
+  JSON array of numbers for a **TimeSeries** representation or a vector unit (`MILLIMETER_3D` and
+  similar) — whitespace-separated numeric tokens in the element text become one array, in order.
+  Anything that is not a clean numeric vector falls back to a string rather than being coerced.
+- **EVENT** (a discrete or enumerated state — `execution`, `mode`, a part count): the element's text,
+  verbatim, as a JSON string — **unless** the device model says the type is numeric (it has `units`,
+  or the type is one of `PART_COUNT`, `LINE`, `LINE_NUMBER`, `TOOL_NUMBER`, `SEQUENCE_NUMBER`,
+  `PATH_FEEDRATE_OVERRIDE`, `ROTARY_VELOCITY_OVERRIDE`), in which case it decodes as a JSON number.
+- **CONDITION** (an alarm/diagnostic state — `Xtravel`, a limit switch): the value **is the state
+  name itself** — `"NORMAL"`, `"WARNING"`, `"FAULT"`, or `"UNAVAILABLE"` — read off the observation
+  element's own tag name (`<Normal>`, `<Warning>`, `<Fault>`, `<Unavailable>`), never guessed.
+  Unrecognized condition element names default to `UNAVAILABLE` — a state this client cannot read
+  must not look healthy. See [Conditions](#conditions-state-as-value-and-as-a-quality-modifier)
+  below for how the same data item can also *degrade another signal's quality*.
+- **DataSet / Table representation** (a data item whose `representation` attribute is `DATA_SET` or
+  `TABLE`): decodes to a JSON object keyed by each `<Entry key="...">`'s key; `TABLE` entries nest one
+  level via `<Cell key="...">` children. An entry marked `removed="true"` becomes an explicit JSON
+  `null` — "this key is gone" is not the same as "this key was never present".
+
+A data item this client's cached model does not (yet) know about still decodes — conservatively, from
+the observation element itself rather than the model — because a stream can outrun a re-probe by a
+moment; it is never silently dropped for lack of metadata.
+
+## `UNAVAILABLE`
+
+MTConnect's own `UNAVAILABLE` state (a device that has not yet reported a value, or a data item that
+temporarily cannot be read) is never coerced to `0`, `""`, or omitted. It publishes as an **explicit
+JSON `null`** with `quality: BAD` and `qualityRaw: "UNAVAILABLE"` — a legitimate protocol answer,
+deliberately published, and structurally different from a signal that has simply not changed.
+
+## Conditions: state-as-value, and as a quality modifier
+
+A CONDITION data item is a signal like any other — configure it directly and its own state
+(`NORMAL`/`WARNING`/`FAULT`/`UNAVAILABLE`) publishes as that signal's value. Additionally, any
+*other* signal's `conditionBinding[]` can name one or more CONDITION data items to fold their state
+into that signal's own quality, without changing its value:
+
+| Condition state | Bound signal's quality | `qualityRaw` |
+|---|---|---|
+| `Normal` | unaffected (stays whatever the value's own quality was) | — |
+| `Warning` | degrades to `Uncertain` (never *improves* a worse quality) | `MTC_CONDITION:WARNING[:<nativeCode>]` |
+| `Fault` | degrades to `Bad` | `MTC_CONDITION:FAULT[:<nativeCode>]` |
+| `Unavailable` | degrades to `Bad` | `UNAVAILABLE` |
+
+When a signal binds more than one condition, the **worst** currently-observed state wins
+(`Fault` > `Unavailable` > `Warning` > `Normal`). A condition's own severity — not its data-item id —
+decides which one is reported.
 
 ## Quality
 
 `Quality::Good` / `Bad` / `Uncertain`, published on the wire as `"GOOD"` / `"BAD"` / `"UNCERTAIN"`.
-The simulator only ever produces `Good` (`temperature-1`) and `Bad` (`pressure-1`, always faulted,
-with `quality_raw: "SENSOR_FAULT"` and `value: null`) — `Uncertain` is unused by the simulated
-backend but common in a real one: a stale cached read, a value outside its calibrated range, a
-sensor that answered but warned. Use it when your protocol has that middle state; if it does not,
-`Good`/`Bad` alone is a perfectly honest mapping.
+For the real MTConnect backend, `quality_raw` follows one fixed vocabulary:
 
-**The rule that matters:** a read that fails for *one* signal should still return that signal (with
-`Quality::Bad` and a `null` value) rather than being omitted from the `Vec<Reading>` `read_signals`
-returns. A signal that silently stops appearing is indistinguishable from one that has not changed;
-a signal published with `BAD` quality is unambiguous.
+| `qualityRaw` | When |
+|---|---|
+| `MTC_OK` | A normal, in-range scalar or vector reading. |
+| `UNAVAILABLE` | The data item's own value is MTConnect `UNAVAILABLE`. |
+| `MTC_NO_SUCH_DATAITEM` | The configured `dataItemId` is not present in the device's current probe model. |
+| `MTC_CONDITION:WARNING[:<code>]` / `MTC_CONDITION:FAULT[:<code>]` | A bound condition degraded this signal — see above. |
 
-## What a real protocol typically adds
+The built-in simulator only ever produces `Good` (`temperature-1`, `quality_raw: "OK"`) and `Bad`
+(`pressure-1`, always faulted, `quality_raw: "SENSOR_FAULT"`, `value: null`) — proof that a failed
+reading is **published**, never swallowed, independent of which backend is in use.
 
-A fixed-register protocol (Modbus) or a typed-node protocol (OPC UA) usually needs more structure
-than "an opaque JSON value" to decode/encode correctly. Two well-worn patterns from the reference
-adapters:
+## Timestamps — the four-slot model
 
-- **A per-signal type + layout descriptor**, analogous to Modbus's `table`/`address`/`type`/
-  `wordOrder`/`byteOrder`/`scale`/`bit` — carried in your extension of `ConnectionConfig`'s
-  (deliberately open) config schema, and used inside your `DeviceSession::read_signals`/
-  `write_signal` implementation to convert between the wire representation and the JSON `value`
-  this seam expects.
-- **A stable, protocol-derived `signal.id`** distinct from the human `name` — Modbus's
-  `u<unitId>/<table>/<address>/<type>`, OPC UA's `ns=<n>;i=<id>`. Keep it independent of any
-  topic/config ordering, so a redeployment that reorders your config does not change which physical
-  point a `signal.id` refers to.
+A `Reading` carries up to three optional ISO-8601 UTC timestamps, never synthesized from one another
+(the fourth slot — the publish moment — is the envelope header's, stamped by the library):
+
+- **`capture_ts`** becomes the sample's `serverTs` — for MTConnect, this is always the agent's own
+  observation `timestamp` attribute, since the agent is the mediating server between the physical
+  controller and this client.
+- **`received_ts`** is auto-stamped by the worker at read completion for every reading the backend
+  did not stamp itself, and additionally rides as a per-sample `receivedTs` extra only when it
+  differs from the effective `serverTs` — i.e., whenever there was a capture stamp to compare it
+  against.
+- **`source_ts`** would ride as `sourceTs` if the device supplied a machine-authored time distinct
+  from the agent's; MTConnect has no such concept, so this slot is always `None` for the real
+  backend and `sourceTs` never appears on an MTConnect sample.
+
+```jsonc
+{ "value": 123.456, "quality": "GOOD", "qualityRaw": "MTC_OK",
+  "serverTs": "2026-07-27T10:00:04.250000Z",
+  "receivedTs": "2026-07-27T10:00:04.900000Z",
+  "extra": { "sequence": 44821 } }
+```
 
 ## Published identity
 
-Every `SouthboundSignalUpdate` carries, in `body.signal`:
+Every `SouthboundSignalUpdate` carries, in `body.signal`: `id` (the stable id above) and `name` (the
+optional human label). `device.adapter` (`"mtconnect"` or `"sim"`) and `device.endpoint`
+(`mtconnect://<host>[:<port>]/<uuid>` for a real device, `sim://<id>` for the simulator) accompany
+every reading, so a consumer can always tell which backend and which physical connection a value
+came from, independent of `signal.id`.
 
-- `id` — the stable id (see above).
-- `name` — the optional human label, when the backend has one (the simulator always sets one).
+## The probe address (`sb/signals[].address`, `sb/browse` entries)
 
-`device.adapter` (the `DeviceBackend::kind()` string) and `device.endpoint`
-(`ConnectionConfig::endpoint`) accompany every reading, so a consumer can always tell which backend
-and which physical connection a value came from, independent of `signal.id`.
+Once an `mtconnect`-adapter instance has been probed at least once, its cached model supplies a
+round-trippable, non-secret address for every data item — see
+[reference/messaging-interface.md](messaging-interface.md) for the full `sb/signals`/`sb/browse`
+shapes:
 
-## Value typing notes
+```jsonc
+{ "protocol": "mtconnect", "agentId": "line-a-agent", "deviceUuid": "OKUMA.123456",
+  "dataItemId": "Xabs", "category": "SAMPLE", "type": "POSITION", "subType": "ACTUAL",
+  "componentPath": "Axes/Linear[X]" }
+```
 
-- `bool` is a JSON boolean; numeric readings are JSON numbers (the simulator emits `f64`); a failed
-  reading emits JSON `null`.
-- There is no scale/offset or byte/word-order layer in the seam itself — build it into your
-  `DeviceSession` implementation if your protocol's wire format needs it (see above).
-- **Timestamps — the four-slot model.** A [`Reading`] carries up to three optional ISO-8601 UTC
-  timestamps, never synthesized from one another (the fourth slot — the publish moment — is the
-  envelope header's, stamped by the library): `capture_ts` becomes the sample's `serverTs`, falling
-  back to `received_ts` when the backend sets no capture stamp (a direct client's receive moment IS
-  the capture moment); `received_ts` is auto-stamped by the worker at read completion for every
-  reading the backend did not stamp itself, and additionally rides as a per-sample `receivedTs`
-  extra only when a mediating server makes it differ from the effective `serverTs`; `source_ts`
-  rides as `sourceTs` only when the device supplied it. The simulator sets none of the three (it
-  has no device clock), so its samples' `serverTs` is the worker's receive stamp and nothing else.
-
-[`Reading`]: ../../src/device.rs
-[`SignalInfo`]: ../../src/device.rs
-[`BrowsedSignal`]: ../../src/device.rs
-[`browse`]: ../../src/device.rs
+Every field the probe supplies is `null` until the device has been probed — the binding keys
+(`protocol`/`agentId`/`deviceUuid`/`dataItemId`) are configuration and always known immediately.

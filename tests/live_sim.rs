@@ -50,7 +50,10 @@ async fn connects_polls_once_and_asserts_readings_and_quality() {
             r.signal_id
         );
         if r.quality == Quality::Good {
-            assert!(!r.value.is_null(), "a GOOD reading must carry a value");
+            assert!(
+                r.value.as_ref().is_some_and(|v| !v.is_null()),
+                "a GOOD reading must carry a value"
+            );
         }
     }
 
