@@ -20,11 +20,14 @@
 use std::time::Duration;
 
 use mtconnect_adapter::mtconnect::config::{parse_agents, AgentCredentials};
-use mtconnect_adapter::mtconnect::{AgentRuntime, InstanceEvent, MtcClient, ObsValue};
+use mtconnect_adapter::mtconnect::{
+    AgentRuntime, InstanceEvent, InstanceReceiver, MtcClient, ObsValue,
+};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -144,22 +147,27 @@ fn runtime(url: &str, extra: serde_json::Value) -> Arc<AgentRuntime> {
     let cfg = parse_agents(&json!({ "agents": [entry] }))
         .unwrap()
         .remove(0);
-    AgentRuntime::new(cfg, &AgentCredentials::default()).unwrap()
+    AgentRuntime::new(
+        cfg,
+        &AgentCredentials::default(),
+        edgecommons::facades::system_clock(),
+    )
+    .unwrap()
 }
 
 /// Wait (bounded) for the next event matching the predicate, discarding others.
 async fn wait_for(
-    rx: &mut tokio::sync::mpsc::Receiver<InstanceEvent>,
+    rx: &mut InstanceReceiver,
     secs: u64,
     what: &str,
     mut pred: impl FnMut(&InstanceEvent) -> bool,
 ) -> InstanceEvent {
     tokio::time::timeout(Duration::from_secs(secs), async {
         loop {
-            let event = rx.recv().await.expect("event channel open");
-            if pred(&event) {
-                return event;
+            if let Some(found) = rx.drain().into_iter().find(&mut pred) {
+                return found;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -187,7 +195,7 @@ async fn observations_flow_probe_snapshot_then_stream() {
 
     let rt = runtime(&url, json!({}));
     let mut handle = rt.attach(DEV_ONE);
-    rt.spawn().unwrap();
+    rt.spawn(CancellationToken::new()).unwrap();
 
     // The /current snapshot carries the fed values.
     wait_for(&mut handle.rx, 20, "the snapshot with the fed value", |e| {
@@ -242,7 +250,7 @@ async fn an_agent_restart_changes_the_instance_and_the_machine_resyncs() {
 
     let rt = runtime(&url, json!({}));
     let mut handle = rt.attach(DEV_ONE);
-    rt.spawn().unwrap();
+    rt.spawn(CancellationToken::new()).unwrap();
     wait_for(&mut handle.rx, 20, "pre-restart data", |e| {
         matches!(e, InstanceEvent::Snapshot(obs)
             if obs.iter().any(|o| o.data_item_id == "d1-Xabs" && scalar_eq(&o.value, 20.5)))
@@ -329,7 +337,7 @@ async fn a_buffer_wrap_is_recovered_without_wedging_the_machine() {
         json!({ "heartbeatMs": 1_000, "requestTimeoutMs": 15_000 }),
     );
     let mut handle = rt.attach(DEV_TINY);
-    rt.spawn().unwrap();
+    rt.spawn(CancellationToken::new()).unwrap();
     wait_for(&mut handle.rx, 20, "initial tiny-agent data", |e| {
         matches!(e, InstanceEvent::Snapshot(_))
     })
@@ -347,7 +355,11 @@ async fn a_buffer_wrap_is_recovered_without_wedging_the_machine() {
     let mut saw_degraded = false;
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            match handle.rx.recv().await.expect("event channel open") {
+            let Some(event) = handle.rx.drain().into_iter().next() else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            };
+            match event {
                 InstanceEvent::DataLoss { skipped } => {
                     saw_data_loss = true;
                     println!("EVIDENCE ladder 2: DataLoss skipped={skipped}");
@@ -410,7 +422,7 @@ async fn one_agent_runtime_demultiplexes_two_live_devices() {
     let rt = runtime(&url, json!({}));
     let mut h1 = rt.attach(DEV_ONE);
     let mut h2 = rt.attach(DEV_TWO);
-    rt.spawn().unwrap();
+    rt.spawn(CancellationToken::new()).unwrap();
 
     one.send("|Xabs|77.7");
     two.send("|Ypos|88.8");
@@ -574,7 +586,7 @@ async fn a_batched_signal_coalesces_live_streamed_readings_into_one_update() {
     use std::time::Instant;
 
     let rt = runtime(&url, json!({}));
-    rt.spawn().unwrap(); // streaming acquisition: read_signals drains what the task delivers
+    rt.spawn(CancellationToken::new()).unwrap(); // streaming acquisition: read_signals drains what the task delivers
     let device = DeviceConfig {
         id: "tiny".into(),
         agent_id: "live-agent".into(),

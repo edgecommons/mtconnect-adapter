@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use edgecommons::prelude::*;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::app::{
     build_sample, compile_mtconnect, connectivity_of, set_paused, stamp_received, Backoff,
@@ -156,7 +157,12 @@ impl App {
                 .map_err(|e| anyhow::anyhow!(e))?;
             let id = cfg.id.clone();
             tracing::info!(agent = %id, url = %cfg.url, mode = ?cfg.streaming, "agent runtime configured");
-            agents.insert(id, AgentRuntime::new(cfg, &creds)?);
+            // The library's own clock, injected across the isolation seam: `src/mtconnect/**`
+            // stamps arrival with it without ever importing `edgecommons`.
+            agents.insert(
+                id,
+                AgentRuntime::new(cfg, &creds, edgecommons::facades::system_clock())?,
+            );
         }
         let mtconnect = Arc::new(MtcBackend::new(agents.clone(), mtc_devices, budgets));
         let signals = mtconnect.signals();
@@ -191,7 +197,9 @@ impl App {
         // The shared acquisition tasks start BEFORE any instance supervisor: an instance attaches
         // to a running agent runtime, it does not start one.
         for agent in self.agents.values() {
-            agent.spawn();
+            // Each acquisition task carries its own cancellation token; the structured shutdown
+            // sequence that builds the token tree is the supervisor's next piece of work.
+            agent.spawn(CancellationToken::new());
             // One emitter per AGENT for the acquisition families (HLD §9): the stream is shared by
             // every device on it, so it is measured once rather than once per attached instance.
             let am = Arc::new(AgentMetrics::new(
@@ -262,6 +270,8 @@ impl App {
                 dm,
                 health,
                 control_rx,
+                self.stale_signal_secs,
+                CancellationToken::new(),
             ));
         }
 
@@ -300,6 +310,7 @@ impl App {
 ///
 /// The connect loop and the poll loop are nested on purpose. A read failure that breaks the link
 /// drops out of the poll loop and back into connect — the only place that knows how to back off.
+#[allow(clippy::too_many_arguments)]
 async fn run_device(
     cfg: DeviceConfig,
     backend: Arc<dyn DeviceBackend>,
@@ -308,6 +319,8 @@ async fn run_device(
     dm: Arc<DeviceMetrics>,
     health: Arc<Health>,
     mut control: mpsc::Receiver<DeviceControl>,
+    stale_signal_secs: u64,
+    cancel: CancellationToken,
 ) {
     let backoff = Backoff::default();
     let mut attempt: u32 = 0;
@@ -376,24 +389,20 @@ async fn run_device(
         };
 
         // --- POLL (until the link breaks or a reconnect is requested) ---
-        // The inventory ids back the resume-time snapshot (HLD §7: resume snapshots first).
-        let inventory: Vec<String> = backend
-            .inventory(&cfg.connection)
-            .into_iter()
-            .map(|s| s.id)
-            .collect();
         // The session just compiled its signals against the device model: the gauge reports what is
         // really being served, not what was merely configured.
         sync_served_signals(session.as_ref(), &health);
         let exit = run_polling(
             &cfg,
             session,
+            &backend,
             &data,
             &events,
             &dm,
             &health,
             &mut control,
-            &inventory,
+            stale_signal_secs,
+            cancel.clone(),
         )
         .await;
 
@@ -451,13 +460,26 @@ enum PollExit {
 async fn run_polling(
     cfg: &DeviceConfig,
     mut session: Box<dyn crate::device::DeviceSession>,
+    backend: &Arc<dyn DeviceBackend>,
     data: &DataFacade,
     events: &EventsFacade,
     dm: &Arc<DeviceMetrics>,
     health: &Arc<Health>,
     control: &mut mpsc::Receiver<DeviceControl>,
-    inventory: &[String],
+    stale_signal_secs: u64,
+    cancel: CancellationToken,
 ) -> PollExit {
+    // Landed with the final signature so later work changes bodies, not call sites:
+    // `stale_signal_secs` is the passive-quality expiry threshold and `cancel` is the structured
+    // shutdown token the select arms are preempted by.
+    let _ = (stale_signal_secs, &cancel);
+    // The inventory ids back the resume-time snapshot (HLD §7: resume snapshots first).
+    let inventory: Vec<String> = backend
+        .inventory(&cfg.connection)
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    let inventory = inventory.as_slice();
     let mut ticker = tokio::time::interval(Duration::from_millis(cfg.poll_interval_ms));
     let mut since_metrics = Instant::now();
 

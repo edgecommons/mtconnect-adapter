@@ -29,7 +29,6 @@ use std::time::Instant;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
 use url::Url;
 
 /// One reading from the device.
@@ -302,6 +301,13 @@ pub trait DeviceSession: Send + Sync {
     /// deadband (the first reading after a resync always passes). Draining it resets it.
     fn take_resync(&mut self) -> bool {
         false
+    }
+
+    /// The link facts passive-quality evaluation needs. `None` (the default) means this backend has
+    /// no **mediated** liveness — its read IS its liveness (the simulator), so there is nothing a
+    /// watchdog could observe between reads.
+    fn passive_input(&self) -> Option<crate::staleness::PassiveLink> {
+        None
     }
 
     /// Close the connection. Must be safe to call twice.
@@ -646,7 +652,7 @@ use crate::mtconnect::config::{DeviceConfig as MtcDeviceConfig, PublishMode, Sig
 use crate::mtconnect::model::{Category, ProbeModel};
 use crate::mtconnect::observations::{CondState, ObsValue, Observation};
 use crate::mtconnect::selection::{served_set, ServedSignal};
-use crate::mtconnect::{AgentRuntime, InstanceEvent, MtcError};
+use crate::mtconnect::{AgentRuntime, InstanceEvent, InstanceReceiver, MtcError};
 use crate::reload::{SignalRegistry, SignalSlot};
 
 /// The `adapter` value that selects this backend.
@@ -822,7 +828,20 @@ impl DeviceBackend for MtcBackend {
             })?
             .clone();
 
-        // "Connected" means the agent answered AND this device is really in its probe.
+        // "Connected" means the agent is DELIVERING (HLD §5.1 state 1: reachable, probe verified,
+        // AND delivering) — not merely that a model was cached once. `ensure_model` answers from
+        // that cache without touching the network, so treating it as proof of liveness is what let
+        // an instance report ONLINE, emit `device-connected` and clear `device-unreachable` against
+        // a dead agent, forever. The shared runtime's own published state is the only authority
+        // (D-R1); an instance stays CONNECTING/BACKOFF until acquisition has really delivered.
+        if !agent.info().connected {
+            return Err(DeviceError::Transient(anyhow::anyhow!(
+                "agent `{}` is not delivering ({})",
+                device.agent_id,
+                agent.last_down_reason()
+            )));
+        }
+        // ...and that this device is really in the agent's probe.
         let model = agent
             .ensure_model(&device.device_uuid)
             .await
@@ -926,7 +945,7 @@ pub struct MtcSession {
     /// The generation currently compiled — compared against the slot to notice a reload.
     generation: String,
     model: Arc<ProbeModel>,
-    rx: mpsc::Receiver<InstanceEvent>,
+    rx: InstanceReceiver,
     /// The latest state of every CONDITION data item this device published, with its native code —
     /// what `conditionBinding` degrades against.
     conditions: HashMap<String, (CondState, Option<String>)>,
@@ -960,7 +979,7 @@ impl MtcSession {
         agent: Arc<AgentRuntime>,
         device: MtcDeviceConfig,
         model: Arc<ProbeModel>,
-        rx: mpsc::Receiver<InstanceEvent>,
+        rx: InstanceReceiver,
     ) -> Self {
         let generation = crate::reload::generation_of(&device.signals, device.selection.as_ref());
         let mut session = Self {
@@ -990,7 +1009,7 @@ impl MtcSession {
         agent: Arc<AgentRuntime>,
         device: MtcDeviceConfig,
         model: Arc<ProbeModel>,
-        rx: mpsc::Receiver<InstanceEvent>,
+        rx: InstanceReceiver,
         slot: Arc<SignalSlot>,
     ) -> Self {
         let mut session = Self::new(agent, device, model, rx);
@@ -1345,10 +1364,10 @@ impl DeviceSession for MtcSession {
     async fn read_signals(&mut self) -> Result<Vec<Reading>> {
         self.adopt_current_signals();
         let mut observations = Vec::new();
-        let mut down: Option<String> = None;
         let mut drifted = false;
 
-        while let Ok(event) = self.rx.try_recv() {
+        let events = self.rx.drain();
+        for event in events {
             self.note(&event);
             match event {
                 InstanceEvent::Obs(obs) => observations.push(*obs),
@@ -1359,8 +1378,8 @@ impl DeviceSession for MtcSession {
                     observations.extend(batch);
                 }
                 InstanceEvent::ModelDrift { .. } => drifted = true,
-                InstanceEvent::AgentDown(reason) => down = Some(reason),
-                InstanceEvent::AgentUp(_)
+                InstanceEvent::AgentDown(_)
+                | InstanceEvent::AgentUp(_)
                 | InstanceEvent::DataLoss { .. }
                 | InstanceEvent::StreamDegraded { .. } => {}
             }
@@ -1368,10 +1387,15 @@ impl DeviceSession for MtcSession {
         if drifted {
             self.adopt_current_model();
         }
-        // The agent went away: the supervisor's reconnect ladder owns what happens next.
-        if let Some(reason) = down {
+        // ONE connectivity authority, consulted EVERY drain: the shared runtime's own published
+        // state, never a remembered event. A drained `AgentDown` becomes its operator event above,
+        // but it is this check that moves the supervisor — so a session that attached after the
+        // agent went down, or that missed the transition entirely, cannot stay ONLINE against a
+        // runtime that is not delivering.
+        if !self.agent.info().connected {
             return Err(DeviceError::Transient(anyhow::anyhow!(
-                "agent unreachable: {reason}"
+                "agent unreachable: {}",
+                self.agent.last_down_reason()
             )));
         }
 
@@ -1483,6 +1507,7 @@ impl DeviceSession for MtcSession {
                 batch_ms: p.batch_ms,
                 latest_only: p.mode == PublishMode::Interval,
                 deadband: if is_sample { p.deadband } else { None },
+                route: crate::shaping::SignalRoute::default(),
             };
             if !policy.is_trivial() {
                 out.insert(sig.id.clone(), policy);
@@ -1493,6 +1518,18 @@ impl DeviceSession for MtcSession {
 
     fn take_resync(&mut self) -> bool {
         std::mem::take(&mut self.resynced)
+    }
+
+    /// The link half of passive quality: this instance's acquisition is **mediated** by a shared
+    /// agent runtime, so a value can be held long after the link that produced it went quiet. The
+    /// facts come from the one connectivity authority and its liveness clock — never re-derived
+    /// here.
+    fn passive_input(&self) -> Option<crate::staleness::PassiveLink> {
+        Some(crate::staleness::PassiveLink {
+            unreachable: !self.agent.info().connected,
+            liveness_age: self.agent.liveness_age(Instant::now()),
+            liveness_window: self.agent.liveness_window(),
+        })
     }
 
     /// `sb/browse`: the probe tree, paged out of the cached model — so the address space stays
@@ -1669,11 +1706,27 @@ mod mtconnect_seam_tests {
     use crate::mtconnect::config::{parse_agents, AgentCredentials};
     use crate::mtconnect::model::Category;
     use crate::mtconnect::xml::{parse_devices, parse_streams};
+    use crate::mtconnect::{instance_queue, InstanceSender};
     use serde_json::json;
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     const DEVICES_2_7: &str = include_str!("../tests/fixtures/devices_2.7.xml");
     const CURRENT_2_7: &str = include_str!("../tests/fixtures/current_2.7.xml");
+
+    /// A test clock: fixed, so nothing in these tests reads the wall clock.
+    fn clock() -> crate::mtconnect::ClockFn {
+        Arc::new(|| "2026-01-01T00:00:00Z".to_string())
+    }
+
+    /// Bring a runtime up the way production does — by ingesting a document. `connect` and every
+    /// drain consult `info().connected`, so a test that wants a live session must deliver first.
+    async fn deliver(agent: &Arc<AgentRuntime>) {
+        agent
+            .ingest_streams(CURRENT_2_7, false)
+            .await
+            .expect("the fixture parses");
+    }
 
     fn model() -> Arc<ProbeModel> {
         Arc::new(
@@ -1737,7 +1790,7 @@ mod mtconnect_seam_tests {
             "requestTimeoutMs": 300 }] }))
         .unwrap()
         .remove(0);
-        AgentRuntime::new(cfg, &AgentCredentials::default()).unwrap()
+        AgentRuntime::new(cfg, &AgentCredentials::default(), clock()).unwrap()
     }
 
     fn connection(agent: &str, uuid: &str) -> ConnectionConfig {
@@ -1949,7 +2002,7 @@ mod mtconnect_seam_tests {
     fn several_signals_may_share_one_data_item() {
         let device = device(vec![signal("x-a", "Xabs"), signal("x-b", "Xabs")]);
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let mut session = MtcSession::new(agent, device, model(), rx);
         let readings = session.map_batch(&[obs("Xabs")]);
         assert_eq!(readings.len(), 2);
@@ -1970,7 +2023,7 @@ mod mtconnect_seam_tests {
         // R1.1 at the seam: the session's served set is the explicit signals merged with the
         // selection-derived half against its cached model.
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let mut session = MtcSession::new(
             agent,
             selecting(
@@ -2043,7 +2096,7 @@ mod mtconnect_seam_tests {
     fn a_derived_signal_carries_the_untruncated_path_its_channel_was_shortened_from() {
         // L12 shortens the *channel* to the topic budget; the stamped path is never shortened.
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let mut session = MtcSession::new(
             agent,
             selecting(vec![], serde_json::json!({ "mode": "all" })),
@@ -2065,7 +2118,7 @@ mod mtconnect_seam_tests {
         // The permanent-BAD case. `sb/signals` answers `address.componentPath: null` for it
         // (`unlearned_address`), and the reading agrees by carrying `None`.
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let session = MtcSession::new(
             agent,
             device(vec![signal("ghost", "no-such-item")]),
@@ -2105,7 +2158,7 @@ mod mtconnect_seam_tests {
         let plain = signal("x-load", "Xload"); // no publish block: not worth a table entry
 
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let session = MtcSession::new(
             agent,
             device(vec![sample, event, condition, unbound, plain]),
@@ -2145,7 +2198,7 @@ mod mtconnect_seam_tests {
         sig.publish =
             Some(serde_json::from_value(json!({ "mode": "interval", "batchMs": 500 })).unwrap());
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let session = MtcSession::new(agent, device(vec![sig]), model(), rx);
         assert!(session.shaping_policies()["x-position"].latest_only);
     }
@@ -2160,7 +2213,7 @@ mod mtconnect_seam_tests {
             sel.default_publish_mode = PublishMode::Interval;
         }
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let session = MtcSession::new(agent, dev, model(), rx);
         let policies = session.shaping_policies();
         assert_eq!(
@@ -2184,7 +2237,7 @@ mod mtconnect_seam_tests {
     #[test]
     fn the_shaping_generation_moves_with_the_signal_set_and_the_model() {
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let mut session = MtcSession::new(
             Arc::clone(&agent),
             device(vec![signal("x", "Xabs")]),
@@ -2217,22 +2270,21 @@ mod mtconnect_seam_tests {
     #[tokio::test]
     async fn a_drained_snapshot_marks_the_session_resynced_once() {
         let agent = runtime("http://127.0.0.1:9");
-        let (tx, rx) = mpsc::channel(8);
+        deliver(&agent).await;
+        let cancel = CancellationToken::new();
+        let (tx, rx) = instance_queue();
         let mut session = MtcSession::new(agent, device(vec![signal("x", "Xabs")]), model(), rx);
         assert!(!session.take_resync(), "nothing drained yet");
 
-        tx.send(InstanceEvent::Snapshot(vec![obs("Xabs")]))
-            .await
-            .unwrap();
+        tx.send_critical(InstanceEvent::Snapshot(vec![obs("Xabs")]), &cancel)
+            .await;
         let readings = session.read_signals().await.unwrap();
         assert!(!readings.is_empty());
         assert!(session.take_resync(), "the snapshot re-baselined the view");
         assert!(!session.take_resync(), "draining it resets it");
 
         // A plain observation is NOT a resync.
-        tx.send(InstanceEvent::Obs(Box::new(obs("Xabs"))))
-            .await
-            .unwrap();
+        tx.send_data(Box::new(obs("Xabs")));
         session.read_signals().await.unwrap();
         assert!(!session.take_resync());
     }
@@ -2338,6 +2390,9 @@ mod mtconnect_seam_tests {
     #[tokio::test]
     async fn reading_drains_what_the_agent_delivered_and_says_nothing_when_nothing_changed() {
         let agent = runtime("http://127.0.0.1:9");
+        // The agent is delivering before the instance attaches — a device link is only ever opened
+        // behind that gate. (Nothing was attached, so no dedupe floor was recorded.)
+        deliver(&agent).await;
         let handle = agent.attach("OKUMA.123456");
         let device = device(vec![
             signal("x-position", "Xabs"),
@@ -2345,10 +2400,10 @@ mod mtconnect_seam_tests {
         ]);
         let mut session = MtcSession::new(Arc::clone(&agent), device, model(), handle.rx);
 
-        // Nothing delivered yet: an empty read, not a failure.
+        // Nothing delivered to THIS instance yet: an empty read, not a failure.
         assert!(session.read_signals().await.unwrap().is_empty());
 
-        agent.ingest_streams(CURRENT_2_7, false).unwrap();
+        agent.ingest_streams(CURRENT_2_7, false).await.unwrap();
         let readings = session.read_signals().await.unwrap();
         assert_eq!(
             readings.len(),
@@ -2364,13 +2419,14 @@ mod mtconnect_seam_tests {
         assert_eq!(load.quality, Quality::Bad);
 
         // The same document again publishes nothing: `/current` repeats itself, an update does not.
-        agent.ingest_streams(CURRENT_2_7, false).unwrap();
+        agent.ingest_streams(CURRENT_2_7, false).await.unwrap();
         assert!(session.read_signals().await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn an_unbound_signal_is_reported_bad_every_cycle_rather_than_dropped() {
         let agent = runtime("http://127.0.0.1:9");
+        deliver(&agent).await;
         let handle = agent.attach("OKUMA.123456");
         let device = device(vec![signal("ghost", "NOT-IN-MODEL")]);
         let mut session = MtcSession::new(agent, device, model(), handle.rx);
@@ -2398,7 +2454,7 @@ mod mtconnect_seam_tests {
         );
 
         // Bring it up, then knock it down.
-        agent.ingest_streams(CURRENT_2_7, false).unwrap();
+        agent.ingest_streams(CURRENT_2_7, false).await.unwrap();
         session.read_signals().await.unwrap();
         assert!(
             agent.poll_once().await.is_err(),
@@ -2412,21 +2468,112 @@ mod mtconnect_seam_tests {
             e.is_transient(),
             "reconnecting is exactly the right response"
         );
+        assert!(
+            e.to_string().contains(&agent.last_down_reason()),
+            "the session reports the authority's latched reason: {e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_that_attaches_after_the_agent_died_cannot_report_online() {
+        // The P1-1 scenario at the seam. The agent delivered once, then died; a session created
+        // AFTER the AgentDown transition never saw the broadcast — and used to keep reporting
+        // ONLINE forever, because nothing else ever asked.
+        let agent = runtime("http://127.0.0.1:9");
+        deliver(&agent).await;
+        assert!(
+            agent.poll_once().await.is_err(),
+            "the agent is not listening"
+        );
+        assert!(!agent.info().connected);
+
+        let handle = agent.attach("OKUMA.123456");
+        let mut session = MtcSession::new(
+            Arc::clone(&agent),
+            device(vec![signal("x", "Xabs")]),
+            model(),
+            handle.rx,
+        );
+
+        // (a) The newborn queue was seeded with the current truth, so the operator event still
+        //     fires even though this session missed the transition...
+        let Err(e) = session.read_signals().await else {
+            panic!("a session must never read OK against a runtime that is not delivering")
+        };
+        // (b) ...and the read fails Transient, so the supervisor's reconnect ladder owns it.
+        assert!(e.is_transient(), "{e}");
+        let notices = session.take_notices();
+        assert_eq!(
+            notices.len(),
+            1,
+            "the seeded AgentDown became its event: {notices:?}"
+        );
+        assert_eq!(notices[0].context["state"], json!("down"));
+        assert_eq!(
+            notices[0].context["reason"],
+            json!(agent.last_down_reason())
+        );
+
+        // ...and it stays that way on every subsequent drain, with nothing left in the queue to
+        // remember: the authority is re-consulted, not a remembered event.
+        assert!(
+            session.read_signals().await.is_err(),
+            "stickiness is structurally impossible"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_passive_link_facts_mirror_the_connectivity_authority() {
+        let agent = runtime("http://127.0.0.1:9");
+        let handle = agent.attach("OKUMA.123456");
+        let session = MtcSession::new(Arc::clone(&agent), device(vec![]), model(), handle.rx);
+
+        // Before first contact: unreachable, and no age to judge.
+        let cold = session
+            .passive_input()
+            .expect("an agent-mediated session has link facts");
+        assert!(cold.unreachable);
+        assert_eq!(cold.liveness_age, None);
+        // Poll mode: two missed polls (the config default is 1000 ms).
+        assert_eq!(cold.liveness_window, Duration::from_millis(2_000));
+
+        deliver(&agent).await;
+        let live = session.passive_input().expect("link facts");
+        assert!(!live.unreachable, "the authority says it is delivering");
+        assert!(live
+            .liveness_age
+            .is_some_and(|age| age < Duration::from_secs(1)));
+
+        // The simulator's read IS its liveness: there is nothing for a watchdog to observe.
+        let sim_conn: ConnectionConfig =
+            serde_json::from_value(json!({ "endpoint": "sim://plc-1" })).unwrap();
+        let sim = SimBackend.connect(&sim_conn).await.unwrap();
+        assert!(sim.passive_input().is_none());
     }
 
     // --- protocol notices -> UNS events (HLD §9) ------------------------------------------------
 
-    /// A session fed from a channel the test owns, so every runtime event can be delivered
-    /// deliberately — including the ones a fake agent could not be made to produce on demand.
-    fn scripted_session(signals: Vec<SignalConfig>) -> (MtcSession, mpsc::Sender<InstanceEvent>) {
+    /// A session fed from a queue the test owns, so every runtime event can be delivered
+    /// deliberately — including the ones a fake agent could not be made to produce on demand. The
+    /// runtime is returned too: connectivity is ITS state, never the queue's, so a test that wants
+    /// a successful read has to bring the runtime up.
+    fn scripted_session(
+        signals: Vec<SignalConfig>,
+    ) -> (MtcSession, InstanceSender, Arc<AgentRuntime>) {
         let agent = runtime("http://127.0.0.1:9");
-        let (tx, rx) = mpsc::channel(32);
-        (MtcSession::new(agent, device(signals), model(), rx), tx)
+        let (tx, rx) = instance_queue();
+        (
+            MtcSession::new(Arc::clone(&agent), device(signals), model(), rx),
+            tx,
+            agent,
+        )
     }
 
     #[tokio::test]
     async fn every_runtime_event_becomes_the_operator_event_it_deserves() {
-        let (mut session, tx) = scripted_session(vec![signal("x", "Xabs")]);
+        let (mut session, tx, agent) = scripted_session(vec![signal("x", "Xabs")]);
+        deliver(&agent).await;
+        let cancel = CancellationToken::new();
 
         let info = Arc::new(crate::mtconnect::AgentInfo {
             agent_id: "line-a-agent".into(),
@@ -2435,19 +2582,20 @@ mod mtconnect_seam_tests {
             agent_version: Some("2.7.0.12".into()),
             ..Default::default()
         });
-        tx.send(InstanceEvent::AgentUp(info)).await.unwrap();
-        tx.send(InstanceEvent::DataLoss { skipped: 12 })
-            .await
-            .unwrap();
-        tx.send(InstanceEvent::ModelDrift {
-            old: "aa".into(),
-            new: "bb".into(),
-        })
-        .await
-        .unwrap();
-        tx.send(InstanceEvent::StreamDegraded { failures: 3 })
-            .await
-            .unwrap();
+        tx.send_critical(InstanceEvent::AgentUp(info), &cancel)
+            .await;
+        tx.send_critical(InstanceEvent::DataLoss { skipped: 12 }, &cancel)
+            .await;
+        tx.send_critical(
+            InstanceEvent::ModelDrift {
+                old: "aa".into(),
+                new: "bb".into(),
+            },
+            &cancel,
+        )
+        .await;
+        tx.send_critical(InstanceEvent::StreamDegraded { failures: 3 }, &cancel)
+            .await;
         session.read_signals().await.expect("drain");
 
         let notices = session.take_notices();
@@ -2497,10 +2645,10 @@ mod mtconnect_seam_tests {
 
     #[tokio::test]
     async fn a_lost_agent_still_reports_its_event_even_though_the_read_fails() {
-        let (mut session, tx) = scripted_session(vec![signal("x", "Xabs")]);
-        tx.send(InstanceEvent::AgentDown("connect refused".into()))
-            .await
-            .unwrap();
+        let (mut session, tx, _agent) = scripted_session(vec![signal("x", "Xabs")]);
+        let cancel = CancellationToken::new();
+        tx.send_critical(InstanceEvent::AgentDown("connect refused".into()), &cancel)
+            .await;
         assert!(
             session.read_signals().await.is_err(),
             "the supervisor must reconnect"
@@ -2517,7 +2665,7 @@ mod mtconnect_seam_tests {
     #[test]
     fn only_the_transition_into_fault_raises_a_condition_event_and_at_most_once_a_minute() {
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let mut session = MtcSession::new(agent, device(vec![signal("x", "Xabs")]), model(), rx);
 
         let cond = |state: CondState, seq: u64| Observation {
@@ -2575,14 +2723,14 @@ mod mtconnect_seam_tests {
         // Two signals bind real data items, one binds a data item the device does not have: the
         // gauge must report the two that are really delivered, in stream mode and poll mode alike
         // (the compiled set is what is served; the mode only decides how it arrives).
-        let (session, _tx) = scripted_session(vec![
+        let (session, _tx, _agent) = scripted_session(vec![
             signal("x-position", "Xabs"),
             signal("x-load", "Xload"),
             signal("ghost", "NOT-IN-MODEL"),
         ]);
         assert_eq!(session.served_signals(), Some(2));
 
-        let (empty, _tx) = scripted_session(vec![]);
+        let (empty, _tx, _agent2) = scripted_session(vec![]);
         assert_eq!(empty.served_signals(), Some(0));
 
         // The template simulator compiles nothing, so it keeps the configured inventory size.

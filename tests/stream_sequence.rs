@@ -18,7 +18,7 @@ use std::time::Duration;
 use mtconnect_adapter::mtconnect::config::{parse_agents, AgentCredentials};
 use mtconnect_adapter::mtconnect::multipart::MultipartReader;
 use mtconnect_adapter::mtconnect::{
-    AgentCtl, AgentRuntime, ChunkSource, InstanceEvent, MtcError, StreamExit,
+    AgentCtl, AgentRuntime, ChunkSource, InstanceEvent, MtcError, StreamExit, StreamRun,
     MAX_CONSECUTIVE_UNDECODABLE,
 };
 use serde_json::json;
@@ -120,7 +120,12 @@ fn runtime() -> Arc<AgentRuntime> {
     }] }))
     .unwrap()
     .remove(0);
-    AgentRuntime::new(cfg, &AgentCredentials::default()).unwrap()
+    AgentRuntime::new(
+        cfg,
+        &AgentCredentials::default(),
+        Arc::new(|| "2026-01-01T00:00:00Z".to_string()),
+    )
+    .unwrap()
 }
 
 /// A minimal Streams document for the OKUMA device: one `Xabs` sample per `(sequence, value)`.
@@ -146,10 +151,15 @@ fn streams_doc(instance_id: u64, next: u64, samples: &[(u64, f64)]) -> String {
     )
 }
 
-async fn drive(rt: &Arc<AgentRuntime>, steps: Vec<Step>) -> StreamExit {
+async fn drive_run(rt: &Arc<AgentRuntime>, steps: Vec<Step>) -> StreamRun {
     let (_tx, mut ctl) = mpsc::channel::<AgentCtl>(4);
     rt.drive_stream(&mut Script::new(steps), &mut reader(), &mut ctl)
         .await
+}
+
+/// [`drive_run`] when only the exit matters.
+async fn drive(rt: &Arc<AgentRuntime>, steps: Vec<Step>) -> StreamExit {
+    drive_run(rt, steps).await.exit
 }
 
 // =================================================================================================
@@ -222,7 +232,7 @@ async fn a_part_split_across_chunks_with_a_gap_still_counts_once_complete() {
 #[tokio::test(start_paused = true)]
 async fn an_out_of_range_error_document_exits_ladder_two_with_the_agents_floor() {
     let rt = runtime();
-    rt.ingest_streams(CURRENT_2_7, false).unwrap(); // position the cursor (next = 42)
+    rt.ingest_streams(CURRENT_2_7, false).await.unwrap(); // position the cursor (next = 42)
     let exit = drive(&rt, vec![Step::Chunk(part(ERRORS_2_7)), Step::Hang]).await;
     match exit {
         StreamExit::OutOfRange { first_sequence } => assert_eq!(first_sequence, 153),
@@ -234,15 +244,15 @@ async fn an_out_of_range_error_document_exits_ladder_two_with_the_agents_floor()
 async fn an_instance_change_in_a_streams_part_exits_ladder_three() {
     let rt = runtime();
     let mut handle = rt.attach("OKUMA.123456");
-    rt.ingest_streams(CURRENT_2_7, false).unwrap(); // instance 1749000000
-    while handle.rx.try_recv().is_ok() {}
+    rt.ingest_streams(CURRENT_2_7, false).await.unwrap(); // instance 1749000000
+    handle.rx.drain();
 
     let restarted = streams_doc(1_749_999_999, 4, &[(3, 9.5)]);
     let exit = drive(&rt, vec![Step::Chunk(part(&restarted)), Step::Hang]).await;
     assert!(matches!(exit, StreamExit::InstanceChanged), "{exit:?}");
     assert!(rt.needs_resync(), "the model is suspect until re-probed");
     // The restarted agent's low sequence was NOT discarded as stale: the state reset first.
-    let events: Vec<InstanceEvent> = std::iter::from_fn(|| handle.rx.try_recv().ok()).collect();
+    let events: Vec<InstanceEvent> = handle.rx.drain();
     assert!(
         events
             .iter()
@@ -257,7 +267,7 @@ async fn an_instance_change_on_an_error_document_beats_out_of_range() {
     // A restarted agent may greet a stale `from` with OUT_OF_RANGE from its NEW incarnation.
     // Ladder 3 supersedes ladder 2: the model is suspect, not just the cursor.
     let rt = runtime();
-    rt.ingest_streams(CURRENT_2_7, false).unwrap();
+    rt.ingest_streams(CURRENT_2_7, false).await.unwrap();
     let errors = ERRORS_2_7.replace("instanceId=\"1749000000\"", "instanceId=\"1749999999\"");
     let exit = drive(&rt, vec![Step::Chunk(part(&errors)), Step::Hang]).await;
     assert!(matches!(exit, StreamExit::InstanceChanged), "{exit:?}");
@@ -272,7 +282,7 @@ async fn a_non_range_agent_error_document_is_liveness_not_an_exit() {
          <Header instanceId="1749000000"/>
          <Errors><Error errorCode="INTERNAL_ERROR">transient agent hiccup</Error></Errors>
        </MTConnectError>"#;
-    rt.ingest_streams(CURRENT_2_7, false).unwrap();
+    rt.ingest_streams(CURRENT_2_7, false).await.unwrap();
     let started = tokio::time::Instant::now();
     let exit = drive(
         &rt,
@@ -383,8 +393,8 @@ async fn the_snapshot_and_the_stream_overlap_without_duplicates() {
     let rt = runtime();
     let mut handle = rt.attach("OKUMA.123456");
     // The /current snapshot published Xabs @ seq 37 (and set next = 42).
-    rt.ingest_streams(CURRENT_2_7, false).unwrap();
-    while handle.rx.try_recv().is_ok() {}
+    rt.ingest_streams(CURRENT_2_7, false).await.unwrap();
+    handle.rx.drain();
 
     // The stream resumes from an overlapping window: seq 37 again (already published) and 43
     // (new). Only the new one may reach the instance.
@@ -392,7 +402,7 @@ async fn the_snapshot_and_the_stream_overlap_without_duplicates() {
     let exit = drive(&rt, vec![Step::Chunk(part(&overlap)), Step::Eof]).await;
     assert!(matches!(exit, StreamExit::EndOfStream), "{exit:?}");
 
-    let events: Vec<InstanceEvent> = std::iter::from_fn(|| handle.rx.try_recv().ok()).collect();
+    let events: Vec<InstanceEvent> = handle.rx.drain();
     let published: Vec<u64> = events
         .iter()
         .filter_map(|e| match e {
@@ -414,13 +424,76 @@ async fn the_snapshot_and_the_stream_overlap_without_duplicates() {
     );
     let exit = drive(&rt, vec![Step::Chunk(part(&other)), Step::Eof]).await;
     assert!(matches!(exit, StreamExit::EndOfStream), "{exit:?}");
-    let events: Vec<InstanceEvent> = std::iter::from_fn(|| handle.rx.try_recv().ok()).collect();
+    let events: Vec<InstanceEvent> = handle.rx.drain();
     assert!(
         events
             .iter()
             .any(|e| matches!(e, InstanceEvent::Snapshot(obs)
             if obs.iter().any(|o| o.data_item_id == "Xload" && o.sequence == 40))),
         "a lower sequence on another data item is not stale: {events:?}"
+    );
+}
+
+// =================================================================================================
+// Liveness accounting: what makes a stream "established" (D-R4)
+// =================================================================================================
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_that_ends_before_delivering_anything_proves_no_liveness() {
+    // The headers-then-immediate-EOF agent: the response opened, so the old rule counted the
+    // attempt as a success and re-established at once, forever, without backing off or degrading.
+    // The stream ingested NOTHING, and that is the fact the state machine now decides on.
+    let rt = runtime();
+    let run = drive_run(&rt, vec![Step::Eof]).await;
+    assert!(
+        matches!(run.exit, StreamExit::EndOfStream),
+        "{:?}",
+        run.exit
+    );
+    assert_eq!(run.liveness_parts, 0, "an empty stream established nothing");
+
+    // Same for a transport failure before the first part, and for a stream that only ever sent
+    // garbage (an undecodable part proves nothing about the agent).
+    let run = drive_run(&rt, vec![Step::Fail]).await;
+    assert_eq!(run.liveness_parts, 0);
+    let run = drive_run(&rt, vec![Step::Chunk(part("not xml at all")), Step::Eof]).await;
+    assert_eq!(run.liveness_parts, 0, "an undecodable part is not liveness");
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_readable_part_counts_toward_the_streams_liveness_including_heartbeats() {
+    let rt = runtime();
+    let hb = Duration::from_millis(u64::from(HEARTBEAT_MS));
+    let run = drive_run(
+        &rt,
+        vec![
+            Step::Chunk(part(HEARTBEAT_2_7)),
+            Step::Wait(hb / 2),
+            Step::Chunk(part(&streams_doc(1_749_000_000, 44, &[(43, 1.0)]))),
+            Step::Eof,
+        ],
+    )
+    .await;
+    assert!(
+        matches!(run.exit, StreamExit::EndOfStream),
+        "{:?}",
+        run.exit
+    );
+    assert_eq!(
+        run.liveness_parts, 2,
+        "the heartbeat and the data part both proved the agent alive"
+    );
+
+    // A stream that timed out its heartbeat window still delivered before it went quiet.
+    let run = drive_run(&rt, vec![Step::Chunk(part(HEARTBEAT_2_7)), Step::Hang]).await;
+    assert!(
+        matches!(run.exit, StreamExit::HeartbeatMissed),
+        "{:?}",
+        run.exit
+    );
+    assert_eq!(
+        run.liveness_parts, 1,
+        "it worked, then it broke - not a failed establishment"
     );
 }
 
@@ -433,20 +506,24 @@ async fn shutdown_and_reconnect_control_requests_end_the_stream() {
     let rt = runtime();
     let (tx, mut ctl) = mpsc::channel::<AgentCtl>(4);
     tx.send(AgentCtl::Shutdown).await.unwrap();
-    let exit = rt
+    let run = rt
         .drive_stream(&mut Script::new(vec![Step::Hang]), &mut reader(), &mut ctl)
         .await;
-    assert!(matches!(exit, StreamExit::Shutdown), "{exit:?}");
+    assert!(matches!(run.exit, StreamExit::Shutdown), "{:?}", run.exit);
 
     let (tx, mut ctl) = mpsc::channel::<AgentCtl>(4);
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     tx.send(AgentCtl::Reconnect { reply: reply_tx })
         .await
         .unwrap();
-    let exit = rt
+    let run = rt
         .drive_stream(&mut Script::new(vec![Step::Hang]), &mut reader(), &mut ctl)
         .await;
-    assert!(matches!(exit, StreamExit::CtlReconnect), "{exit:?}");
+    assert!(
+        matches!(run.exit, StreamExit::CtlReconnect),
+        "{:?}",
+        run.exit
+    );
     // No devices attached: the re-probe had nothing to do and answered Ok.
     assert!(reply_rx.await.unwrap().is_ok());
 }

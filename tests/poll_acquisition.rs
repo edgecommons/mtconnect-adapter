@@ -24,6 +24,7 @@ use mtconnect_adapter::mtconnect::AgentRuntime;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 const PROBE: &str = include_str!("fixtures/devices_2.7.xml");
 const CURRENT: &str = include_str!("fixtures/current_2.7.xml");
@@ -165,7 +166,12 @@ fn wire_with(
     }] }))
     .unwrap()
     .remove(0);
-    let runtime = AgentRuntime::new(cfg, &AgentCredentials::default()).unwrap();
+    let runtime = AgentRuntime::new(
+        cfg,
+        &AgentCredentials::default(),
+        Arc::new(|| "2026-01-01T00:00:00Z".to_string()),
+    )
+    .unwrap();
     let backend = MtcBackend::new(
         HashMap::from([("line-a-agent".to_string(), Arc::clone(&runtime))]),
         devices,
@@ -179,6 +185,21 @@ fn reading<'a>(readings: &'a [Reading], id: &str) -> &'a Reading {
         .iter()
         .find(|r| r.signal_id == id)
         .unwrap_or_else(|| panic!("no reading `{id}`"))
+}
+
+/// Bring the shared runtime up before an instance connects.
+///
+/// A device link is only ever opened behind the connectivity gate: `connect` refuses until the
+/// agent runtime is **delivering** (D-R1), because a cached probe model is not liveness. Production
+/// gets there through the acquisition task's first successful cycle; a test that drives acquisition
+/// by hand says so here. Nothing is attached yet, so no dedupe floor is recorded and the first
+/// post-connect cycle still publishes everything.
+async fn deliver(runtime: &Arc<AgentRuntime>) {
+    runtime
+        .snapshot_cycle(false)
+        .await
+        .expect("the fake agent answers /current");
+    assert!(runtime.info().connected);
 }
 
 #[tokio::test]
@@ -198,6 +219,7 @@ async fn a_configured_device_probes_polls_and_publishes_its_signals() {
     );
 
     // Connecting verifies the device is really in the agent's probe.
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     assert_eq!(
         agent.request_count("/probe"),
@@ -285,6 +307,7 @@ async fn a_bound_condition_degrades_the_value_it_guards() {
     guarded.condition_binding = Some(vec!["Xtravel".into()]);
     let (runtime, backend) = wire(&agent, vec![device(vec![guarded])]);
 
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     runtime.poll_once().await.expect("poll");
     let readings = session.read_signals().await.expect("read");
@@ -307,6 +330,7 @@ async fn a_bound_condition_degrades_the_value_it_guards() {
 async fn only_changed_observations_are_published_and_a_new_one_is() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     runtime.poll_once().await.unwrap();
@@ -339,11 +363,17 @@ async fn only_changed_observations_are_published_and_a_new_one_is() {
 async fn the_acquisition_task_polls_on_its_own_cadence() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     // The shared task drives acquisition; the instance only drains its queue.
-    runtime.spawn().expect("the acquisition task starts once");
-    assert!(runtime.spawn().is_none(), "a second start is a no-op");
+    runtime
+        .spawn(CancellationToken::new())
+        .expect("the acquisition task starts once");
+    assert!(
+        runtime.spawn(CancellationToken::new()).is_none(),
+        "a second start is a no-op"
+    );
 
     let mut readings = Vec::new();
     for _ in 0..50 {
@@ -388,6 +418,7 @@ async fn a_read_is_always_live_and_never_deduplicated() {
             signal("x-load", "Xload"),
         ])],
     );
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     // Drain the poll path first, so a deduplicating read would answer with nothing.
@@ -410,7 +441,7 @@ async fn a_read_is_always_live_and_never_deduplicated() {
 #[tokio::test]
 async fn a_device_that_is_not_in_the_probe_is_a_permanent_failure() {
     let agent = FakeAgent::start().await;
-    let (_runtime, backend) = wire(
+    let (runtime, backend) = wire(
         &agent,
         vec![DeviceConfig {
             device_uuid: "GHOST.1".into(),
@@ -422,6 +453,7 @@ async fn a_device_that_is_not_in_the_probe_is_a_permanent_failure() {
     }))
     .unwrap();
 
+    deliver(&runtime).await;
     let Err(e) = backend.connect(&cfg).await else {
         panic!("a device that is not there must fail")
     };
@@ -436,6 +468,7 @@ async fn a_device_that_is_not_in_the_probe_is_a_permanent_failure() {
 async fn an_agent_that_stops_answering_surfaces_as_a_transient_failure() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     runtime.poll_once().await.unwrap();
     session.read_signals().await.unwrap();
@@ -455,9 +488,61 @@ async fn an_agent_that_stops_answering_surfaces_as_a_transient_failure() {
 }
 
 #[tokio::test]
+async fn a_cached_model_is_not_liveness_so_connect_refuses_a_dead_agent() {
+    // The P1-1 defect, at the gate: `ensure_model` answers from the cache with no network touch,
+    // so a connect that trusted it reported ONLINE, emitted `device-connected` and cleared the
+    // `device-unreachable` alarm against an agent that had been dead for hours.
+    let agent = FakeAgent::start().await;
+    let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
+    let mut session = backend
+        .connect(&connection())
+        .await
+        .expect("connect while delivering");
+    let probes = agent.request_count("/probe");
+    assert_eq!(probes, 1, "the model was fetched once and cached");
+    session.close().await;
+
+    // The agent goes away entirely — the cached model does not.
+    agent.documents.lock().unwrap().clear();
+    assert!(runtime.poll_once().await.is_err());
+    assert!(
+        runtime.model("OKUMA.123456").is_some(),
+        "the model is still cached"
+    );
+
+    let Err(e) = backend.connect(&connection()).await else {
+        panic!("a cached model must never be mistaken for a live agent")
+    };
+    assert!(
+        e.is_transient(),
+        "the supervisor keeps retrying rather than giving up: {e}"
+    );
+    assert!(e.to_string().contains("is not delivering"), "{e}");
+    assert_eq!(
+        agent.request_count("/probe"),
+        probes,
+        "and it did not even ask"
+    );
+
+    // Once acquisition delivers again, connect succeeds — still from the cache, still with no
+    // network probe: the gate is about liveness, not about re-fetching the model.
+    agent.set("current", CURRENT.to_string());
+    runtime.poll_once().await.expect("the agent answers again");
+    let mut session = backend.connect(&connection()).await.expect("connect");
+    assert_eq!(
+        agent.request_count("/probe"),
+        probes,
+        "a cache hit needs no network probe"
+    );
+    session.close().await;
+}
+
+#[tokio::test]
 async fn a_probe_that_changes_under_us_is_surfaced_as_drift_not_silently_remapped() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     let before = runtime.model("OKUMA.123456").unwrap().digest_hex();
 
@@ -489,7 +574,8 @@ async fn a_probe_that_changes_under_us_is_surfaced_as_drift_not_silently_remappe
 #[tokio::test]
 async fn browsing_serves_the_cached_probe_while_the_agent_is_unreachable() {
     let agent = FakeAgent::start().await;
-    let (_runtime, backend) = wire(&agent, vec![device(vec![])]);
+    let (runtime, backend) = wire(&agent, vec![device(vec![])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     // The agent goes away entirely; the address space is still browsable.
@@ -504,7 +590,8 @@ async fn browsing_serves_the_cached_probe_while_the_agent_is_unreachable() {
 #[tokio::test]
 async fn writes_are_refused_even_at_the_backend() {
     let agent = FakeAgent::start().await;
-    let (_runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     let Err(e) = session.write_signal("x-position", &json!(1.0)).await else {
         panic!("MTConnect is read-only")
@@ -516,11 +603,12 @@ async fn writes_are_refused_even_at_the_backend() {
 async fn a_read_serializes_with_acquisition_through_the_control_channel() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     // With the acquisition task running, a read rides the control channel rather than opening its
     // own request behind the task's back (the single-owner rule).
-    runtime.spawn().expect("task");
+    runtime.spawn(CancellationToken::new()).expect("task");
     let readings = session
         .read_named(&["x-position".to_string()])
         .await
@@ -542,6 +630,7 @@ async fn a_read_serializes_with_acquisition_through_the_control_channel() {
 async fn reconnecting_re_probes_and_republishes_everything_as_fresh() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     runtime.poll_once().await.unwrap();
@@ -571,8 +660,9 @@ async fn reconnecting_re_probes_and_republishes_everything_as_fresh() {
 async fn a_reconnect_through_the_running_task_reports_a_probe_failure() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let _session = backend.connect(&connection()).await.expect("connect");
-    runtime.spawn().expect("task");
+    runtime.spawn(CancellationToken::new()).expect("task");
 
     agent.documents.lock().unwrap().remove("probe");
     let err = runtime
@@ -600,6 +690,7 @@ async fn a_repoll_takes_a_fresh_current_and_says_every_configured_signal_again()
             signal("ghost", "NOT-IN-MODEL"),
         ])],
     );
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     // A normal cycle publishes, and a second one publishes nothing: `/current` repeats itself.
@@ -643,7 +734,8 @@ async fn a_repoll_takes_a_fresh_current_and_says_every_configured_signal_again()
 #[tokio::test]
 async fn a_repoll_asks_only_for_this_devices_configured_data_items() {
     let agent = FakeAgent::start().await;
-    let (_runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     let readings = session.snapshot_now().await.expect("repoll");
@@ -655,7 +747,8 @@ async fn a_repoll_asks_only_for_this_devices_configured_data_items() {
     assert_eq!(readings[0].signal_id, "x-position");
 
     // A device with no configured signals has nothing to snapshot, and asks the agent for nothing.
-    let (_r2, backend) = wire(&agent, vec![device(vec![])]);
+    let (r2, backend) = wire(&agent, vec![device(vec![])]);
+    deliver(&r2).await;
     let mut empty = backend.connect(&connection()).await.expect("connect");
     let before = agent.request_count("/current");
     assert!(empty.snapshot_now().await.expect("repoll").is_empty());
@@ -669,7 +762,8 @@ async fn a_repoll_asks_only_for_this_devices_configured_data_items() {
 #[tokio::test]
 async fn a_repoll_against_an_unreachable_agent_reports_the_failure() {
     let agent = FakeAgent::start().await;
-    let (_runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     agent.documents.lock().unwrap().remove("current");
 
@@ -692,6 +786,7 @@ async fn a_reloaded_signal_set_reaches_a_live_session_without_a_reconnect() {
     // The session keeps its socketless attachment; nothing reconnects, nothing re-probes.
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     runtime.poll_once().await.unwrap();
@@ -766,6 +861,7 @@ async fn a_minimal_selection_all_instance_publishes_the_whole_device() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![selecting(vec![], json!({ "mode": "all" }))]);
 
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     runtime.poll_once().await.expect("poll");
     let readings = session.read_signals().await.expect("read");
@@ -834,6 +930,7 @@ async fn selection_matchers_scope_the_derived_set_and_explicit_entries_override(
         )],
     );
 
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     runtime.poll_once().await.expect("poll");
     let readings = session.read_signals().await.expect("read");
@@ -866,10 +963,11 @@ async fn selection_matchers_scope_the_derived_set_and_explicit_entries_override(
 #[tokio::test]
 async fn max_signals_truncates_with_a_warning_event_never_silently() {
     let agent = FakeAgent::start().await;
-    let (_runtime, backend) = wire(
+    let (runtime, backend) = wire(
         &agent,
         vec![selecting(vec![], json!({ "mode": "all", "maxSignals": 3 }))],
     );
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     let notices = session.take_notices();
@@ -904,6 +1002,7 @@ async fn the_derived_set_follows_the_model_through_drift() {
             "include": [{ "category": "SAMPLE", "path": "Axes/**" }] }),
         )],
     );
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     runtime.poll_once().await.expect("poll");
     let before = session.read_signals().await.expect("read");
@@ -975,6 +1074,7 @@ async fn a_reloaded_selection_reaches_a_live_session_atomically() {
     // signals[] edit — no restart, no reconnect, no re-probe.
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     runtime.poll_once().await.unwrap();
     assert_eq!(session.read_signals().await.unwrap().len(), 1);
@@ -1043,7 +1143,8 @@ async fn a_reloaded_selection_reaches_a_live_session_atomically() {
 #[tokio::test]
 async fn sb_read_resolves_derived_ids_like_configured_ones() {
     let agent = FakeAgent::start().await;
-    let (_runtime, backend) = wire(&agent, vec![selecting(vec![], json!({ "mode": "all" }))]);
+    let (runtime, backend) = wire(&agent, vec![selecting(vec![], json!({ "mode": "all" }))]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     let readings = session
@@ -1107,6 +1208,7 @@ async fn a_deep_component_path_publishes_on_a_channel_that_fits_the_uns_topic() 
         realistic_budgets(),
     );
 
+    deliver(&runtime).await;
     let mut session = backend.connect(&deep_connection()).await.expect("connect");
     runtime.poll_once().await.expect("poll");
     let readings = session.read_signals().await.expect("read");
@@ -1225,9 +1327,10 @@ async fn a_budget_that_cannot_fit_even_an_id_warns_rather_than_publishing_silenc
             max_bytes: 0,
         },
     );
-    let (_runtime, backend) =
+    let (runtime, backend) =
         wire_with(&agent, vec![deep_device(json!({ "mode": "all" }))], budgets);
 
+    deliver(&runtime).await;
     let mut session = backend.connect(&deep_connection()).await.expect("connect");
     let notices = session.take_notices();
     let warned = notices

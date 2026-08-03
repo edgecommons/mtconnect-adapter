@@ -35,6 +35,9 @@ cloudwatch = ["edgecommons/cloudwatch"]
 # `edgecommons component upgrade --to <version>`.
 edgecommons = { git = "https://github.com/edgecommons/edgecommons", rev = "a14a3285573ef2bb6a531e1e1936c6dc40a85ef4", default-features = false, features = ["credentials"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+# `CancellationToken` — the structured-lifecycle primitive used both above and below the device
+# seam. It is not an `edgecommons` import, so `src/mtconnect/**` stays isolated (tests/isolation.rs).
+tokio-util = { version = "0.7", default-features = false }
 serde_json = "1"
 tracing = "0.1"
 anyhow = "1"

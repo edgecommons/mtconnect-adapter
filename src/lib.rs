@@ -16,4 +16,5 @@ pub mod metrics;
 pub mod mtconnect;
 pub mod reload;
 pub mod shaping;
+pub mod staleness;
 pub mod supervisor;

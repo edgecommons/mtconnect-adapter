@@ -39,6 +39,16 @@ use crate::mtconnect::config::{PublishMode, SignalConfig};
 /// arrival order. Never empty.
 pub type Update = Vec<Reading>;
 
+/// Where a signal's readings publish. Part of the policy **identity**: one flushed update carries
+/// one signal's window on one route, so a route change must flush the open window rather than let
+/// readings from two routing generations leave together (D-R16).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SignalRoute {
+    pub channel: Option<String>,
+    pub component_path: Option<String>,
+    pub name: Option<String>,
+}
+
 /// One signal's effective shaping policy — the engine's own vocabulary, compiled from
 /// [`PublishCfg`](crate::mtconnect::config::PublishCfg) by whoever knows the signal (the MTConnect
 /// session compiles the served set against the probe model; a backend with no compile step uses
@@ -53,11 +63,14 @@ pub struct PublishPolicy {
     /// Absolute deadband, applied on entry. Set only where it applies (numeric SAMPLE-category
     /// data items for MTConnect); `None` means every reading enters.
     pub deadband: Option<f64>,
+    /// Where the signal publishes. A route change is a policy change.
+    pub route: SignalRoute,
 }
 
 impl PublishPolicy {
     /// Whether this policy shapes anything at all. A trivial policy is not worth a table entry:
-    /// the unshaped fast path is identical.
+    /// the unshaped fast path is identical. The route alone never forces an entry — a trivial
+    /// policy never buffers, so it cannot mix routing generations.
     #[must_use]
     pub fn is_trivial(&self) -> bool {
         self.batch_ms == 0 && self.deadband.is_none()
@@ -79,6 +92,7 @@ pub fn policies_from_signals(signals: &[SignalConfig]) -> HashMap<String, Publis
             batch_ms: p.batch_ms,
             latest_only: p.mode == PublishMode::Interval,
             deadband: p.deadband,
+            route: SignalRoute::default(),
         };
         if !policy.is_trivial() {
             out.insert(s.id.clone(), policy);
@@ -319,6 +333,7 @@ mod tests {
             batch_ms,
             latest_only: false,
             deadband: None,
+            route: SignalRoute::default(),
         }
     }
 
@@ -372,6 +387,7 @@ mod tests {
                 batch_ms: 0,
                 latest_only: false,
                 deadband: Some(0.5),
+                route: SignalRoute::default(),
             },
         )]));
         assert_eq!(
@@ -397,14 +413,16 @@ mod tests {
         assert!(!PublishPolicy {
             batch_ms: 0,
             latest_only: false,
-            deadband: Some(1.0)
+            deadband: Some(1.0),
+            route: SignalRoute::default()
         }
         .is_trivial());
         // latest_only with a zero window degenerates to immediate — trivial.
         assert!(PublishPolicy {
             batch_ms: 0,
             latest_only: true,
-            deadband: None
+            deadband: None,
+            route: SignalRoute::default()
         }
         .is_trivial());
     }
@@ -527,6 +545,7 @@ mod tests {
                 batch_ms: 200,
                 latest_only: true,
                 deadband: None,
+                route: SignalRoute::default(),
             },
         )]));
         let start = t0();
@@ -616,6 +635,7 @@ mod tests {
                 batch_ms: 0,
                 latest_only: false,
                 deadband: Some(1.0),
+                route: SignalRoute::default(),
             },
         )]));
         assert_eq!(
@@ -656,6 +676,7 @@ mod tests {
                 batch_ms: 0,
                 latest_only: false,
                 deadband: Some(100.0),
+                route: SignalRoute::default(),
             },
         )]));
         s.offer(good("a", 10.0), t0());
@@ -701,6 +722,7 @@ mod tests {
                 batch_ms: 0,
                 latest_only: false,
                 deadband: Some(100.0),
+                route: SignalRoute::default(),
             },
         )]));
         s.offer(good("a", 1.0), t0());
@@ -728,6 +750,7 @@ mod tests {
                 batch_ms: 0,
                 latest_only: false,
                 deadband: Some(1.0),
+                route: SignalRoute::default(),
             },
         )]));
         s.offer(good("a", 10.0), t0());
@@ -757,6 +780,7 @@ mod tests {
                 batch_ms: 100,
                 latest_only: false,
                 deadband: Some(1.0),
+                route: SignalRoute::default(),
             },
         )]));
         let start = t0();
@@ -887,7 +911,8 @@ mod tests {
             PublishPolicy {
                 batch_ms: 0,
                 latest_only: false,
-                deadband: Some(0.5)
+                deadband: Some(0.5),
+                route: SignalRoute::default()
             }
         );
         assert_eq!(
@@ -895,7 +920,8 @@ mod tests {
             PublishPolicy {
                 batch_ms: 100,
                 latest_only: true,
-                deadband: None
+                deadband: None,
+                route: SignalRoute::default()
             }
         );
     }
