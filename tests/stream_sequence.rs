@@ -406,10 +406,9 @@ async fn the_snapshot_and_the_stream_overlap_without_duplicates() {
     let published: Vec<u64> = events
         .iter()
         .filter_map(|e| match e {
-            InstanceEvent::Snapshot(obs) => Some(obs.iter().map(|o| o.sequence)),
+            InstanceEvent::Obs(o) => Some(o.sequence),
             _ => None,
         })
-        .flatten()
         .collect();
     assert_eq!(
         published,
@@ -426,10 +425,8 @@ async fn the_snapshot_and_the_stream_overlap_without_duplicates() {
     assert!(matches!(exit, StreamExit::EndOfStream), "{exit:?}");
     let events: Vec<InstanceEvent> = handle.rx.drain();
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, InstanceEvent::Snapshot(obs)
-            if obs.iter().any(|o| o.data_item_id == "Xload" && o.sequence == 40))),
+        events.iter().any(|e| matches!(e, InstanceEvent::Obs(o)
+            if o.data_item_id == "Xload" && o.sequence == 40)),
         "a lower sequence on another data item is not stale: {events:?}"
     );
 }

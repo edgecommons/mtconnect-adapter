@@ -2268,6 +2268,106 @@ mod mtconnect_seam_tests {
     }
 
     #[tokio::test]
+    async fn consecutive_ordinary_cycles_never_resync_the_session_but_a_republish_does() {
+        // The F-N1 rule stated directly: `take_resync` is what makes the supervisor re-arm the
+        // deadband, so only a genuine re-baseline may raise it.
+        let agent = runtime("http://127.0.0.1:9");
+        deliver(&agent).await;
+        let handle = agent.attach("OKUMA.123456");
+        let mut session = MtcSession::new(
+            Arc::clone(&agent),
+            device(vec![signal("x", "Xabs")]),
+            model(),
+            handle.rx,
+        );
+
+        agent.ingest_streams(CURRENT_2_7, false).await.unwrap();
+        assert!(!session.read_signals().await.unwrap().is_empty());
+        assert!(
+            !session.take_resync(),
+            "an ordinary cycle is on-change flow, not a re-baseline"
+        );
+
+        let moved = CURRENT_2_7
+            .replace("sequence=\"37\"", "sequence=\"43\"")
+            .replace("123.456", "200.0");
+        agent.ingest_streams(&moved, false).await.unwrap();
+        assert!(!session.read_signals().await.unwrap().is_empty());
+        assert!(!session.take_resync(), "...and neither is the one after it");
+
+        let again = moved.replace("sequence=\"43\"", "sequence=\"44\"");
+        agent.ingest_streams(&again, true).await.unwrap();
+        assert!(!session.read_signals().await.unwrap().is_empty());
+        assert!(
+            session.take_resync(),
+            "a forced republish rebuilds the whole view and says so"
+        );
+    }
+
+    /// One supervisor tick, exactly as `run_polling` does it: drain, re-arm the deadband if the
+    /// drain re-baselined the view, then shape. Returns how many updates reached the wire.
+    async fn supervisor_tick(
+        session: &mut MtcSession,
+        shaper: &mut crate::shaping::Shaper,
+    ) -> usize {
+        let readings = session
+            .read_signals()
+            .await
+            .expect("the agent is delivering");
+        if session.take_resync() {
+            shaper.reset_deadband();
+        }
+        let now = Instant::now();
+        readings
+            .into_iter()
+            .map(|reading| shaper.offer(reading, now).len())
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn the_deadband_survives_between_poll_cycles_because_ordinary_flow_is_not_a_re_baseline()
+    {
+        // F-N1, end to end at the seam. Every ordinary delivery used to arrive as a `Snapshot`,
+        // which marks the session resynced, which makes the supervisor re-arm the deadband on
+        // EVERY tick - so the deadband could never suppress anything across cycles and was inert
+        // in production. Ordinary flow is per observation now, and only a genuine re-baseline says
+        // it is one.
+        let agent = runtime("http://127.0.0.1:9");
+        deliver(&agent).await;
+        let handle = agent.attach("OKUMA.123456");
+        let mut sig = signal("x-position", "Xabs");
+        sig.publish = Some(serde_json::from_value(json!({ "deadband": 0.5 })).unwrap());
+        let mut session =
+            MtcSession::new(Arc::clone(&agent), device(vec![sig]), model(), handle.rx);
+        let mut shaper = crate::shaping::Shaper::new();
+        assert!(shaper.set_policies(session.shaping_policies()).is_empty());
+
+        // Cycle 1: Xabs = 123.456 @ seq 37. The first reading always passes.
+        agent.ingest_streams(CURRENT_2_7, false).await.unwrap();
+        assert_eq!(supervisor_tick(&mut session, &mut shaper).await, 1);
+
+        // Cycle 2: a sub-deadband move (0.1 against a 0.5 band) in the NEXT cycle.
+        let nudged = CURRENT_2_7
+            .replace("sequence=\"37\"", "sequence=\"43\"")
+            .replace("123.456", "123.556");
+        agent.ingest_streams(&nudged, false).await.unwrap();
+        assert_eq!(
+            supervisor_tick(&mut session, &mut shaper).await,
+            0,
+            "a sub-deadband change is suppressed across cycles - the deadband is real"
+        );
+
+        // A genuine re-baseline still re-arms it: the same sub-deadband value republishes.
+        let republished = nudged.replace("sequence=\"43\"", "sequence=\"44\"");
+        agent.ingest_streams(&republished, true).await.unwrap();
+        assert_eq!(
+            supervisor_tick(&mut session, &mut shaper).await,
+            1,
+            "a re-baseline says the whole current view again, deadband or not"
+        );
+    }
+
+    #[tokio::test]
     async fn a_drained_snapshot_marks_the_session_resynced_once() {
         let agent = runtime("http://127.0.0.1:9");
         deliver(&agent).await;

@@ -98,6 +98,10 @@ pub const CRITICAL_QUEUE_DEPTH: usize = 256;
 /// How long a loss-intolerant send may wait for room before it is dropped and counted (D-R2).
 pub const CRITICAL_SEND_BUDGET: Duration = Duration::from_secs(5);
 
+/// How often one instance's queue-drop warning may repeat. A lagging consumer loses events in
+/// bursts; the counters carry the volume, so the log only has to say *that* it is happening.
+pub const DROP_WARN_INTERVAL: Duration = Duration::from_secs(30);
+
 /// The `interval=` a streaming request asks the agent for. The LLD (§14 Q2) floors the interval at
 /// 250 ms; per-signal publish cadences below that are shaped client-side by the publish policy.
 pub const STREAM_INTERVAL_MS: u32 = 250;
@@ -116,10 +120,15 @@ pub const NOT_YET_REACHABLE: &str = "not yet reachable";
 /// What the runtime tells one device instance.
 #[derive(Debug, Clone)]
 pub enum InstanceEvent {
-    /// One new observation for this device. Boxed: a single observation is by far the largest
+    /// One new observation for this device — **ordinary on-change flow**, the shape every poll
+    /// cycle and every stream part delivers. Boxed: a single observation is by far the largest
     /// thing this enum carries, and every other variant would pay for it in the queue.
     Obs(Box<Observation>),
-    /// A whole `/current` snapshot, published together (a resume, a forced repoll).
+    /// A **re-baseline**: the fleet's whole view of this device is being rebuilt, so the batch is
+    /// delivered together and the session treats it as a resync (it re-arms the deadband) rather
+    /// than as on-change flow. Reserved for the attach snapshot, a forced republish (resume,
+    /// repoll, `OUT_OF_RANGE` recovery) and the post-restart resync snapshot — never for ordinary
+    /// delivery, which would re-baseline the session every cycle and leave the deadband inert.
     Snapshot(Vec<Observation>),
     /// The agent is reachable and its model verified.
     AgentUp(Arc<AgentInfo>),
@@ -286,12 +295,25 @@ pub struct InstanceReceiver {
     queue: Arc<Queue>,
 }
 
+/// What one synchronous push onto the loss-intolerant lane did.
+enum CriticalPush {
+    /// Queued — the lane had room.
+    Queued,
+    /// No room. The event comes back so the sender can wait for a drain and offer it again.
+    Full(InstanceEvent),
+    /// The receiver is gone: no drain will ever come, so waiting for room would be a lie.
+    Detached,
+}
+
 impl InstanceSender {
     /// Data lane. Never blocks.
     ///
-    /// On overflow the oldest data-lane entry is evicted and counted; a detached receiver makes the
-    /// send a counted no-op. (Latest-value coalescing per `data_item_id` is the lane's next
-    /// refinement — `QueueCounters::coalesced` is its counter.)
+    /// A full lane keeps its depth by **latest-value coalescing** (LLD §3): a queued reading of the
+    /// same `data_item_id` is replaced in place, counted `coalesced` — the consumer was going to
+    /// act on the newer number anyway, so nothing it could still have used is lost, and the
+    /// signal keeps its place in line. Only when there is no entry to supersede does the lane evict
+    /// its OLDEST entry, which IS a loss and is counted `dropped_data`. A detached receiver makes
+    /// the send a counted no-op.
     pub fn send_data(&self, obs: Box<Observation>) {
         let mut state = self.queue.state.lock().expect("instance queue");
         if state.detached {
@@ -299,23 +321,67 @@ impl InstanceSender {
             return;
         }
         if state.data.len() >= INSTANCE_QUEUE_DEPTH {
+            let queued = state
+                .data
+                .iter()
+                .position(|q| q.data_item_id == obs.data_item_id);
+            if let Some(at) = queued {
+                state.data[at] = obs;
+                state.counters.coalesced += 1;
+                return;
+            }
             state.data.pop_front();
             state.counters.dropped_data += 1;
         }
         state.data.push_back(obs);
     }
 
-    /// Loss-intolerant lane. Enqueues immediately when there is room; a cancelled send, a detached
-    /// receiver, or a lane with no room is dropped and counted — never an error the caller must
-    /// handle, because there is nothing a caller could usefully do with one.
+    /// Loss-intolerant lane. Enqueues immediately when there is room; when the lane is **full it
+    /// waits** for a drain to make room, up to [`CRITICAL_SEND_BUDGET`], preempted by `cancel`
+    /// — genuine consumer lag backpressures acquisition instead of silently discarding a condition
+    /// transition or a lifecycle event.
+    ///
+    /// Past the budget, on cancellation, or against a detached receiver the event is dropped and
+    /// counted (`dropped_critical`). This bound is the recorded, justified deviation from the LLD's
+    /// literal unbounded `send().await` (D-R2): the publish path below is shared by every agent, so
+    /// an unbounded wait would let one stalled consumer freeze all acquisition — while the
+    /// backpressured events could not be published anyway. It is never an error the caller must
+    /// handle, because there is nothing a caller could usefully do with one: the counter and a
+    /// rate-limited warning are the surface.
     pub async fn send_critical(&self, event: InstanceEvent, cancel: &CancellationToken) {
+        // Checked before the push, not after: once shutdown has been asked for, nothing new goes
+        // into a queue nobody will drain.
         if cancel.is_cancelled() {
             self.count_critical_drop();
             return;
         }
-        if !self.push_critical(event) {
-            self.count_critical_drop();
+        let mut event = match self.try_push_critical(event) {
+            CriticalPush::Queued => return,
+            CriticalPush::Detached => {
+                self.count_critical_drop();
+                return;
+            }
+            CriticalPush::Full(event) => event,
+        };
+        let deadline = tokio::time::Instant::now() + CRITICAL_SEND_BUDGET;
+        loop {
+            // Register interest BEFORE re-offering: a drain landing between the offer and the wait
+            // would otherwise go unnoticed and the event would sit out its whole budget for nothing.
+            let room = self.queue.room.notified();
+            tokio::pin!(room);
+            room.as_mut().enable();
+            match self.try_push_critical(event) {
+                CriticalPush::Queued => return,
+                CriticalPush::Detached => break,
+                CriticalPush::Full(pending) => event = pending,
+            }
+            tokio::select! {
+                () = &mut room => {}
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep_until(deadline) => break,
+            }
         }
+        self.count_critical_drop();
     }
 
     /// Drain-and-reset the counters (the runtime aggregates them).
@@ -327,12 +393,19 @@ impl InstanceSender {
     /// The synchronous critical push: `false` when there was no room (or no receiver). This is what
     /// [`AgentRuntime::attach`] seeds a newborn queue through — an empty queue always has room.
     fn push_critical(&self, event: InstanceEvent) -> bool {
+        matches!(self.try_push_critical(event), CriticalPush::Queued)
+    }
+
+    fn try_push_critical(&self, event: InstanceEvent) -> CriticalPush {
         let mut state = self.queue.state.lock().expect("instance queue");
-        if state.detached || state.critical.len() >= CRITICAL_QUEUE_DEPTH {
-            return false;
+        if state.detached {
+            return CriticalPush::Detached;
+        }
+        if state.critical.len() >= CRITICAL_QUEUE_DEPTH {
+            return CriticalPush::Full(event);
         }
         state.critical.push_back(event);
-        true
+        CriticalPush::Queued
     }
 
     fn count_critical_drop(&self) {
@@ -346,8 +419,9 @@ impl InstanceSender {
 }
 
 impl InstanceReceiver {
-    /// Everything queued: the loss-intolerant lane FIRST (FIFO), then the data lane (FIFO).
-    /// Non-blocking — the session drains on its own cadence.
+    /// Everything queued: the loss-intolerant lane FIRST (FIFO), then the data lane (FIFO, with
+    /// coalesced entries in the positions their predecessors held). Non-blocking — the session
+    /// drains on its own cadence. Draining is also what signals room to a blocked critical send.
     pub fn drain(&mut self) -> Vec<InstanceEvent> {
         let drained = {
             let mut state = self.queue.state.lock().expect("instance queue");
@@ -371,10 +445,15 @@ impl InstanceReceiver {
 
 impl Drop for InstanceReceiver {
     fn drop(&mut self) {
-        let mut state = self.queue.state.lock().expect("instance queue");
-        state.detached = true;
-        state.critical.clear();
-        state.data.clear();
+        {
+            let mut state = self.queue.state.lock().expect("instance queue");
+            state.detached = true;
+            state.critical.clear();
+            state.data.clear();
+        }
+        // A sender waiting for room has to learn there will never be any: without this it would
+        // hold its whole send budget against a consumer that is already gone.
+        self.queue.room.notify_waiters();
     }
 }
 
@@ -427,7 +506,14 @@ pub struct AgentRuntime {
     stats: AgentStats,
     ctl_tx: mpsc::Sender<AgentCtl>,
     ctl_rx: Mutex<Option<mpsc::Receiver<AgentCtl>>>,
-    dropped_events: AtomicU64,
+    /// Queue accounting folded out of every instance queue: what the coalescible data lane threw
+    /// away, what the loss-intolerant lane lost past its budget, and what coalescing superseded.
+    dropped_data: AtomicU64,
+    dropped_critical: AtomicU64,
+    coalesced_events: AtomicU64,
+    /// When each instance was last warned about queue losses — one warning per
+    /// [`DROP_WARN_INTERVAL`] per instance, never one per lost event.
+    drop_warned: Mutex<HashMap<String, Instant>>,
     /// The acquisition task's cancellation token — installed by [`AgentRuntime::spawn`], cancelled
     /// by [`AgentRuntime::shutdown`], and the token every loss-intolerant send is preempted by, so
     /// a full queue can never stall shutdown.
@@ -501,7 +587,10 @@ impl AgentRuntime {
             stats: AgentStats::default(),
             ctl_tx,
             ctl_rx: Mutex::new(Some(ctl_rx)),
-            dropped_events: AtomicU64::new(0),
+            dropped_data: AtomicU64::new(0),
+            dropped_critical: AtomicU64::new(0),
+            coalesced_events: AtomicU64::new(0),
+            drop_warned: Mutex::new(HashMap::new()),
             cancel: Mutex::new(CancellationToken::new()),
             last_down: Mutex::new(NOT_YET_REACHABLE.to_string()),
             last_liveness: AtomicU64::new(u64::MAX),
@@ -542,7 +631,20 @@ impl AgentRuntime {
     /// Events dropped because an instance's consumer lagged — both lanes.
     #[must_use]
     pub fn dropped_events(&self) -> u64 {
-        self.dropped_events.load(Ordering::Relaxed)
+        self.dropped_data.load(Ordering::Relaxed) + self.dropped_critical.load(Ordering::Relaxed)
+    }
+
+    /// The queue accounting in full, since start: which lane lost what, and how many stale readings
+    /// coalescing superseded. Coalescing is not a loss and is deliberately NOT a metric measure —
+    /// the `MtconnectStream` family's measure set is closed (D-R6), so this accessor plus the debug
+    /// log are where it surfaces.
+    #[must_use]
+    pub fn queue_counters(&self) -> QueueCounters {
+        QueueCounters {
+            dropped_data: self.dropped_data.load(Ordering::Relaxed),
+            dropped_critical: self.dropped_critical.load(Ordering::Relaxed),
+            coalesced: self.coalesced_events.load(Ordering::Relaxed),
+        }
     }
 
     /// ISO-8601 UTC "now" from the injected clock — the arrival stamp an ingested observation
@@ -751,6 +853,12 @@ impl AgentRuntime {
     /// Any client or parse error; the runtime marks itself down and tells every attached instance
     /// before returning.
     pub async fn snapshot_cycle(&self, republish_all: bool) -> Result<PollReport, MtcError> {
+        // Read BEFORE the cycle touches anything: a pending resync means this `/current` IS the
+        // ladder-3 re-baseline, even though the floors were already cleared for it by
+        // `reset_for_new_instance` and no `republish_all` is needed to make it republish. The
+        // `Snapshot` event is the MARKER a session needs (it re-arms the deadband), not the
+        // mechanism that refills it.
+        let re_baseline = republish_all || self.needs_resync();
         let started = Instant::now();
         let fetched = self.client.current(None).await;
         self.stats
@@ -762,7 +870,9 @@ impl AgentRuntime {
                 return Err(e);
             }
         };
-        let report = self.ingest_streams(&text, republish_all).await?;
+        let report = self
+            .ingest_streams_as(&text, republish_all, re_baseline)
+            .await?;
         // Ladder 3 completes here, where a re-probe can actually be awaited: a restarted agent may
         // have come back with a different device model, and drift is surfaced, never remapped.
         if self.resync_needed.swap(false, Ordering::Relaxed) {
@@ -796,6 +906,19 @@ impl AgentRuntime {
         text: &str,
         republish_all: bool,
     ) -> Result<PollReport, MtcError> {
+        self.ingest_streams_as(text, republish_all, republish_all)
+            .await
+    }
+
+    /// [`Self::ingest_streams`] with the re-baseline decision made by the caller: only
+    /// [`Self::snapshot_cycle`] knows that a cycle is a ladder-3 recovery, which republishes
+    /// everything off already-cleared floors rather than through `republish_all`.
+    async fn ingest_streams_as(
+        &self,
+        text: &str,
+        republish_all: bool,
+        re_baseline: bool,
+    ) -> Result<PollReport, MtcError> {
         let doc = match xml::parse_streams(text) {
             Ok(doc) => doc,
             Err(e) => {
@@ -809,12 +932,19 @@ impl AgentRuntime {
             .lock()
             .expect("parse counters")
             .record_ok(doc.unknown_elements);
-        Ok(self.ingest_streams_doc(&doc, republish_all).await)
+        Ok(self
+            .ingest_streams_doc(&doc, republish_all, re_baseline)
+            .await)
     }
 
     /// Fold one already-parsed Streams document into the runtime: sequence header, dedupe,
     /// dispatch, published state. Infallible — parsing (and its failure policy) is the caller's.
-    async fn ingest_streams_doc(&self, doc: &xml::StreamsDoc, republish_all: bool) -> PollReport {
+    async fn ingest_streams_doc(
+        &self,
+        doc: &xml::StreamsDoc,
+        republish_all: bool,
+        re_baseline: bool,
+    ) -> PollReport {
         // The header first: an agent restart voids every sequence number we hold, and it must do so
         // BEFORE anything from this document is measured against a floor.
         let outcome = {
@@ -824,11 +954,15 @@ impl AgentRuntime {
             }
             seq.observe_header(&doc.header)
         };
+        let mut re_baseline = re_baseline;
         if let HeaderOutcome::InstanceChanged { old, new } = outcome {
             // Ladder 3: the numbers are already void (the state reset itself). The MODEL is now
-            // suspect too, so a re-probe is scheduled rather than assumed unnecessary.
+            // suspect too, so a re-probe is scheduled rather than assumed unnecessary. Every floor
+            // just went with the old incarnation, so whatever this document carries is a fresh
+            // view of the device, not on-change flow.
             tracing::warn!(agent = %self.cfg.id, old, new, "agent restarted; resequencing");
             self.resync_needed.store(true, Ordering::Relaxed);
+            re_baseline = true;
         }
 
         let mut report = PollReport {
@@ -861,9 +995,25 @@ impl AgentRuntime {
                 }
             }
             report.published += fresh.len();
-            if !fresh.is_empty() {
+            if fresh.is_empty() {
+                continue;
+            }
+            if re_baseline {
+                // A re-baseline is ONE event on purpose: the session must treat the whole batch as
+                // a fresh view of the device — which re-arms its deadband — rather than as
+                // on-change flow. Losing one would break the resync guarantee, so it rides the
+                // loss-intolerant lane.
                 self.dispatch(&ds.uuid, InstanceEvent::Snapshot(fresh))
                     .await;
+            } else {
+                // Ordinary flow is per observation, so each one takes the lane its class earns:
+                // condition transitions are loss-intolerant, values are coalescible. (F-N1: a
+                // per-batch `Snapshot` re-baselined the session on EVERY cycle, which reset the
+                // deadband entry state before it could ever suppress anything.)
+                for obs in fresh {
+                    self.dispatch(&ds.uuid, InstanceEvent::Obs(Box::new(obs)))
+                        .await;
+                }
             }
         }
 
@@ -1436,7 +1586,9 @@ impl AgentRuntime {
                     .lock()
                     .expect("parse counters")
                     .record_ok(doc.unknown_elements);
-                let report = self.ingest_streams_doc(&doc, false).await;
+                // A stream part is on-change flow by definition; only its own header can make it a
+                // re-baseline (an agent that restarted under the open stream).
+                let report = self.ingest_streams_doc(&doc, false, false).await;
                 if report.observations == 0 {
                     PartOutcome::Heartbeat
                 } else {
@@ -1501,15 +1653,28 @@ impl AgentRuntime {
             }
             match self.snapshot(&uuid, &[]).await {
                 Ok(observations) if !observations.is_empty() => {
-                    // Record the floors so the live stream does not immediately repeat these.
-                    {
-                        let mut seq = self.seq.lock().expect("sequence state");
-                        for obs in &observations {
-                            seq.should_publish(&dedupe_key(&uuid, &obs.data_item_id), obs.sequence);
-                        }
-                    }
-                    self.dispatch(&uuid, InstanceEvent::Snapshot(observations))
+                    let floors: Vec<(String, u64)> = observations
+                        .iter()
+                        .map(|obs| (obs.data_item_id.clone(), obs.sequence))
+                        .collect();
+                    let delivered = self
+                        .dispatch(&uuid, InstanceEvent::Snapshot(observations))
                         .await;
+                    // The floors say "the instance has these already", so they are recorded only
+                    // once the snapshot is KNOWN to have landed. Recording them against a dropped
+                    // dispatch would suppress those observations forever; leaving them unset costs
+                    // one repeat on the next cycle, which is what the dedupe floor is for (F-N2).
+                    if delivered {
+                        let mut seq = self.seq.lock().expect("sequence state");
+                        for (data_item_id, sequence) in floors {
+                            seq.should_publish(&dedupe_key(&uuid, &data_item_id), sequence);
+                        }
+                    } else {
+                        tracing::warn!(
+                            agent = %self.cfg.id, device = %uuid,
+                            "attach snapshot was not delivered; it republishes next cycle"
+                        );
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -1580,38 +1745,84 @@ impl AgentRuntime {
         self.sinks.read().expect("sinks").contains_key(device_uuid)
     }
 
-    async fn dispatch(&self, device_uuid: &str, event: InstanceEvent) {
+    /// Deliver one event to one instance. `false` when the instance is gone or its queue could not
+    /// take the event — the answer [`Self::service_attach_snapshots`] needs before it records
+    /// dedupe floors against observations that may never have arrived.
+    async fn dispatch(&self, device_uuid: &str, event: InstanceEvent) -> bool {
         let sink = self.sinks.read().expect("sinks").get(device_uuid).cloned();
-        if let Some(tx) = sink {
-            self.send_on(&tx, event).await;
+        match sink {
+            Some(tx) => self.send_on(device_uuid, &tx, event).await,
+            None => false,
         }
     }
 
     async fn broadcast(&self, event: &InstanceEvent) {
-        let sinks: Vec<InstanceSender> = self
+        let sinks: Vec<(String, InstanceSender)> = self
             .sinks
             .read()
             .expect("sinks")
-            .values()
-            .cloned()
+            .iter()
+            .map(|(uuid, tx)| (uuid.clone(), tx.clone()))
             .collect();
-        for tx in &sinks {
-            self.send_on(tx, event.clone()).await;
+        for (uuid, tx) in &sinks {
+            self.send_on(uuid, tx, event.clone()).await;
         }
     }
 
-    /// Route one event onto its lane and fold whatever the queue counted back into the runtime.
-    async fn send_on(&self, tx: &InstanceSender, event: InstanceEvent) {
+    /// Route one event onto its lane — loss-intolerant events onto the reserved lane that waits for
+    /// room, resamplable values onto the coalescible one — fold whatever the queue counted back
+    /// into the runtime, and say whether the event actually landed.
+    async fn send_on(&self, device_uuid: &str, tx: &InstanceSender, event: InstanceEvent) -> bool {
         if is_loss_intolerant(&event) {
             tx.send_critical(event, &self.cancel_token()).await;
         } else if let InstanceEvent::Obs(obs) = event {
             tx.send_data(obs);
         }
         let counted = tx.take_counters();
-        self.dropped_events.fetch_add(
-            counted.dropped_data + counted.dropped_critical,
-            Ordering::Relaxed,
+        self.fold_queue_counters(device_uuid, counted);
+        counted.dropped_data == 0 && counted.dropped_critical == 0
+    }
+
+    /// Fold one queue's accounting into the runtime's, naming the lane that lost something at most
+    /// once per instance per [`DROP_WARN_INTERVAL`] — a lagging consumer loses events in bursts,
+    /// and the counters, not the log, carry the volume.
+    fn fold_queue_counters(&self, device_uuid: &str, counted: QueueCounters) {
+        if counted.coalesced > 0 {
+            self.coalesced_events
+                .fetch_add(counted.coalesced, Ordering::Relaxed);
+            tracing::debug!(
+                agent = %self.cfg.id, device = %device_uuid, coalesced = counted.coalesced,
+                "a lagging consumer's stale reading was superseded in place"
+            );
+        }
+        if counted.dropped_data == 0 && counted.dropped_critical == 0 {
+            return;
+        }
+        self.dropped_data
+            .fetch_add(counted.dropped_data, Ordering::Relaxed);
+        self.dropped_critical
+            .fetch_add(counted.dropped_critical, Ordering::Relaxed);
+        if !self.may_warn_about_drops(device_uuid) {
+            return;
+        }
+        tracing::warn!(
+            agent = %self.cfg.id, device = %device_uuid,
+            data_lane = counted.dropped_data, critical_lane = counted.dropped_critical,
+            "instance queue dropped events; its consumer is lagging"
         );
+    }
+
+    /// Whether this instance's drop warning is due again.
+    fn may_warn_about_drops(&self, device_uuid: &str) -> bool {
+        let now = Instant::now();
+        let mut warned = self.drop_warned.lock().expect("drop warnings");
+        if let Some(last) = warned.get(device_uuid) {
+            if now.duration_since(*last) < DROP_WARN_INTERVAL {
+                return false;
+            }
+        }
+        warned.insert(device_uuid.to_string(), now);
+        true
     }
 
     /// Record that the agent is unreachable: latch the reason, flip `connected`, and tell every
@@ -1698,6 +1909,51 @@ mod tests {
 
     const CURRENT_2_7: &str = include_str!("../../tests/fixtures/current_2.7.xml");
     const HEARTBEAT_2_7: &str = include_str!("../../tests/fixtures/heartbeat_2.7.xml");
+    const DEVICES_2_7: &str = include_str!("../../tests/fixtures/devices_2.7.xml");
+
+    /// A runtime backed by a minimal HTTP agent stand-in: `/probe` answers the devices fixture,
+    /// every other path the `/current` one. Enough to drive the cycles that do real I/O
+    /// (`snapshot_cycle`, `service_attach_snapshots`) rather than only the pure ingest path.
+    async fn agent_backed_runtime() -> Arc<AgentRuntime> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match sock.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => head.push(byte[0]),
+                        }
+                    }
+                    let body = if String::from_utf8_lossy(&head).contains("/probe") {
+                        DEVICES_2_7
+                    } else {
+                        CURRENT_2_7
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        AgentRuntime::new(
+            agent_cfg(&format!("http://{addr}")),
+            &AgentCredentials::default(),
+            clock(),
+        )
+        .unwrap()
+    }
 
     /// One observation, shaped for the queue tests.
     fn obs(data_item_id: &str, sequence: u64, category: Category) -> Box<Observation> {
@@ -1738,19 +1994,18 @@ mod tests {
         // One agent, many devices: an event for one device reaches only that device's queue.
         rt.ingest_streams(CURRENT_2_7, false).await.unwrap();
         let events = handle.rx.drain();
-        let snapshot = events
+        let delivered: Vec<&str> = events
             .iter()
-            .find(|e| matches!(e, InstanceEvent::Snapshot(_)))
-            .expect("the CNC's observations");
-        match snapshot {
-            InstanceEvent::Snapshot(obs) => {
-                assert!(
-                    obs.iter().all(|o| o.data_item_id != "m-avail"),
-                    "no other device's data"
-                );
-            }
-            other => panic!("expected a snapshot, got {other:?}"),
-        }
+            .filter_map(|e| match e {
+                InstanceEvent::Obs(o) => Some(o.data_item_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!delivered.is_empty(), "the CNC's observations: {events:?}");
+        assert!(
+            !delivered.contains(&"m-avail"),
+            "no other device's data: {delivered:?}"
+        );
 
         rt.detach("OKUMA.123456");
         assert_eq!(rt.attached(), vec!["MAZAK.999".to_string()]);
@@ -1784,20 +2039,32 @@ mod tests {
         assert_eq!(second.observations, first.observations);
         assert_eq!(second.published, 0);
 
-        // The first cycle dispatched the snapshot AND the agent-up announcement; the second
+        // The first cycle dispatched the observations AND the agent-up announcement; the second
         // dispatched nothing at all.
         let first_events = handle.rx.drain();
-        assert!(first_events
-            .iter()
-            .any(|e| matches!(e, InstanceEvent::Snapshot(_))));
+        assert_eq!(
+            first_events
+                .iter()
+                .filter(|e| matches!(e, InstanceEvent::Obs(_)))
+                .count(),
+            first.published,
+            "ordinary flow is one event per observation: {first_events:?}"
+        );
         assert!(
             handle.rx.is_empty(),
             "nothing was dispatched the second time"
         );
 
-        // A forced republish (a resume, a repoll) deliberately says the same thing again.
+        // A forced republish (a resume, a repoll) deliberately says the same thing again — and
+        // says it as a RE-BASELINE, so the session re-arms its deadband for the whole batch.
         let third = rt.ingest_streams(CURRENT_2_7, true).await.unwrap();
         assert_eq!(third.published, first.published);
+        let third_events = handle.rx.drain();
+        assert!(
+            matches!(third_events.as_slice(), [InstanceEvent::Snapshot(batch)]
+                     if batch.len() == third.published),
+            "{third_events:?}"
+        );
     }
 
     // =============================================================================================
@@ -2117,31 +2384,203 @@ mod tests {
         assert_eq!(tx.take_counters().dropped_critical, 1);
     }
 
-    #[test]
-    fn the_data_lane_evicts_its_oldest_entry_rather_than_growing_without_bound() {
-        let (tx, mut rx) = instance_queue();
-        for sequence in 0..u64::try_from(INSTANCE_QUEUE_DEPTH).unwrap() + 3 {
-            tx.send_data(obs("x", sequence, Category::Sample));
-        }
-        assert_eq!(tx.take_counters().dropped_data, 3, "every drop is counted");
-        let drained = rx.drain();
-        assert_eq!(drained.len(), INSTANCE_QUEUE_DEPTH);
-        match &drained[0] {
-            InstanceEvent::Obs(o) => assert_eq!(o.sequence, 3, "the OLDEST went, not the newest"),
-            other => panic!("{other:?}"),
-        }
+    #[tokio::test(start_paused = true)]
+    async fn a_send_already_blocked_on_room_gives_way_to_shutdown_at_once() {
+        // The other half of the cancellation rule: the bounded wait must be PREEMPTED, not merely
+        // bounded. A consumer that has stopped consuming can hold a critical send for five seconds;
+        // shutdown cannot be asked to queue behind that (D-R2).
+        let (tx, _rx) = instance_queue();
+        fill_critical_lane(&tx).await;
+        let cancel = CancellationToken::new();
+
+        let sender = tx.clone();
+        let token = cancel.clone();
+        let waiting = tokio::spawn(async move {
+            sender
+                .send_critical(InstanceEvent::AgentDown("gone".into()), &token)
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "it is waiting for room");
+
+        let started = tokio::time::Instant::now();
+        cancel.cancel();
+        waiting.await.unwrap();
+        assert!(
+            started.elapsed() < CRITICAL_SEND_BUDGET,
+            "shutdown preempted the wait: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(tx.take_counters().dropped_critical, 1);
     }
 
-    #[tokio::test]
-    async fn a_full_loss_intolerant_lane_drops_and_counts_rather_than_blocking_acquisition() {
-        let (tx, mut rx) = instance_queue();
+    /// Fill the data lane to its depth with one entry per DISTINCT signal, so nothing in it can be
+    /// coalesced onto and the next send has to choose.
+    fn fill_data_lane(tx: &InstanceSender) {
+        for sequence in 0..u64::try_from(INSTANCE_QUEUE_DEPTH).unwrap() {
+            tx.send_data(obs(&format!("x{sequence}"), sequence, Category::Sample));
+        }
+        assert_eq!(
+            tx.take_counters(),
+            QueueCounters::default(),
+            "a lane filled exactly to its depth lost nothing"
+        );
+    }
+
+    /// Fill the loss-intolerant lane to its depth.
+    async fn fill_critical_lane(tx: &InstanceSender) {
         let cancel = CancellationToken::new();
-        for skipped in 0..u64::try_from(CRITICAL_QUEUE_DEPTH).unwrap() + 2 {
+        for skipped in 0..u64::try_from(CRITICAL_QUEUE_DEPTH).unwrap() {
             tx.send_critical(InstanceEvent::DataLoss { skipped }, &cancel)
                 .await;
         }
-        assert_eq!(tx.take_counters().dropped_critical, 2);
+        assert_eq!(
+            tx.take_counters(),
+            QueueCounters::default(),
+            "a lane filled exactly to its depth lost nothing"
+        );
+    }
+
+    #[test]
+    fn a_full_data_lane_supersedes_a_signals_stale_reading_rather_than_losing_the_new_one() {
+        let (tx, mut rx) = instance_queue();
+        fill_data_lane(&tx);
+
+        // A newer reading of a signal that is ALREADY queued replaces it where it stands: the
+        // consumer was going to act on the newer number anyway, so this is not a loss.
+        tx.send_data(obs("x7", 9_001, Category::Sample));
+        assert_eq!(
+            tx.take_counters(),
+            QueueCounters {
+                coalesced: 1,
+                ..QueueCounters::default()
+            }
+        );
+
+        // A signal with nothing to supersede evicts the OLDEST entry instead — and THAT is a loss.
+        tx.send_data(obs("newcomer", 9_002, Category::Sample));
+        assert_eq!(
+            tx.take_counters(),
+            QueueCounters {
+                dropped_data: 1,
+                ..QueueCounters::default()
+            }
+        );
+
+        let queued: Vec<(String, u64)> = rx
+            .drain()
+            .iter()
+            .map(|e| match e {
+                InstanceEvent::Obs(o) => (o.data_item_id.clone(), o.sequence),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            queued.len(),
+            INSTANCE_QUEUE_DEPTH,
+            "the lane kept its depth"
+        );
+        assert!(
+            !queued.iter().any(|(id, _)| id == "x0"),
+            "the OLDEST entry went, not the newest"
+        );
+        assert_eq!(
+            queued[6],
+            ("x7".to_string(), 9_001),
+            "the coalesced signal kept its place in line, carrying its LATEST value"
+        );
+        assert_eq!(queued.last().unwrap().0, "newcomer");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_loss_intolerant_lane_waits_for_room_and_is_delivered_when_the_consumer_drains()
+    {
+        let (tx, mut rx) = instance_queue();
+        fill_critical_lane(&tx).await;
+
+        // The lane is full: rather than discard a lifecycle event, the send WAITS.
+        let sender = tx.clone();
+        let waiting = tokio::spawn(async move {
+            sender
+                .send_critical(
+                    InstanceEvent::AgentDown("gone".into()),
+                    &CancellationToken::new(),
+                )
+                .await;
+        });
+        tokio::time::sleep(CRITICAL_SEND_BUDGET / 2).await;
+        assert!(
+            !waiting.is_finished(),
+            "real consumer lag backpressures acquisition; it does not silently lose the event"
+        );
+
+        // A consumer that drains inside the budget gets it.
         assert_eq!(rx.drain().len(), CRITICAL_QUEUE_DEPTH);
+        waiting.await.unwrap();
+        assert_eq!(
+            tx.take_counters(),
+            QueueCounters::default(),
+            "nothing was lost"
+        );
+        assert!(matches!(
+            rx.drain().as_slice(),
+            [InstanceEvent::AgentDown(_)]
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_loss_intolerant_send_past_its_budget_is_dropped_and_counted() {
+        let (tx, mut rx) = instance_queue();
+        fill_critical_lane(&tx).await;
+
+        // Nobody drains. The wait is BOUNDED (D-R2): acquisition is never frozen by a consumer
+        // that has stopped consuming, and what the bound costs is counted rather than hidden.
+        let started = tokio::time::Instant::now();
+        tx.send_critical(
+            InstanceEvent::AgentDown("gone".into()),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            started.elapsed() >= CRITICAL_SEND_BUDGET,
+            "it waited its whole budget first: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(tx.take_counters().dropped_critical, 1);
+        assert_eq!(
+            rx.drain().len(),
+            CRITICAL_QUEUE_DEPTH,
+            "the lane kept what it had"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_loss_intolerant_send_gives_up_the_moment_its_consumer_goes_away() {
+        let (tx, rx) = instance_queue();
+        fill_critical_lane(&tx).await;
+
+        let sender = tx.clone();
+        let waiting = tokio::spawn(async move {
+            sender
+                .send_critical(
+                    InstanceEvent::AgentDown("gone".into()),
+                    &CancellationToken::new(),
+                )
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+
+        // The session closed. No drain will ever come, so waiting out the budget would be a lie.
+        let started = tokio::time::Instant::now();
+        drop(rx);
+        waiting.await.unwrap();
+        assert!(
+            started.elapsed() < CRITICAL_SEND_BUDGET,
+            "a detached queue is answered at once: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(tx.take_counters().dropped_critical, 1);
     }
 
     #[tokio::test]
@@ -2154,6 +2593,265 @@ mod tests {
             rt.dropped_events() > 0,
             "a lost consumer is counted, never a stalled poll"
         );
+        let counted = rt.queue_counters();
+        assert_eq!(
+            rt.dropped_events(),
+            counted.dropped_data + counted.dropped_critical,
+            "`dropped_events` is both lanes; `queue_counters` is which"
+        );
+        assert!(
+            counted.dropped_data > 0 && counted.dropped_critical > 0,
+            "the fixture carries both values and a condition: {counted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn coalescing_is_counted_and_reported_without_widening_a_metric_family() {
+        // D-R6: `coalesced` is not a loss, so it is not `dropped_events` and it is NOT a new
+        // `MtconnectStream` measure - it surfaces here and in a debug log.
+        let rt = runtime();
+        let handle = rt.attach("OKUMA.123456");
+        let tx = rt
+            .sinks
+            .read()
+            .expect("sinks")
+            .get("OKUMA.123456")
+            .cloned()
+            .expect("the instance's sink");
+        fill_data_lane(&tx);
+        // Every one of these supersedes a queued reading of the same signal.
+        for round in 0..3 {
+            tx.send_data(obs("x7", 9_000 + round, Category::Sample));
+        }
+        rt.fold_queue_counters("OKUMA.123456", tx.take_counters());
+
+        assert_eq!(
+            rt.queue_counters(),
+            QueueCounters {
+                coalesced: 3,
+                ..QueueCounters::default()
+            }
+        );
+        assert_eq!(
+            rt.dropped_events(),
+            0,
+            "superseding a stale value is no loss"
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn one_lagging_instance_is_warned_about_once_a_window_not_once_an_event() {
+        let rt = runtime();
+        let lost = QueueCounters {
+            dropped_data: 4,
+            ..QueueCounters::default()
+        };
+        assert!(
+            rt.may_warn_about_drops("OKUMA.123456"),
+            "the first one talks"
+        );
+        assert!(
+            !rt.may_warn_about_drops("OKUMA.123456"),
+            "and the burst behind it does not"
+        );
+        // Another instance keeps its own window: one machine's lag never mutes another's.
+        assert!(rt.may_warn_about_drops("MAZAK.999"));
+
+        // Folding still counts every event, warned about or not.
+        rt.fold_queue_counters("OKUMA.123456", lost);
+        rt.fold_queue_counters("OKUMA.123456", lost);
+        assert_eq!(rt.dropped_events(), 8);
+    }
+
+    // =============================================================================================
+    // Delivery classes (F-N1): ordinary flow vs a re-baseline
+    // =============================================================================================
+
+    #[tokio::test]
+    async fn ordinary_flow_is_dispatched_per_observation_onto_the_lane_its_class_earns() {
+        let rt = runtime();
+        let mut handle = rt.attach("OKUMA.123456");
+        handle.rx.drain(); // the attach seed
+
+        let report = rt.ingest_streams(CURRENT_2_7, false).await.unwrap();
+        let events = handle.rx.drain();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, InstanceEvent::Snapshot(_))),
+            "an ordinary cycle is on-change flow, never a re-baseline: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, InstanceEvent::Obs(_)))
+                .count(),
+            report.published
+        );
+
+        // The condition transitions rode the loss-intolerant lane, so they drained FIRST - which is
+        // the condition-before-value order `map_batch` is written against.
+        let categories: Vec<Category> = events
+            .iter()
+            .filter_map(|e| match e {
+                InstanceEvent::Obs(o) => Some(o.category),
+                _ => None,
+            })
+            .collect();
+        let conditions = categories
+            .iter()
+            .filter(|c| **c == Category::Condition)
+            .count();
+        assert!(conditions > 0, "the fixture carries conditions");
+        assert!(
+            categories[..conditions]
+                .iter()
+                .all(|c| *c == Category::Condition),
+            "conditions first: {categories:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forced_republish_is_one_re_baseline_event_and_an_ordinary_cycle_is_not() {
+        // The F-N1 rule at the runtime's own boundary: `Snapshot` means "rebuild your view", and
+        // only a genuine re-baseline may say it. When ordinary flow said it every cycle, every
+        // session re-armed its deadband every cycle and the deadband could never suppress anything.
+        let rt = runtime();
+        let mut handle = rt.attach("OKUMA.123456");
+        handle.rx.drain();
+
+        rt.ingest_streams(CURRENT_2_7, false).await.unwrap();
+        assert!(
+            handle
+                .rx
+                .drain()
+                .iter()
+                .all(|e| !matches!(e, InstanceEvent::Snapshot(_))),
+            "ordinary flow does not re-baseline"
+        );
+
+        let report = rt.ingest_streams(CURRENT_2_7, true).await.unwrap();
+        let events = handle.rx.drain();
+        assert!(
+            matches!(events.as_slice(), [InstanceEvent::Snapshot(batch)]
+                     if batch.len() == report.published),
+            "a resume/repoll republish is ONE re-baseline: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_document_is_a_re_baseline_because_every_floor_went_with_it() {
+        let rt = runtime();
+        let mut handle = rt.attach("OKUMA.123456");
+        rt.ingest_streams(CURRENT_2_7, false).await.unwrap();
+        handle.rx.drain();
+
+        let restarted = CURRENT_2_7
+            .replace("instanceId=\"1749000000\"", "instanceId=\"1749999999\"")
+            .replace("sequence=\"37\"", "sequence=\"3\"");
+        rt.ingest_streams(&restarted, false).await.unwrap();
+        let events = handle.rx.drain();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, InstanceEvent::Snapshot(_))),
+            "the old incarnation's floors are void: this is a fresh view, not on-change: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ladder_three_recovery_cycle_is_marked_a_re_baseline_for_the_sessions() {
+        // The recovery `/current` republishes off floors that `reset_for_new_instance` already
+        // cleared, so it never needs `republish_all` - but the instances still have to be TOLD
+        // their whole view is being rebuilt. `snapshot_cycle` reads the pending resync to say so.
+        let rt = agent_backed_runtime().await;
+        let mut handle = rt.attach("OKUMA.123456");
+        handle.rx.drain();
+
+        // A cold cycle is ordinary flow.
+        rt.snapshot_cycle(false).await.unwrap();
+        let events = handle.rx.drain();
+        assert!(events.iter().any(|e| matches!(e, InstanceEvent::Obs(_))));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, InstanceEvent::Snapshot(_))));
+
+        // The stream saw the agent restart: every floor went with the old incarnation and a
+        // re-probe is pending. What follows is a re-baseline, and it says so.
+        rt.seq
+            .lock()
+            .expect("sequence state")
+            .reset_for_new_instance();
+        rt.resync_needed.store(true, Ordering::Relaxed);
+        let report = rt.snapshot_cycle(false).await.unwrap();
+        assert!(
+            report.published > 0,
+            "everything republishes off the cleared floors"
+        );
+        let events = handle.rx.drain();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, InstanceEvent::Snapshot(_))),
+            "the recovery cycle is a re-baseline: {events:?}"
+        );
+        assert!(!rt.needs_resync(), "and the re-probe completed");
+    }
+
+    // =============================================================================================
+    // The attach snapshot's dedupe floors (F-N2)
+    // =============================================================================================
+
+    #[tokio::test]
+    async fn a_delivered_attach_snapshot_records_the_floors_the_stream_must_not_repeat() {
+        let rt = agent_backed_runtime().await;
+        let mut handle = rt.attach("OKUMA.123456");
+        handle.rx.drain();
+
+        rt.service_attach_snapshots().await;
+        let events = handle.rx.drain();
+        assert!(
+            matches!(events.as_slice(), [InstanceEvent::Snapshot(_)]),
+            "a change-only stream owes a newly attached instance one full view: {events:?}"
+        );
+        assert_eq!(
+            rt.seq
+                .lock()
+                .expect("sequence state")
+                .floor(&dedupe_key("OKUMA.123456", "Xabs")),
+            Some(37)
+        );
+        let report = rt.snapshot_cycle(false).await.unwrap();
+        assert_eq!(report.published, 0, "the instance already has them");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_attach_snapshot_leaves_its_floors_unset_so_the_next_cycle_says_it_again() {
+        // F-N2: the floors used to be recorded BEFORE the dispatch was known to have landed, so a
+        // dropped attach snapshot took its observations with it - permanently, because the floors
+        // then suppressed every repeat.
+        let rt = agent_backed_runtime().await;
+        let handle = rt.attach("OKUMA.123456");
+        drop(handle.rx); // the sink is registered; its consumer is not there
+
+        rt.service_attach_snapshots().await;
+        assert!(
+            rt.dropped_events() > 0,
+            "the snapshot did not land, and that was counted"
+        );
+        assert_eq!(
+            rt.seq
+                .lock()
+                .expect("sequence state")
+                .floor(&dedupe_key("OKUMA.123456", "Xabs")),
+            None,
+            "nothing may claim the instance has observations it never received"
+        );
+
+        // The cost of the drop is one repeat, which is exactly what the floors exist to permit.
+        let report = rt.snapshot_cycle(false).await.unwrap();
+        assert!(report.published > 0);
     }
 
     #[test]

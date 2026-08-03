@@ -269,18 +269,26 @@ impl Events {
     }
 }
 
-/// Wait (bounded) for the next event matching the predicate, keeping the ones it skipped.
+/// Wait (bounded) for the next event matching the predicate, KEEPING the ones it stepped over so a
+/// later wait can still find them. One drain empties both lanes at once, and the loss-intolerant
+/// lane comes out first, so an assertion about a value may well step over the lifecycle event a
+/// later assertion is looking for — these tests assert what happened, not in which slot.
 async fn wait_for(
     events: &mut Events,
     what: &str,
     mut pred: impl FnMut(&InstanceEvent) -> bool,
 ) -> InstanceEvent {
     tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stepped_over: VecDeque<InstanceEvent> = VecDeque::new();
         loop {
             while let Some(event) = events.pending.pop_front() {
                 if pred(&event) {
+                    while let Some(kept) = stepped_over.pop_back() {
+                        events.pending.push_front(kept);
+                    }
                     return event;
                 }
+                stepped_over.push_back(event);
             }
             events.pending.extend(events.rx.drain());
             if events.pending.is_empty() {
@@ -290,6 +298,18 @@ async fn wait_for(
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+}
+
+/// Whether an event is ORDINARY on-change delivery of this observation. Ordinary flow is dispatched
+/// per observation, each onto the lane its class earns; only a genuine re-baseline is a `Snapshot`.
+fn on_change(event: &InstanceEvent, sequence: u64) -> bool {
+    matches!(event, InstanceEvent::Obs(o) if o.sequence == sequence)
+}
+
+/// Whether an event is a RE-BASELINE carrying this observation: the whole current view of the
+/// device said again together (an attach snapshot, a ladder-2 republish, a post-restart resync).
+fn re_baseline(event: &InstanceEvent, sequence: u64) -> bool {
+    matches!(event, InstanceEvent::Snapshot(batch) if batch.iter().any(|o| o.sequence == sequence))
 }
 
 /// Poll (bounded) until the runtime's published info satisfies the predicate.
@@ -326,23 +346,22 @@ async fn the_machine_probes_snapshots_then_streams_from_next_sequence() {
     let mut handle = Events::of(rt.attach(DEVICE));
     rt.spawn(CancellationToken::new()).unwrap();
 
-    // The /current snapshot arrives first, then the agent-up announcement rides behind it.
-    wait_for(
-        &mut handle,
-        "the snapshot",
-        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 37)),
-    )
+    // The /current snapshot's observations and the agent-up announcement both land in the first
+    // drain (the announcement rides the loss-intolerant lane, so it comes out ahead of the
+    // values). A cold connect is on-change flow like any other cycle: nothing is being rebuilt,
+    // so nothing claims to be a re-baseline.
+    wait_for(&mut handle, "the snapshot's observation", |e| {
+        on_change(e, 37)
+    })
     .await;
     wait_for(&mut handle, "agent up", |e| {
         matches!(e, InstanceEvent::AgentUp(_))
     })
     .await;
     // ...then the stream delivers what is new.
-    wait_for(
-        &mut handle,
-        "the streamed observation",
-        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 43)),
-    )
+    wait_for(&mut handle, "the streamed observation", |e| {
+        on_change(e, 43)
+    })
     .await;
 
     let info = rt.info();
@@ -395,13 +414,8 @@ async fn out_of_range_republishes_a_snapshot_and_resumes() {
     let mut handle = Events::of(rt.attach(DEVICE));
     rt.spawn(CancellationToken::new()).unwrap();
 
-    // The initial snapshot (seq 37, next 42).
-    wait_for(
-        &mut handle,
-        "the initial snapshot",
-        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 37)),
-    )
-    .await;
+    // The initial snapshot (seq 37, next 42) — ordinary flow.
+    wait_for(&mut handle, "the initial snapshot", |e| on_change(e, 37)).await;
 
     // Ladder 2: the loss is quantified — the agent's firstSequence (153) minus our cursor (42).
     let loss = wait_for(&mut handle, "the data-loss event", |e| {
@@ -414,19 +428,17 @@ async fn out_of_range_republishes_a_snapshot_and_resumes() {
     );
 
     // The recovery snapshot REPUBLISHES the same values as fresh (dedupe floors bypassed): the
-    // same /current document, the same sequence 37, deliberately said again.
-    wait_for(
-        &mut handle,
-        "the republished snapshot",
-        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 37)),
-    )
+    // same /current document, the same sequence 37, deliberately said again — and said as a
+    // RE-BASELINE, which is how the instance knows to rebuild its whole view of the device rather
+    // than treat 37 as one more on-change reading.
+    wait_for(&mut handle, "the republished snapshot", |e| {
+        re_baseline(e, 37)
+    })
     .await;
-    // And the stream resumes and delivers.
-    wait_for(
-        &mut handle,
-        "the post-recovery observation",
-        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 43)),
-    )
+    // And the stream resumes and delivers — on-change again.
+    wait_for(&mut handle, "the post-recovery observation", |e| {
+        on_change(e, 43)
+    })
     .await;
 
     let requests = agent.requests();
@@ -489,12 +501,12 @@ async fn an_agent_restart_reprobes_surfaces_drift_and_resumes() {
     let mut handle = Events::of(rt.attach(DEVICE));
     rt.spawn(CancellationToken::new()).unwrap();
 
-    // The restart's own observation is published fresh (sequence numbering restarted at 3).
-    wait_for(
-        &mut handle,
-        "the post-restart observation",
-        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 3)),
-    )
+    // The restart's own observation is published fresh (sequence numbering restarted at 3) — as a
+    // RE-BASELINE, because every dedupe floor went with the dead incarnation and what the instance
+    // is being handed is a whole fresh view, not one more on-change reading.
+    wait_for(&mut handle, "the post-restart observation", |e| {
+        re_baseline(e, 3)
+    })
     .await;
 
     // Ladder 3: the model was re-verified and its digest CHANGED — surfaced, never remapped.
@@ -507,13 +519,8 @@ async fn an_agent_restart_reprobes_surfaces_drift_and_resumes() {
     };
     assert_ne!(old, new, "the digest change is the drift");
 
-    // The machine resumed streaming against the new incarnation.
-    wait_for(
-        &mut handle,
-        "the resumed stream",
-        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 5)),
-    )
-    .await;
+    // The machine resumed streaming against the new incarnation — on-change flow again.
+    wait_for(&mut handle, "the resumed stream", |e| on_change(e, 5)).await;
     wait_info(&rt, "the new instance id", |i| {
         i.instance_id == Some(NEW_INSTANCE)
     })
@@ -556,11 +563,9 @@ async fn repeated_establish_failures_degrade_to_polling_and_recover() {
     );
 
     // Degraded is not down: /current polling keeps data flowing between stream retries.
-    wait_for(
-        &mut handle,
-        "poll-delivered data while degraded",
-        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 57)),
-    )
+    wait_for(&mut handle, "poll-delivered data while degraded", |e| {
+        on_change(e, 57)
+    })
     .await;
     assert_eq!(
         rt.info().mode,
@@ -680,7 +685,7 @@ async fn a_stream_that_delivered_resumes_at_once_without_counting_a_failure() {
 
     for sequence in [43u64, 44, 45] {
         wait_for(&mut events, "the streamed observation", |e| {
-            matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == sequence))
+            on_change(e, sequence)
         })
         .await;
     }
@@ -711,7 +716,7 @@ async fn poll_only_never_requests_a_stream() {
     rt.spawn(CancellationToken::new()).unwrap();
 
     wait_for(&mut handle, "polled data", |e| {
-        matches!(e, InstanceEvent::Snapshot(_))
+        matches!(e, InstanceEvent::Obs(_))
     })
     .await;
     tokio::time::sleep(Duration::from_millis(120)).await;
@@ -766,30 +771,31 @@ async fn one_stream_serves_many_devices_each_seeing_only_its_own() {
     let mut mazak = Events::of(rt.attach("MAZAK.999"));
     rt.spawn(CancellationToken::new()).unwrap();
 
-    let okuma_obs = wait_for(
-        &mut okuma,
-        "the CNC's streamed observation",
-        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 58)),
-    )
+    let okuma_obs = wait_for(&mut okuma, "the CNC's streamed observation", |e| {
+        on_change(e, 58)
+    })
     .await;
-    if let InstanceEvent::Snapshot(obs) = &okuma_obs {
-        assert!(
-            obs.iter().all(|o| o.data_item_id != "m-avail"),
-            "no cross-device leakage"
-        );
-    }
-    let mazak_obs = wait_for(
-        &mut mazak,
-        "the mill's streamed observation",
-        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 59)),
-    )
+    let InstanceEvent::Obs(cnc) = &okuma_obs else {
+        panic!("{okuma_obs:?}")
+    };
+    assert_eq!(cnc.data_item_id, "Xabs", "no cross-device leakage");
+    assert!(
+        okuma
+            .pending
+            .iter()
+            .all(|e| !matches!(e, InstanceEvent::Obs(o) if o.data_item_id == "m-avail")),
+        "no cross-device leakage: {:?}",
+        okuma.pending
+    );
+
+    let mazak_obs = wait_for(&mut mazak, "the mill's streamed observation", |e| {
+        on_change(e, 59)
+    })
     .await;
-    if let InstanceEvent::Snapshot(obs) = &mazak_obs {
-        assert!(
-            obs.iter().all(|o| o.data_item_id == "m-avail"),
-            "only its own items"
-        );
-    }
+    let InstanceEvent::Obs(mill) = &mazak_obs else {
+        panic!("{mazak_obs:?}")
+    };
+    assert_eq!(mill.data_item_id, "m-avail", "only its own items");
 
     rt.shutdown().await;
 }
