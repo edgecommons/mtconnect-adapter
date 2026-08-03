@@ -25,7 +25,10 @@ async fn connects_polls_once_and_asserts_readings_and_quality() {
 
     // --- connect --------------------------------------------------------------------------
     let backend = SimBackend;
-    let cfg = ConnectionConfig { endpoint, extra: serde_json::Map::new() };
+    let cfg = ConnectionConfig {
+        endpoint,
+        extra: serde_json::Map::new(),
+    };
     let mut session = backend
         .connect(&cfg)
         .await
@@ -36,7 +39,10 @@ async fn connects_polls_once_and_asserts_readings_and_quality() {
         .read_signals()
         .await
         .expect("one read cycle against the live endpoint");
-    assert!(!readings.is_empty(), "a live poll must return at least one reading");
+    assert!(
+        !readings.is_empty(),
+        "a live poll must return at least one reading"
+    );
 
     // --- assert readings + quality ------------------------------------------------------------
     // Every reading carries an explicit quality — GOOD or BAD, never omitted — so a consumer can

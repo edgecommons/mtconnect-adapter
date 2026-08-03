@@ -120,7 +120,9 @@ impl Reading {
     /// Attach one extra field (fluent).
     #[must_use]
     pub fn with_extra(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
-        self.extra.get_or_insert_with(serde_json::Map::new).insert(key.into(), value);
+        self.extra
+            .get_or_insert_with(serde_json::Map::new)
+            .insert(key.into(), value);
         self
     }
 }
@@ -220,7 +222,10 @@ pub trait DeviceSession: Send + Sync {
     /// Only when the *connection* is broken (same contract as [`read_signals`](Self::read_signals)).
     async fn read_named(&mut self, ids: &[String]) -> Result<Vec<Reading>> {
         let all = self.read_signals().await?;
-        Ok(all.into_iter().filter(|r| ids.iter().any(|id| id == &r.signal_id)).collect())
+        Ok(all
+            .into_iter()
+            .filter(|r| ids.iter().any(|id| id == &r.signal_id))
+            .collect())
     }
 
     /// Write a value back to the device.
@@ -413,7 +418,10 @@ impl DeviceBackend for SimBackend {
     fn inventory(&self, _cfg: &ConnectionConfig) -> Vec<SignalInfo> {
         SIM_SIGNALS
             .iter()
-            .map(|(id, name, _)| SignalInfo { id: (*id).to_string(), name: Some((*name).to_string()) })
+            .map(|(id, name, _)| SignalInfo {
+                id: (*id).to_string(),
+                name: Some((*name).to_string()),
+            })
             .collect()
     }
 
@@ -421,7 +429,9 @@ impl DeviceBackend for SimBackend {
         if cfg.endpoint.is_empty() {
             // A missing endpoint will never fix itself: permanent, so the supervisor does not
             // spend the next hour reconnecting to nothing.
-            return Err(DeviceError::Permanent(anyhow::anyhow!("no endpoint configured")));
+            return Err(DeviceError::Permanent(anyhow::anyhow!(
+                "no endpoint configured"
+            )));
         }
         Ok(Box::new(SimSession { tick: 0 }))
     }
@@ -478,7 +488,10 @@ impl DeviceSession for SimSession {
                 type_name: (*ty).to_string(),
             })
             .collect();
-        Ok(BrowsePage { entries, next_cursor: None })
+        Ok(BrowsePage {
+            entries,
+            next_cursor: None,
+        })
     }
 }
 
@@ -487,7 +500,10 @@ mod tests {
     use super::*;
 
     fn conn(endpoint: &str) -> ConnectionConfig {
-        ConnectionConfig { endpoint: endpoint.into(), extra: serde_json::Map::new() }
+        ConnectionConfig {
+            endpoint: endpoint.into(),
+            extra: serde_json::Map::new(),
+        }
     }
 
     #[tokio::test]
@@ -510,7 +526,10 @@ mod tests {
         // that silently vanishes is indistinguishable from one that is not changing.
         let mut s = SimBackend.connect(&conn("sim://device")).await.unwrap();
         let readings = s.read_signals().await.unwrap();
-        let bad = readings.iter().find(|r| r.signal_id == "pressure-1").unwrap();
+        let bad = readings
+            .iter()
+            .find(|r| r.signal_id == "pressure-1")
+            .unwrap();
         assert_eq!(bad.quality, Quality::Bad);
         assert_eq!(bad.quality_raw.as_deref(), Some("SENSOR_FAULT"));
     }
@@ -522,7 +541,10 @@ mod tests {
         let Err(e) = SimBackend.connect(&conn("")).await else {
             panic!("connecting with no endpoint must fail");
         };
-        assert!(!e.is_transient(), "a missing endpoint will never fix itself by retrying");
+        assert!(
+            !e.is_transient(),
+            "a missing endpoint will never fix itself by retrying"
+        );
     }
 
     #[tokio::test]
@@ -542,7 +564,11 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].signal_id, "temperature-1");
         // An unknown id resolves to nothing (the command layer reports it as a BAD/no-data entry).
-        assert!(s.read_named(&["nope".to_string()]).await.unwrap().is_empty());
+        assert!(s
+            .read_named(&["nope".to_string()])
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -551,7 +577,10 @@ mod tests {
         let page = s.browse(None, 100).await.unwrap();
         assert_eq!(page.entries.len(), 2);
         assert_eq!(page.entries[0].id, "temperature-1");
-        assert!(page.next_cursor.is_none(), "the sim's first page is its last");
+        assert!(
+            page.next_cursor.is_none(),
+            "the sim's first page is its last"
+        );
         // A cursor asks for the page after the last — empty.
         let page2 = s.browse(Some("x".into()), 100).await.unwrap();
         assert!(page2.entries.is_empty());
@@ -580,7 +609,10 @@ mod tests {
             }
         }
         let mut s = NoBrowse;
-        assert!(matches!(s.browse(None, 10).await, Err(BrowseError::Unsupported)));
+        assert!(matches!(
+            s.browse(None, 10).await,
+            Err(BrowseError::Unsupported)
+        ));
     }
 }
 
@@ -645,7 +677,9 @@ pub fn connection_binding(cfg: &ConnectionConfig) -> std::result::Result<(String
         match cfg.extra.get(key).and_then(Value::as_str) {
             Some(v) if !v.trim().is_empty() => Ok(v.to_string()),
             Some(_) => Err(format!("connection.{key} must not be empty")),
-            None => Err(format!("connection.{key} is required for the `{KIND}` adapter")),
+            None => Err(format!(
+                "connection.{key} is required for the `{KIND}` adapter"
+            )),
         }
     };
     Ok((field("agentId")?, field("deviceUuid")?))
@@ -711,7 +745,11 @@ impl MtcBackend {
             .into_iter()
             .map(|d| (binding_key(&d.agent_id, &d.device_uuid), d))
             .collect();
-        Self { agents, devices, signals }
+        Self {
+            agents,
+            devices,
+            signals,
+        }
     }
 
     /// The live signal registry a reload swaps into (LLD §8) — the same slots the sessions read.
@@ -720,14 +758,19 @@ impl MtcBackend {
         Arc::clone(&self.signals)
     }
 
-    fn binding(&self, cfg: &ConnectionConfig) -> std::result::Result<&MtcDeviceConfig, DeviceError> {
+    fn binding(
+        &self,
+        cfg: &ConnectionConfig,
+    ) -> std::result::Result<&MtcDeviceConfig, DeviceError> {
         let (agent_id, uuid) =
             connection_binding(cfg).map_err(|e| DeviceError::Permanent(anyhow::anyhow!(e)))?;
-        self.devices.get(&binding_key(&agent_id, &uuid)).ok_or_else(|| {
-            DeviceError::Permanent(anyhow::anyhow!(
-                "no configured device `{uuid}` on agent `{agent_id}`"
-            ))
-        })
+        self.devices
+            .get(&binding_key(&agent_id, &uuid))
+            .ok_or_else(|| {
+                DeviceError::Permanent(anyhow::anyhow!(
+                    "no configured device `{uuid}` on agent `{agent_id}`"
+                ))
+            })
     }
 }
 
@@ -754,7 +797,10 @@ impl DeviceBackend for MtcBackend {
                     served_set(&live.signals, live.selection.as_ref(), model.as_deref())
                         .signals
                         .into_iter()
-                        .map(|s| SignalInfo { id: s.signal.id, name: s.signal.name })
+                        .map(|s| SignalInfo {
+                            id: s.signal.id,
+                            name: s.signal.name,
+                        })
                         .collect()
                 }
                 None => Vec::new(),
@@ -777,7 +823,10 @@ impl DeviceBackend for MtcBackend {
             .clone();
 
         // "Connected" means the agent answered AND this device is really in its probe.
-        let model = agent.ensure_model(&device.device_uuid).await.map_err(to_device_error)?;
+        let model = agent
+            .ensure_model(&device.device_uuid)
+            .await
+            .map_err(to_device_error)?;
         let slot = self.signals.slot(&device.id).ok_or_else(|| {
             DeviceError::Permanent(anyhow::anyhow!(
                 "instance `{}` has no signal slot; it was not in the compiled configuration",
@@ -785,7 +834,9 @@ impl DeviceBackend for MtcBackend {
             ))
         })?;
         let handle = agent.attach(&device.device_uuid);
-        Ok(Box::new(MtcSession::with_slot(agent, device, model, handle.rx, slot)))
+        Ok(Box::new(MtcSession::with_slot(
+            agent, device, model, handle.rx, slot,
+        )))
     }
 }
 
@@ -837,13 +888,16 @@ pub fn resolve_agent_credentials(
 
     let auth = match &cfg.auth {
         None => None,
-        Some(AuthRef::Basic { username, secret_ref }) => Some(AuthMaterial::Basic {
+        Some(AuthRef::Basic {
+            username,
+            secret_ref,
+        }) => Some(AuthMaterial::Basic {
             username: username.clone(),
             password: fetch(secret_ref)?,
         }),
-        Some(AuthRef::Bearer { secret_ref }) => {
-            Some(AuthMaterial::Bearer { token: fetch(secret_ref)? })
-        }
+        Some(AuthRef::Bearer { secret_ref }) => Some(AuthMaterial::Bearer {
+            token: fetch(secret_ref)?,
+        }),
     };
 
     let tls = match &cfg.tls {
@@ -970,8 +1024,11 @@ impl MtcSession {
 
     /// The served data item ids of this device — the scope of a forced `/current` snapshot.
     fn configured_data_items(&self) -> Vec<String> {
-        let mut ids: Vec<String> =
-            self.served.iter().map(|s| s.signal.data_item_id.clone()).collect();
+        let mut ids: Vec<String> = self
+            .served
+            .iter()
+            .map(|s| s.signal.data_item_id.clone())
+            .collect();
         ids.sort();
         ids.dedup();
         ids
@@ -982,7 +1039,8 @@ impl MtcSession {
         match self.last_condition_event.get(data_item_id) {
             Some(last) if now.saturating_duration_since(*last) < CONDITION_EVENT_INTERVAL => false,
             _ => {
-                self.last_condition_event.insert(data_item_id.to_string(), now);
+                self.last_condition_event
+                    .insert(data_item_id.to_string(), now);
                 true
             }
         }
@@ -1070,7 +1128,11 @@ impl MtcSession {
     /// the model — a removed item simply stops publishing, and the change is announced as a
     /// set-change event with counts, never a lingering BAD and never silence.
     fn recompile(&mut self) {
-        let set = served_set(&self.device.signals, self.device.selection.as_ref(), Some(&self.model));
+        let set = served_set(
+            &self.device.signals,
+            self.device.selection.as_ref(),
+            Some(&self.model),
+        );
 
         // Explicit signals keep the strict permanent-BAD missing-item contract.
         self.unbound = self
@@ -1211,7 +1273,10 @@ impl MtcSession {
     fn map_batch_at(&mut self, observations: &[Observation], now: Instant) -> Vec<Reading> {
         for obs in observations {
             if let Some(state) = obs.condition_state() {
-                let code = obs.extra("nativeCode").and_then(Value::as_str).map(str::to_string);
+                let code = obs
+                    .extra("nativeCode")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 let previous = self
                     .conditions
                     .insert(obs.data_item_id.clone(), (state, code.clone()))
@@ -1241,7 +1306,12 @@ impl MtcSession {
         let mut out = Vec::new();
         for obs in observations {
             for sig in self.signals_for(&obs.data_item_id) {
-                out.push(reading_from_observation(obs, sig, &self.model, &self.conditions));
+                out.push(reading_from_observation(
+                    obs,
+                    sig,
+                    &self.model,
+                    &self.conditions,
+                ));
             }
         }
         out
@@ -1300,7 +1370,9 @@ impl DeviceSession for MtcSession {
         }
         // The agent went away: the supervisor's reconnect ladder owns what happens next.
         if let Some(reason) = down {
-            return Err(DeviceError::Transient(anyhow::anyhow!("agent unreachable: {reason}")));
+            return Err(DeviceError::Transient(anyhow::anyhow!(
+                "agent unreachable: {reason}"
+            )));
         }
 
         let mut readings = self.map_batch(&observations);
@@ -1337,7 +1409,9 @@ impl DeviceSession for MtcSession {
             .filter(|r| ids.iter().any(|id| id == &r.signal_id))
             .collect();
         readings.extend(
-            self.unbound_readings().into_iter().filter(|r| ids.iter().any(|id| id == &r.signal_id)),
+            self.unbound_readings()
+                .into_iter()
+                .filter(|r| ids.iter().any(|id| id == &r.signal_id)),
         );
         Ok(readings)
     }
@@ -1385,7 +1459,10 @@ impl DeviceSession for MtcSession {
     /// right half, a model drift moves the left — and both change what
     /// [`shaping_policies`](DeviceSession::shaping_policies) says, so both must rebuild the table.
     fn shaping_generation(&self) -> Option<String> {
-        Some(crate::reload::view_generation(&self.model.digest_hex(), &self.generation))
+        Some(crate::reload::view_generation(
+            &self.model.digest_hex(),
+            &self.generation,
+        ))
     }
 
     /// The served set's effective publish policies (HLD §5.3): each served signal's `publish`
@@ -1542,7 +1619,9 @@ pub fn reading_from_observation(
         channel: sig.channel.clone(),
         // The canonical path, straight from the model that serves `sb/signals` — the derived
         // channel above may be truncated to the topic budget, this never is (L12/L13).
-        component_path: model.component_path_of(&obs.data_item_id).map(str::to_string),
+        component_path: model
+            .component_path_of(&obs.data_item_id)
+            .map(str::to_string),
     }
 }
 
@@ -1619,7 +1698,10 @@ mod mtconnect_seam_tests {
     }
 
     fn obs(id: &str) -> Observation {
-        observations().into_iter().find(|o| o.data_item_id == id).expect("observation")
+        observations()
+            .into_iter()
+            .find(|o| o.data_item_id == id)
+            .expect("observation")
     }
 
     fn signal(id: &str, data_item_id: &str) -> SignalConfig {
@@ -1662,7 +1744,10 @@ mod mtconnect_seam_tests {
         let mut extra = serde_json::Map::new();
         extra.insert("agentId".into(), json!(agent));
         extra.insert("deviceUuid".into(), json!(uuid));
-        ConnectionConfig { endpoint: String::new(), extra }
+        ConnectionConfig {
+            endpoint: String::new(),
+            extra,
+        }
     }
 
     // --- the mapping ------------------------------------------------------------------------
@@ -1681,8 +1766,14 @@ mod mtconnect_seam_tests {
         assert_eq!(r.quality_raw.as_deref(), Some("MTC_OK"));
         // The observation timestamp is the AGENT's capture stamp -> serverTs (crate::app maps it).
         assert_eq!(r.capture_ts.as_deref(), Some("2026-07-27T10:00:04.250000Z"));
-        assert!(r.source_ts.is_none(), "MTConnect distinguishes no device-authored time");
-        assert!(r.received_ts.is_none(), "the worker stamps the receive moment");
+        assert!(
+            r.source_ts.is_none(),
+            "MTConnect distinguishes no device-authored time"
+        );
+        assert!(
+            r.received_ts.is_none(),
+            "the worker stamps the receive moment"
+        );
         assert_eq!(r.extra.as_ref().unwrap()["sequence"], json!(37));
         // The label falls back to the agent's own name for the data item.
         assert_eq!(r.name.as_deref(), Some("Xabs"));
@@ -1719,10 +1810,16 @@ mod mtconnect_seam_tests {
         );
         assert_eq!(r.value, Some(json!("FAULT")));
         assert_eq!(r.quality, Quality::Bad);
-        assert_eq!(r.quality_raw.as_deref(), Some("MTC_CONDITION:FAULT:ALM-1041"));
+        assert_eq!(
+            r.quality_raw.as_deref(),
+            Some("MTC_CONDITION:FAULT:ALM-1041")
+        );
         let extra = r.extra.unwrap();
         assert_eq!(extra["nativeCode"], json!("ALM-1041"));
-        assert_eq!(extra["conditionText"], json!("X axis travel limit exceeded"));
+        assert_eq!(
+            extra["conditionText"],
+            json!("X axis travel limit exceeded")
+        );
 
         // A Normal condition is GOOD, and says which state it is.
         let r = reading_from_observation(
@@ -1747,24 +1844,45 @@ mod mtconnect_seam_tests {
         assert_eq!(r.quality, Quality::Good);
 
         // A warning makes the value UNCERTAIN — it is still a value, and the alarm says why.
-        conditions.insert("Xtravel".to_string(), (CondState::Warning, Some("ALM-7".into())));
+        conditions.insert(
+            "Xtravel".to_string(),
+            (CondState::Warning, Some("ALM-7".into())),
+        );
         let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &conditions);
         assert_eq!(r.quality, Quality::Uncertain);
-        assert_eq!(r.quality_raw.as_deref(), Some("MTC_CONDITION:WARNING:ALM-7"));
-        assert_eq!(r.value, Some(json!(123.456)), "a warned value is still published");
+        assert_eq!(
+            r.quality_raw.as_deref(),
+            Some("MTC_CONDITION:WARNING:ALM-7")
+        );
+        assert_eq!(
+            r.value,
+            Some(json!(123.456)),
+            "a warned value is still published"
+        );
 
         // A fault makes it BAD.
-        conditions.insert("Xtravel".to_string(), (CondState::Fault, Some("ALM-1041".into())));
+        conditions.insert(
+            "Xtravel".to_string(),
+            (CondState::Fault, Some("ALM-1041".into())),
+        );
         let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &conditions);
         assert_eq!(r.quality, Quality::Bad);
-        assert_eq!(r.quality_raw.as_deref(), Some("MTC_CONDITION:FAULT:ALM-1041"));
+        assert_eq!(
+            r.quality_raw.as_deref(),
+            Some("MTC_CONDITION:FAULT:ALM-1041")
+        );
 
         // An UNAVAILABLE value stays UNAVAILABLE: a binding cannot make a reading look better.
-        let r = reading_from_observation(&obs("Xload"), &{
-            let mut s = signal("x-load", "Xload");
-            s.condition_binding = Some(vec!["Xtravel".into()]);
-            s
-        }, &model(), &conditions);
+        let r = reading_from_observation(
+            &obs("Xload"),
+            &{
+                let mut s = signal("x-load", "Xload");
+                s.condition_binding = Some(vec!["Xtravel".into()]);
+                s
+            },
+            &model(),
+            &conditions,
+        );
         assert_eq!(r.quality_raw.as_deref(), Some("UNAVAILABLE"));
 
         // An unbound condition affects only its own signal.
@@ -1807,7 +1925,10 @@ mod mtconnect_seam_tests {
     fn condition_quality_names_the_alarm_when_the_agent_gave_one() {
         assert_eq!(
             condition_quality(CondState::Warning, Some("ALM-9")),
-            (Quality::Uncertain, "MTC_CONDITION:WARNING:ALM-9".to_string())
+            (
+                Quality::Uncertain,
+                "MTC_CONDITION:WARNING:ALM-9".to_string()
+            )
         );
         assert_eq!(
             condition_quality(CondState::Warning, None),
@@ -1852,11 +1973,18 @@ mod mtconnect_seam_tests {
         let (_tx, rx) = mpsc::channel(4);
         let mut session = MtcSession::new(
             agent,
-            selecting(vec![signal("x-position", "Xabs")], serde_json::json!({ "mode": "all" })),
+            selecting(
+                vec![signal("x-position", "Xabs")],
+                serde_json::json!({ "mode": "all" }),
+            ),
             model(),
             rx,
         );
-        assert_eq!(session.served_signals(), Some(14), "1 explicit (merged) + 13 derived");
+        assert_eq!(
+            session.served_signals(),
+            Some(14),
+            "1 explicit (merged) + 13 derived"
+        );
 
         // A derived signal maps a batch onto its derived identity — id and channel included.
         let readings = session.map_batch(&[obs("Sspeed")]);
@@ -1884,8 +2012,9 @@ mod mtconnect_seam_tests {
                 &m,
                 &HashMap::new(),
             );
-            let served = m.address_of("line-a-agent", data_item_id).expect("an address")
-                ["componentPath"]
+            let served = m
+                .address_of("line-a-agent", data_item_id)
+                .expect("an address")["componentPath"]
                 .clone();
             assert_eq!(
                 serde_json::Value::from(r.component_path.clone()),
@@ -1903,7 +2032,11 @@ mod mtconnect_seam_tests {
             &model(),
             &HashMap::new(),
         );
-        assert_eq!(r.component_path.as_deref(), Some(""), "known, and hanging off no component");
+        assert_eq!(
+            r.component_path.as_deref(),
+            Some(""),
+            "known, and hanging off no component"
+        );
     }
 
     #[test]
@@ -1933,10 +2066,18 @@ mod mtconnect_seam_tests {
         // (`unlearned_address`), and the reading agrees by carrying `None`.
         let agent = runtime("http://127.0.0.1:9");
         let (_tx, rx) = mpsc::channel(4);
-        let session =
-            MtcSession::new(agent, device(vec![signal("ghost", "no-such-item")]), model(), rx);
+        let session = MtcSession::new(
+            agent,
+            device(vec![signal("ghost", "no-such-item")]),
+            model(),
+            rx,
+        );
         let unbound = session.unbound_readings();
-        assert_eq!(unbound.len(), 1, "the explicit signal is unbound against this model");
+        assert_eq!(
+            unbound.len(),
+            1,
+            "the explicit signal is unbound against this model"
+        );
         assert_eq!(unbound[0].signal_id, "ghost");
         assert_eq!(unbound[0].quality, Quality::Bad);
         assert_eq!(unbound[0].component_path, None);
@@ -1951,11 +2092,13 @@ mod mtconnect_seam_tests {
     #[test]
     fn shaping_policies_grant_a_deadband_only_to_sample_category_items() {
         let mut sample = signal("x-position", "Xabs"); // SAMPLE in the fixture model
-        sample.publish = Some(serde_json::from_value(json!({ "batchMs": 250, "deadband": 0.5 })).unwrap());
+        sample.publish =
+            Some(serde_json::from_value(json!({ "batchMs": 250, "deadband": 0.5 })).unwrap());
         let mut event = signal("execution", "execution"); // EVENT in the fixture model
         event.publish = Some(serde_json::from_value(json!({ "deadband": 0.5 })).unwrap());
         let mut condition = signal("x-travel", "Xtravel"); // CONDITION in the fixture model
-        condition.publish = Some(serde_json::from_value(json!({ "deadband": 1.0, "batchMs": 100 })).unwrap());
+        condition.publish =
+            Some(serde_json::from_value(json!({ "deadband": 1.0, "batchMs": 100 })).unwrap());
         let mut unbound = signal("ghost", "no-such-item"); // not in the model at all
         unbound.publish =
             Some(serde_json::from_value(json!({ "deadband": 1.0, "batchMs": 50 })).unwrap());
@@ -1981,10 +2124,19 @@ mod mtconnect_seam_tests {
             "an EVENT's deadband is dropped, leaving a trivial policy - no entry"
         );
         let c = &policies["x-travel"];
-        assert_eq!(c.deadband, None, "a CONDITION's states are never numerically gated");
+        assert_eq!(
+            c.deadband, None,
+            "a CONDITION's states are never numerically gated"
+        );
         assert_eq!(c.batch_ms, 100, "but its window still applies");
-        assert_eq!(policies["ghost"].deadband, None, "no model item, no category, no deadband");
-        assert!(!policies.contains_key("x-load"), "the default policy is not worth an entry");
+        assert_eq!(
+            policies["ghost"].deadband, None,
+            "no model item, no category, no deadband"
+        );
+        assert!(
+            !policies.contains_key("x-load"),
+            "the default policy is not worth an entry"
+        );
     }
 
     #[test]
@@ -2011,50 +2163,76 @@ mod mtconnect_seam_tests {
         let (_tx, rx) = mpsc::channel(4);
         let session = MtcSession::new(agent, dev, model(), rx);
         let policies = session.shaping_policies();
-        assert_eq!(policies["xabs"].batch_ms, 250, "derived SAMPLE: the defaults window");
-        assert!(policies["xabs"].latest_only, "derived SAMPLE: the defaults mode");
-        assert_eq!(policies["xabs"].deadband, None, "no derived deadband, ever (L10)");
-        assert!(!policies.contains_key("execution"), "derived EVENT: immediate, no entry");
+        assert_eq!(
+            policies["xabs"].batch_ms, 250,
+            "derived SAMPLE: the defaults window"
+        );
+        assert!(
+            policies["xabs"].latest_only,
+            "derived SAMPLE: the defaults mode"
+        );
+        assert_eq!(
+            policies["xabs"].deadband, None,
+            "no derived deadband, ever (L10)"
+        );
+        assert!(
+            !policies.contains_key("execution"),
+            "derived EVENT: immediate, no entry"
+        );
     }
 
     #[test]
     fn the_shaping_generation_moves_with_the_signal_set_and_the_model() {
         let agent = runtime("http://127.0.0.1:9");
         let (_tx, rx) = mpsc::channel(4);
-        let mut session =
-            MtcSession::new(Arc::clone(&agent), device(vec![signal("x", "Xabs")]), model(), rx);
-        let before = session.shaping_generation().expect("an MTConnect session has a generation");
+        let mut session = MtcSession::new(
+            Arc::clone(&agent),
+            device(vec![signal("x", "Xabs")]),
+            model(),
+            rx,
+        );
+        let before = session
+            .shaping_generation()
+            .expect("an MTConnect session has a generation");
 
         // A publish-policy edit moves the generation (the reload swap re-arms the shaper).
         let mut edited = signal("x", "Xabs");
         edited.publish = Some(serde_json::from_value(json!({ "batchMs": 100 })).unwrap());
         session.device.signals = vec![edited];
-        session.generation =
-            crate::reload::generation_of(&session.device.signals, session.device.selection.as_ref());
+        session.generation = crate::reload::generation_of(
+            &session.device.signals,
+            session.device.selection.as_ref(),
+        );
         session.recompile();
         let after = session.shaping_generation().unwrap();
         assert_ne!(before, after, "a policy edit is a new shaping generation");
 
         // The generation composes the probe digest too: a model drift recompiles categories.
-        assert!(after.starts_with(&session.model.digest_hex()), "probe digest leads the token");
+        assert!(
+            after.starts_with(&session.model.digest_hex()),
+            "probe digest leads the token"
+        );
     }
 
     #[tokio::test]
     async fn a_drained_snapshot_marks_the_session_resynced_once() {
         let agent = runtime("http://127.0.0.1:9");
         let (tx, rx) = mpsc::channel(8);
-        let mut session =
-            MtcSession::new(agent, device(vec![signal("x", "Xabs")]), model(), rx);
+        let mut session = MtcSession::new(agent, device(vec![signal("x", "Xabs")]), model(), rx);
         assert!(!session.take_resync(), "nothing drained yet");
 
-        tx.send(InstanceEvent::Snapshot(vec![obs("Xabs")])).await.unwrap();
+        tx.send(InstanceEvent::Snapshot(vec![obs("Xabs")]))
+            .await
+            .unwrap();
         let readings = session.read_signals().await.unwrap();
         assert!(!readings.is_empty());
         assert!(session.take_resync(), "the snapshot re-baselined the view");
         assert!(!session.take_resync(), "draining it resets it");
 
         // A plain observation is NOT a resync.
-        tx.send(InstanceEvent::Obs(Box::new(obs("Xabs")))).await.unwrap();
+        tx.send(InstanceEvent::Obs(Box::new(obs("Xabs"))))
+            .await
+            .unwrap();
         session.read_signals().await.unwrap();
         assert!(!session.take_resync());
     }
@@ -2071,10 +2249,14 @@ mod mtconnect_seam_tests {
 
         let mut missing = connection("line-a-agent", "X");
         missing.extra.remove("deviceUuid");
-        assert!(connection_binding(&missing).unwrap_err().contains("deviceUuid"));
+        assert!(connection_binding(&missing)
+            .unwrap_err()
+            .contains("deviceUuid"));
 
         let blank = connection("line-a-agent", "   ");
-        assert!(connection_binding(&blank).unwrap_err().contains("must not be empty"));
+        assert!(connection_binding(&blank)
+            .unwrap_err()
+            .contains("must not be empty"));
     }
 
     #[test]
@@ -2096,11 +2278,17 @@ mod mtconnect_seam_tests {
 
     #[tokio::test]
     async fn a_missing_binding_is_a_permanent_configuration_failure() {
-        let backend = MtcBackend::new(HashMap::new(), vec![device(vec![])], ChannelBudgets::default());
+        let backend = MtcBackend::new(
+            HashMap::new(),
+            vec![device(vec![])],
+            ChannelBudgets::default(),
+        );
         // An instance whose connection names nothing.
         let mut bare = connection("line-a-agent", "OKUMA.123456");
         bare.extra.remove("agentId");
-        let Err(e) = backend.connect(&bare).await else { panic!("must fail") };
+        let Err(e) = backend.connect(&bare).await else {
+            panic!("must fail")
+        };
         assert!(!e.is_transient());
 
         // A device that is not configured on that agent.
@@ -2110,10 +2298,16 @@ mod mtconnect_seam_tests {
         assert!(!e.is_transient());
 
         // A device whose agent runtime does not exist.
-        let Err(e) = backend.connect(&connection("line-a-agent", "OKUMA.123456")).await else {
+        let Err(e) = backend
+            .connect(&connection("line-a-agent", "OKUMA.123456"))
+            .await
+        else {
             panic!("must fail")
         };
-        assert!(!e.is_transient(), "an unconfigured agent will not appear by retrying");
+        assert!(
+            !e.is_transient(),
+            "an unconfigured agent will not appear by retrying"
+        );
         assert_eq!(backend.kind(), KIND);
     }
 
@@ -2122,7 +2316,10 @@ mod mtconnect_seam_tests {
         let backend = MtcBackend::new(
             HashMap::new(),
             vec![device(vec![
-                SignalConfig { name: Some("X position".into()), ..signal("x-position", "Xabs") },
+                SignalConfig {
+                    name: Some("X position".into()),
+                    ..signal("x-position", "Xabs")
+                },
                 signal("x-load", "Xload"),
             ])],
             ChannelBudgets::default(),
@@ -2133,14 +2330,19 @@ mod mtconnect_seam_tests {
         assert_eq!(inv[0].name.as_deref(), Some("X position"));
         assert_eq!(inv[1].name, None);
         // An unknown device has no inventory, and asking is not an error.
-        assert!(backend.inventory(&connection("line-a-agent", "NOPE")).is_empty());
+        assert!(backend
+            .inventory(&connection("line-a-agent", "NOPE"))
+            .is_empty());
     }
 
     #[tokio::test]
     async fn reading_drains_what_the_agent_delivered_and_says_nothing_when_nothing_changed() {
         let agent = runtime("http://127.0.0.1:9");
         let handle = agent.attach("OKUMA.123456");
-        let device = device(vec![signal("x-position", "Xabs"), signal("x-load", "Xload")]);
+        let device = device(vec![
+            signal("x-position", "Xabs"),
+            signal("x-load", "Xload"),
+        ]);
         let mut session = MtcSession::new(Arc::clone(&agent), device, model(), handle.rx);
 
         // Nothing delivered yet: an empty read, not a failure.
@@ -2148,8 +2350,15 @@ mod mtconnect_seam_tests {
 
         agent.ingest_streams(CURRENT_2_7, false).unwrap();
         let readings = session.read_signals().await.unwrap();
-        assert_eq!(readings.len(), 2, "both configured signals, and nothing else");
-        let x = readings.iter().find(|r| r.signal_id == "x-position").unwrap();
+        assert_eq!(
+            readings.len(),
+            2,
+            "both configured signals, and nothing else"
+        );
+        let x = readings
+            .iter()
+            .find(|r| r.signal_id == "x-position")
+            .unwrap();
         assert_eq!(x.value, Some(json!(123.456)));
         let load = readings.iter().find(|r| r.signal_id == "x-load").unwrap();
         assert_eq!(load.quality, Quality::Bad);
@@ -2170,7 +2379,10 @@ mod mtconnect_seam_tests {
         assert_eq!(readings.len(), 1);
         assert_eq!(readings[0].signal_id, "ghost");
         assert_eq!(readings[0].quality, Quality::Bad);
-        assert_eq!(readings[0].quality_raw.as_deref(), Some("MTC_NO_SUCH_DATAITEM"));
+        assert_eq!(
+            readings[0].quality_raw.as_deref(),
+            Some("MTC_NO_SUCH_DATAITEM")
+        );
         assert_eq!(readings[0].value, None);
     }
 
@@ -2178,25 +2390,35 @@ mod mtconnect_seam_tests {
     async fn a_lost_agent_is_a_transient_error_so_the_supervisor_reconnects() {
         let agent = runtime("http://127.0.0.1:9");
         let handle = agent.attach("OKUMA.123456");
-        let mut session =
-            MtcSession::new(Arc::clone(&agent), device(vec![signal("x", "Xabs")]), model(), handle.rx);
+        let mut session = MtcSession::new(
+            Arc::clone(&agent),
+            device(vec![signal("x", "Xabs")]),
+            model(),
+            handle.rx,
+        );
 
         // Bring it up, then knock it down.
         agent.ingest_streams(CURRENT_2_7, false).unwrap();
         session.read_signals().await.unwrap();
-        assert!(agent.poll_once().await.is_err(), "the agent is not listening");
+        assert!(
+            agent.poll_once().await.is_err(),
+            "the agent is not listening"
+        );
 
-        let Err(e) = session.read_signals().await else { panic!("a lost agent must surface") };
-        assert!(e.is_transient(), "reconnecting is exactly the right response");
+        let Err(e) = session.read_signals().await else {
+            panic!("a lost agent must surface")
+        };
+        assert!(
+            e.is_transient(),
+            "reconnecting is exactly the right response"
+        );
     }
 
     // --- protocol notices -> UNS events (HLD §9) ------------------------------------------------
 
     /// A session fed from a channel the test owns, so every runtime event can be delivered
     /// deliberately — including the ones a fake agent could not be made to produce on demand.
-    fn scripted_session(
-        signals: Vec<SignalConfig>,
-    ) -> (MtcSession, mpsc::Sender<InstanceEvent>) {
+    fn scripted_session(signals: Vec<SignalConfig>) -> (MtcSession, mpsc::Sender<InstanceEvent>) {
         let agent = runtime("http://127.0.0.1:9");
         let (tx, rx) = mpsc::channel(32);
         (MtcSession::new(agent, device(signals), model(), rx), tx)
@@ -2214,14 +2436,26 @@ mod mtconnect_seam_tests {
             ..Default::default()
         });
         tx.send(InstanceEvent::AgentUp(info)).await.unwrap();
-        tx.send(InstanceEvent::DataLoss { skipped: 12 }).await.unwrap();
-        tx.send(InstanceEvent::ModelDrift { old: "aa".into(), new: "bb".into() }).await.unwrap();
-        tx.send(InstanceEvent::StreamDegraded { failures: 3 }).await.unwrap();
+        tx.send(InstanceEvent::DataLoss { skipped: 12 })
+            .await
+            .unwrap();
+        tx.send(InstanceEvent::ModelDrift {
+            old: "aa".into(),
+            new: "bb".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(InstanceEvent::StreamDegraded { failures: 3 })
+            .await
+            .unwrap();
         session.read_signals().await.expect("drain");
 
         let notices = session.take_notices();
         assert_eq!(notices.len(), 4);
-        assert!(session.take_notices().is_empty(), "a drain empties the queue");
+        assert!(
+            session.take_notices().is_empty(),
+            "a drain empties the queue"
+        );
 
         let up = &notices[0];
         assert_eq!(up.event_type, EVENT_AGENT);
@@ -2254,15 +2488,23 @@ mod mtconnect_seam_tests {
         // No notice carries anything that came out of a vault.
         for n in &notices {
             let rendered = n.context.to_string();
-            assert!(!rendered.contains("secret") && !rendered.contains("password"), "{rendered}");
+            assert!(
+                !rendered.contains("secret") && !rendered.contains("password"),
+                "{rendered}"
+            );
         }
     }
 
     #[tokio::test]
     async fn a_lost_agent_still_reports_its_event_even_though_the_read_fails() {
         let (mut session, tx) = scripted_session(vec![signal("x", "Xabs")]);
-        tx.send(InstanceEvent::AgentDown("connect refused".into())).await.unwrap();
-        assert!(session.read_signals().await.is_err(), "the supervisor must reconnect");
+        tx.send(InstanceEvent::AgentDown("connect refused".into()))
+            .await
+            .unwrap();
+        assert!(
+            session.read_signals().await.is_err(),
+            "the supervisor must reconnect"
+        );
 
         let notices = session.take_notices();
         assert_eq!(notices.len(), 1);
@@ -2276,8 +2518,7 @@ mod mtconnect_seam_tests {
     fn only_the_transition_into_fault_raises_a_condition_event_and_at_most_once_a_minute() {
         let agent = runtime("http://127.0.0.1:9");
         let (_tx, rx) = mpsc::channel(4);
-        let mut session =
-            MtcSession::new(agent, device(vec![signal("x", "Xabs")]), model(), rx);
+        let mut session = MtcSession::new(agent, device(vec![signal("x", "Xabs")]), model(), rx);
 
         let cond = |state: CondState, seq: u64| Observation {
             data_item_id: "Xtravel".into(),
@@ -2293,7 +2534,10 @@ mod mtconnect_seam_tests {
 
         let t0 = Instant::now();
         session.map_batch_at(&[cond(CondState::Normal, 1)], t0);
-        assert!(session.take_notices().is_empty(), "a healthy condition is not an event");
+        assert!(
+            session.take_notices().is_empty(),
+            "a healthy condition is not an event"
+        );
 
         session.map_batch_at(&[cond(CondState::Fault, 2)], t0);
         let raised = session.take_notices();
@@ -2307,12 +2551,18 @@ mod mtconnect_seam_tests {
 
         // Still faulted: the state keeps publishing as the signal's value, the EVENT does not repeat.
         session.map_batch_at(&[cond(CondState::Fault, 3)], t0 + Duration::from_secs(1));
-        assert!(session.take_notices().is_empty(), "a still-asserted fault is not a new event");
+        assert!(
+            session.take_notices().is_empty(),
+            "a still-asserted fault is not a new event"
+        );
 
         // A fault that clears and re-latches inside the window is still rate-limited.
         session.map_batch_at(&[cond(CondState::Normal, 4)], t0 + Duration::from_secs(2));
         session.map_batch_at(&[cond(CondState::Fault, 5)], t0 + Duration::from_secs(3));
-        assert!(session.take_notices().is_empty(), "one condition event per data item per minute");
+        assert!(
+            session.take_notices().is_empty(),
+            "one condition event per data item per minute"
+        );
 
         // Past the window, a re-latch is news again.
         session.map_batch_at(&[cond(CondState::Normal, 6)], t0 + Duration::from_secs(61));
@@ -2369,7 +2619,10 @@ mod mtconnect_seam_tests {
 
         let page = session.browse(page.next_cursor, 100).await.unwrap();
         assert_eq!(page.entries[0].id, "mtc:/component/Axes");
-        assert!(page.next_cursor.is_none(), "the last page ends the enumeration");
+        assert!(
+            page.next_cursor.is_none(),
+            "the last page ends the enumeration"
+        );
 
         assert!(matches!(
             session.browse(Some("not-a-number".into()), 10).await,
@@ -2395,7 +2648,10 @@ mod mtconnect_seam_tests {
     struct FakeVault(HashMap<String, String>);
 
     impl edgecommons::credentials::CredentialService for FakeVault {
-        fn get(&self, _name: &str) -> edgecommons::Result<Option<edgecommons::credentials::Secret>> {
+        fn get(
+            &self,
+            _name: &str,
+        ) -> edgecommons::Result<Option<edgecommons::credentials::Secret>> {
             Ok(None)
         }
         fn get_version(
@@ -2438,7 +2694,9 @@ mod mtconnect_seam_tests {
         for (k, v) in extra.as_object().cloned().unwrap_or_default() {
             entry[k] = v;
         }
-        parse_agents(&json!({ "agents": [entry] })).unwrap().remove(0)
+        parse_agents(&json!({ "agents": [entry] }))
+            .unwrap()
+            .remove(0)
     }
 
     #[test]
@@ -2451,7 +2709,10 @@ mod mtconnect_seam_tests {
     fn references_resolve_into_material_the_client_can_use() {
         let vault = FakeVault(HashMap::from([
             ("mtc/agent-pw".to_string(), "s3cret".to_string()),
-            ("mtc/ca".to_string(), "-----BEGIN CERTIFICATE-----".to_string()),
+            (
+                "mtc/ca".to_string(),
+                "-----BEGIN CERTIFICATE-----".to_string(),
+            ),
         ]));
         let cfg = agent_with(json!({
             "auth": { "type": "basic", "username": "reader", "secretRef": "mtc/agent-pw" },
@@ -2490,9 +2751,17 @@ mod mtconnect_seam_tests {
     async fn read_named_of_an_unknown_signal_asks_the_agent_for_nothing() {
         let agent = runtime("http://127.0.0.1:9");
         let handle = agent.attach("OKUMA.123456");
-        let mut session =
-            MtcSession::new(agent, device(vec![signal("x-position", "Xabs")]), model(), handle.rx);
+        let mut session = MtcSession::new(
+            agent,
+            device(vec![signal("x-position", "Xabs")]),
+            model(),
+            handle.rx,
+        );
         // No configured signal matches, so there is nothing to read and no request to make.
-        assert!(session.read_named(&["nope".to_string()]).await.unwrap().is_empty());
+        assert!(session
+            .read_named(&["nope".to_string()])
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

@@ -74,7 +74,9 @@ impl ShdrFeed {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let task = tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 let mut buf = [0u8; 256];
                 loop {
                     tokio::select! {
@@ -139,7 +141,9 @@ fn runtime(url: &str, extra: serde_json::Value) -> Arc<AgentRuntime> {
     for (k, v) in extra.as_object().cloned().unwrap_or_default() {
         entry[k] = v;
     }
-    let cfg = parse_agents(&json!({ "agents": [entry] })).unwrap().remove(0);
+    let cfg = parse_agents(&json!({ "agents": [entry] }))
+        .unwrap()
+        .remove(0);
     AgentRuntime::new(cfg, &AgentCredentials::default()).unwrap()
 }
 
@@ -203,11 +207,17 @@ async fn observations_flow_probe_snapshot_then_stream() {
     .await;
 
     let info = rt.info();
-    assert_eq!(info.mode, "stream", "live acquisition is streaming, not polling");
+    assert_eq!(
+        info.mode, "stream",
+        "live acquisition is streaming, not polling"
+    );
     assert!(info.connected);
     assert!(info.instance_id.is_some());
     assert!(
-        info.agent_version.as_deref().unwrap_or_default().starts_with("2.7.0"),
+        info.agent_version
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("2.7.0"),
         "the pinned agent: {info:?}"
     );
     println!(
@@ -314,7 +324,10 @@ async fn a_buffer_wrap_is_recovered_without_wedging_the_machine() {
     // Now the machine: stream live, freeze the agent past the heartbeat window (the stream dies
     // silently), wrap the buffer while the machine is trying to recover, and require that it ends
     // up streaming fresh data again — with the loss surfaced, not papered over.
-    let rt = runtime(&url, json!({ "heartbeatMs": 1_000, "requestTimeoutMs": 15_000 }));
+    let rt = runtime(
+        &url,
+        json!({ "heartbeatMs": 1_000, "requestTimeoutMs": 15_000 }),
+    );
     let mut handle = rt.attach(DEV_TINY);
     rt.spawn().unwrap();
     wait_for(&mut handle.rx, 20, "initial tiny-agent data", |e| {
@@ -479,8 +492,13 @@ async fn selection_mode_all_derives_the_tiny_devices_signals_live() {
 
     // Not one signal was configured, yet the whole device serves: the derived set came from the
     // live probe.
-    let served = session.served_signals().expect("an MTConnect session reports served signals");
-    assert!(served >= 2, "the tiny device has at least tavail + Tpos: {served}");
+    let served = session
+        .served_signals()
+        .expect("an MTConnect session reports served signals");
+    assert!(
+        served >= 2,
+        "the tiny device has at least tavail + Tpos: {served}"
+    );
 
     // The agent reconnects to this test's fresh SHDR feed on its own cadence (an earlier test in
     // the serialized suite owned the same port), so wait for the fed value rather than assuming it.
@@ -503,17 +521,31 @@ async fn selection_mode_all_derives_the_tiny_devices_signals_live() {
         .iter()
         .find(|r| r.signal_id == "t1-tpos")
         .expect("the derived lower-kebab id of dataItemId `t1-Tpos`");
-    assert_eq!(tpos.value, Some(json!(3.25)), "the live fed value, under a derived identity");
-    assert!(tpos.channel.is_some(), "a derived channel from the live component path");
+    assert_eq!(
+        tpos.value,
+        Some(json!(3.25)),
+        "the live fed value, under a derived identity"
+    );
+    assert!(
+        tpos.channel.is_some(),
+        "a derived channel from the live component path"
+    );
     // Every reading off a live agent carries the canonical component path (L13) — the untruncated
     // string the derived channel above was shaped from.
     for r in &readings {
-        assert!(r.component_path.is_some(), "{} carries no componentPath", r.signal_id);
+        assert!(
+            r.component_path.is_some(),
+            "{} carries no componentPath",
+            r.signal_id
+        );
     }
     println!(
         "EVIDENCE selection: served={served} derived ids={:?} t1-tpos value={:?} channel={:?} \
          componentPath={:?}",
-        readings.iter().map(|r| r.signal_id.as_str()).collect::<Vec<_>>(),
+        readings
+            .iter()
+            .map(|r| r.signal_id.as_str())
+            .collect::<Vec<_>>(),
         tpos.value,
         tpos.channel,
         tpos.component_path
@@ -576,7 +608,10 @@ async fn a_batched_signal_coalesces_live_streamed_readings_into_one_update() {
     // The session compiled the policy table from the live probe: the SAMPLE keeps its window.
     let mut shaper = Shaper::new();
     let policies = session.shaping_policies();
-    assert_eq!(policies["t-pos"].batch_ms, 60_000, "the live-compiled policy");
+    assert_eq!(
+        policies["t-pos"].batch_ms, 60_000,
+        "the live-compiled policy"
+    );
     let _ = shaper.set_policies(policies);
 
     // Feed three values and pump real streamed readings through the engine: every t-pos reading
@@ -628,9 +663,14 @@ async fn a_batched_signal_coalesces_live_streamed_readings_into_one_update() {
         .filter_map(|r| r.value.clone().and_then(|v| v.as_f64()))
         .filter(|v| wanted.contains(v))
         .collect();
-    assert_eq!(values, wanted, "arrival order, every reading its own sample");
+    assert_eq!(
+        values, wanted,
+        "arrival order, every reading its own sample"
+    );
     assert!(
-        flushed[0].iter().all(|r| r.extra.as_ref().is_some_and(|e| e.contains_key("sequence"))),
+        flushed[0]
+            .iter()
+            .all(|r| r.extra.as_ref().is_some_and(|e| e.contains_key("sequence"))),
         "each buffered sample keeps its own sequence extra"
     );
     println!(

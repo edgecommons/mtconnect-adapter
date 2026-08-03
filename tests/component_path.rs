@@ -96,7 +96,10 @@ fn an_empty_path_and_a_null_path_both_survive_as_themselves() {
         Some(""),
     ));
     assert_eq!(empty[COMPONENT_PATH_KEY], json!(""));
-    assert!(empty.as_object().expect("body").contains_key(COMPONENT_PATH_KEY));
+    assert!(empty
+        .as_object()
+        .expect("body")
+        .contains_key(COMPONENT_PATH_KEY));
 
     let null = round_trip(stamped_body(
         "ghost",
@@ -109,7 +112,9 @@ fn an_empty_path_and_a_null_path_both_survive_as_themselves() {
         "EcValue carries a null, so the key is present even here"
     );
     assert!(
-        null.as_object().expect("body").contains_key(COMPONENT_PATH_KEY),
+        null.as_object()
+            .expect("body")
+            .contains_key(COMPONENT_PATH_KEY),
         "presence is unconditional: a consumer never branches on a missing key"
     );
 }
@@ -133,7 +138,9 @@ fn a_batched_window_carries_exactly_one_component_path_for_all_its_samples() {
             ..Reading::good("x-position", json!(value)).with_extra("sequence", json!(37 + i as u64))
         };
         assert!(
-            shaper.offer(reading, start + Duration::from_millis(i as u64 * 80)).is_empty(),
+            shaper
+                .offer(reading, start + Duration::from_millis(i as u64 * 80))
+                .is_empty(),
             "buffered, not published"
         );
     }
@@ -150,7 +157,12 @@ fn a_batched_window_carries_exactly_one_component_path_for_all_its_samples() {
         let sample = build_sample(r);
         assert_eq!(sample.value, Some(json!((i + 1) as f64)));
         assert!(
-            sample.extra.as_ref().expect("extras").get(COMPONENT_PATH_KEY).is_none(),
+            sample
+                .extra
+                .as_ref()
+                .expect("extras")
+                .get(COMPONENT_PATH_KEY)
+                .is_none(),
             "`build_sample` never puts the path on a sample"
         );
     }
@@ -172,15 +184,25 @@ fn a_batched_window_carries_exactly_one_component_path_for_all_its_samples() {
     ));
 
     assert_eq!(decoded[COMPONENT_PATH_KEY], json!("Axes/Linear[X]"));
-    assert_eq!(samples_of(&decoded).len(), 3, "every buffered reading, arrival order");
+    assert_eq!(
+        samples_of(&decoded).len(),
+        3,
+        "every buffered reading, arrival order"
+    );
     for (i, sample) in samples_of(&decoded).iter().enumerate() {
-        assert_eq!(sample["sequence"], json!(37 + i as u64), "per-sample extras still ride");
+        assert_eq!(
+            sample["sequence"],
+            json!(37 + i as u64),
+            "per-sample extras still ride"
+        );
         assert!(
             sample.get(COMPONENT_PATH_KEY).is_none(),
             "one path per update, not one per sample"
         );
     }
-    assert!(readings.iter().all(|r| r.component_path.as_deref() == Some("Axes/Linear[X]")));
+    assert!(readings
+        .iter()
+        .all(|r| r.component_path.as_deref() == Some("Axes/Linear[X]")));
 }
 
 #[test]

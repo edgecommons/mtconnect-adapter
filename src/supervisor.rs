@@ -15,8 +15,8 @@
 //! the denominator and is tested.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use edgecommons::prelude::*;
@@ -96,7 +96,11 @@ impl ConfigurationChangeListener for ConfigListener {
 /// The `component.instances[]` array of a configuration snapshot, rebuilt from the accessor pair
 /// the library exposes.
 fn instances_of(config: &Config) -> Vec<serde_json::Value> {
-    config.instance_ids().iter().filter_map(|id| config.instance(id).cloned()).collect()
+    config
+        .instance_ids()
+        .iter()
+        .filter_map(|id| config.instance(id).cloned())
+        .collect()
 }
 
 impl App {
@@ -122,13 +126,19 @@ impl App {
                 Err(e) => tracing::warn!("skipping malformed device `{id}`: {e}"),
             }
         }
-        anyhow::ensure!(!devices.is_empty(), "no valid devices in component.instances[]");
+        anyhow::ensure!(
+            !devices.is_empty(),
+            "no valid devices in component.instances[]"
+        );
 
         // The agents come first: an MTConnect instance is one device of an agent that is declared
         // once and shared (D-MTC-3), and its endpoint is derived from that pairing.
         let needs_agents = devices.iter().any(|d| d.adapter == crate::device::KIND);
-        let agent_configs =
-            if needs_agents { parse_agents(config.global())? } else { Vec::new() };
+        let agent_configs = if needs_agents {
+            parse_agents(config.global())?
+        } else {
+            Vec::new()
+        };
         let defaults = crate::app::publish_defaults_of(config.global());
         // Every instance's UNS channel budget, resolved once against the live identity: it is what
         // shapes the derived channels of a machine whose component paths run deeper than a topic
@@ -150,9 +160,19 @@ impl App {
         }
         let mtconnect = Arc::new(MtcBackend::new(agents.clone(), mtc_devices, budgets));
         let signals = mtconnect.signals();
-        gg.add_config_change_listener(Arc::new(ConfigListener { signals: Arc::clone(&signals) }));
+        gg.add_config_change_listener(Arc::new(ConfigListener {
+            signals: Arc::clone(&signals),
+        }));
 
-        Ok(Self { config, metrics, devices, stale_signal_secs, agents, mtconnect, signals })
+        Ok(Self {
+            config,
+            metrics,
+            devices,
+            stale_signal_secs,
+            agents,
+            mtconnect,
+            signals,
+        })
     }
 
     /// The backend serving one device's `adapter`.
@@ -213,7 +233,9 @@ impl App {
 
             // The signal inventory `sb/signals` shows — a config/backend view, no device round-trip.
             // Its size drives the `southbound_health.signalsSubscribed` gauge while the link is up.
-            let Some(backend) = self.backend_for(device) else { continue };
+            let Some(backend) = self.backend_for(device) else {
+                continue;
+            };
             let signals = backend.inventory(&device.connection);
             health.set_signal_inventory(signals.len() as u64);
 
@@ -247,7 +269,10 @@ impl App {
         // `instances[]` every tick, and returns the very same sample from the built-in `status`
         // command verb. Whoever watches and whoever asks cannot get different answers.
         let provider: Arc<InstanceConnectivityProvider> = Arc::new(move || {
-            reported.iter().map(|(cfg, health)| connectivity_of(cfg, health)).collect()
+            reported
+                .iter()
+                .map(|(cfg, health)| connectivity_of(cfg, health))
+                .collect()
         });
         gg.set_instance_connectivity_provider(Some(provider));
 
@@ -293,7 +318,11 @@ async fn run_device(
         // --- CONNECT (servicing control while down, so pause/reconnect don't block on backoff) ---
         let session = loop {
             dm.on_connect_attempt();
-            health.set_link(if attempt == 0 { LinkState::Connecting } else { LinkState::Backoff });
+            health.set_link(if attempt == 0 {
+                LinkState::Connecting
+            } else {
+                LinkState::Backoff
+            });
             let now = Instant::now();
             match backend.connect(&cfg.connection).await {
                 Ok(session) => {
@@ -309,7 +338,9 @@ async fn run_device(
                             Some(json!({ "instance": cfg.id, "adapter": backend.kind() })),
                         )
                         .await;
-                    let _ = events.clear_alarm(Severity::Critical, "device-unreachable", None).await;
+                    let _ = events
+                        .clear_alarm(Severity::Critical, "device-unreachable", None)
+                        .await;
                     if let Some(reply) = pending_reconnect.take() {
                         let _ = reply.send(Ok(()));
                     }
@@ -346,14 +377,25 @@ async fn run_device(
 
         // --- POLL (until the link breaks or a reconnect is requested) ---
         // The inventory ids back the resume-time snapshot (HLD §7: resume snapshots first).
-        let inventory: Vec<String> =
-            backend.inventory(&cfg.connection).into_iter().map(|s| s.id).collect();
+        let inventory: Vec<String> = backend
+            .inventory(&cfg.connection)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
         // The session just compiled its signals against the device model: the gauge reports what is
         // really being served, not what was merely configured.
         sync_served_signals(session.as_ref(), &health);
-        let exit =
-            run_polling(&cfg, session, &data, &events, &dm, &health, &mut control, &inventory)
-                .await;
+        let exit = run_polling(
+            &cfg,
+            session,
+            &data,
+            &events,
+            &dm,
+            &health,
+            &mut control,
+            &inventory,
+        )
+        .await;
 
         // The link is down (or a reconnect asked us to drop it).
         health.set_link(LinkState::Backoff);
@@ -690,7 +732,10 @@ async fn publish_with_component_path(
     }
     let mut body = data.build_body(update)?;
     crate::app::stamp_component_path(&mut body, component_path);
-    let path = update.effective_signal_path().unwrap_or_default().to_string();
+    let path = update
+        .effective_signal_path()
+        .unwrap_or_default()
+        .to_string();
     data.publish_body_via(&path, body, update.via.clone()).await
 }
 
@@ -711,7 +756,9 @@ async fn publish_shaped(
     let publish_started = Instant::now();
     let mut published = 0u64;
     for readings in &updates {
-        let Some(first) = readings.first() else { continue };
+        let Some(first) = readings.first() else {
+            continue;
+        };
         // The data() facade builds the SouthboundSignalUpdate body, mints the topic, and stamps
         // identity. Every reading becomes one sample via the unit-tested `build_sample`.
         let mut signal = data.signal(&first.signal_id);
@@ -728,8 +775,8 @@ async fn publish_shaped(
 
         // ONE componentPath for the whole flushed window: the path is per-signal-static and a
         // window is one signal's readings, so it belongs on the update, not on every sample.
-        if let Err(e) = publish_with_component_path(data, &update, first.component_path.as_deref())
-            .await
+        if let Err(e) =
+            publish_with_component_path(data, &update, first.component_path.as_deref()).await
         {
             tracing::warn!(instance = %cfg.id, signal = %first.signal_id, error = %e, "publish failed");
         } else {
@@ -738,7 +785,9 @@ async fn publish_shaped(
         }
     }
     let publish_latency = u64::try_from(publish_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    health.publish_latency_ms.store(publish_latency, Ordering::Relaxed);
+    health
+        .publish_latency_ms
+        .store(publish_latency, Ordering::Relaxed);
     published
 }
 
@@ -778,7 +827,8 @@ async fn publish_readings(
             .sample(sample)
             .build();
 
-        if let Err(e) = publish_with_component_path(data, &update, r.component_path.as_deref()).await
+        if let Err(e) =
+            publish_with_component_path(data, &update, r.component_path.as_deref()).await
         {
             tracing::warn!(instance = %cfg.id, signal = %r.signal_id, error = %e, "publish failed");
         } else {
@@ -788,7 +838,9 @@ async fn publish_readings(
         }
     }
     let publish_latency = u64::try_from(publish_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    health.publish_latency_ms.store(publish_latency, Ordering::Relaxed);
+    health
+        .publish_latency_ms
+        .store(publish_latency, Ordering::Relaxed);
     published
 }
 
@@ -910,7 +962,9 @@ fn agent_telemetry(
         return None;
     }
     let (agent_id, _uuid) = crate::device::connection_binding(&cfg.connection).ok()?;
-    agents.get(&agent_id).map(|a| Arc::clone(a) as Arc<dyn AgentTelemetry>)
+    agents
+        .get(&agent_id)
+        .map(|a| Arc::clone(a) as Arc<dyn AgentTelemetry>)
 }
 
 /// The adapter's receive-moment stamp: ISO-8601 UTC "now", from the library's own clock (the same
@@ -921,6 +975,8 @@ fn now_iso() -> String {
 
 fn rand01() -> f64 {
     use std::hash::{BuildHasher, Hasher};
-    let n = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    let n = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
     (n % 1_000_000) as f64 / 1_000_000.0
 }

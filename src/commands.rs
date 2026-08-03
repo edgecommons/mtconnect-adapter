@@ -47,12 +47,16 @@ use std::time::Instant;
 
 use edgecommons::commands::AVAILABILITY_UNSUPPORTED;
 use edgecommons::messaging::Message;
-use edgecommons::prelude::{command_handler, CommandError, CommandHandler, CommandInbox, CommandScope};
+use edgecommons::prelude::{
+    command_handler, CommandError, CommandHandler, CommandInbox, CommandScope,
+};
 use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::app::{DeviceConfig, DeviceControl, Health, LinkState, Writes};
-use crate::device::{BrowseError, Quality, Reading, SignalInfo, QUALITY_UNAVAILABLE, READ_ONLY_MESSAGE};
+use crate::device::{
+    BrowseError, Quality, Reading, SignalInfo, QUALITY_UNAVAILABLE, READ_ONLY_MESSAGE,
+};
 use crate::metrics::DeviceMetrics;
 use crate::mtconnect::model::{BrowseNode, Category, NodeKind, ProbeModel, ROOT_NODE_ID};
 use crate::mtconnect::selection::{served_set, Provenance, ServedSet};
@@ -181,7 +185,11 @@ impl ProtocolView {
     #[must_use]
     pub fn served(&self) -> ServedSet {
         let live = self.signals();
-        served_set(&live.signals, live.selection.as_ref(), self.model().as_deref())
+        served_set(
+            &live.signals,
+            live.selection.as_ref(),
+            self.model().as_deref(),
+        )
     }
 
     /// The `sb/signals` inventory: the **served** signals — explicit and selection-derived alike —
@@ -298,7 +306,11 @@ pub fn register_all(commands: &CommandInbox, handles: Vec<DeviceHandle>) -> anyh
     }
     // D-MTC-7: advertised as permanently unsupported, not merely disabled — the protocol has no
     // write path, so no configuration can ever turn this on.
-    commands.set_command_availability("sb/write", AVAILABILITY_UNSUPPORTED, Some("MTConnect is read-only"))?;
+    commands.set_command_availability(
+        "sb/write",
+        AVAILABILITY_UNSUPPORTED,
+        Some("MTConnect is read-only"),
+    )?;
     for panel in panels() {
         commands.register_panel(panel)?;
     }
@@ -381,7 +393,13 @@ fn registrations(
 /// write, and `sb/write`'s permanent refusal rides the command-availability surface instead.
 #[must_use]
 pub fn panels() -> Vec<Value> {
-    vec![overview_view(), device_structure_view(), signals_view(), conditions_view(), diagnostics_view()]
+    vec![
+        overview_view(),
+        device_structure_view(),
+        signals_view(),
+        conditions_view(),
+        diagnostics_view(),
+    ]
 }
 
 fn overview_view() -> Value {
@@ -587,10 +605,9 @@ impl Commander {
     /// device, or is `BAD_ARGS` when there are two or more.
     fn resolve(&self, instance: Option<&str>) -> std::result::Result<&DeviceHandle, CommandError> {
         match instance {
-            Some(id) => self
-                .devices
-                .get(id)
-                .ok_or_else(|| CommandError::new("NO_SUCH_INSTANCE", format!("no configured device `{id}`"))),
+            Some(id) => self.devices.get(id).ok_or_else(|| {
+                CommandError::new("NO_SUCH_INSTANCE", format!("no configured device `{id}`"))
+            }),
             None => {
                 if self.ids.len() == 1 {
                     Ok(self.devices.get(&self.ids[0]).expect("one device"))
@@ -612,7 +629,11 @@ impl Commander {
         let link = h.health.link();
         let connected = link == LinkState::Online;
         let paused = h.health.is_paused();
-        let state = if paused && connected { "PAUSED" } else { link.as_str() };
+        let state = if paused && connected {
+            "PAUSED"
+        } else {
+            link.as_str()
+        };
         let mut out = json!({
             "id": h.cfg.id,
             "adapter": h.cfg.adapter,
@@ -716,7 +737,9 @@ impl Commander {
             .collect();
 
         h.dm.record_command("sb/read", failure.is_none(), ms(started));
-        Ok(Some(json!({ "id": h.cfg.id, "mode": "current", "reads": reads })))
+        Ok(Some(
+            json!({ "id": h.cfg.id, "mode": "current", "reads": reads }),
+        ))
     }
 
     // --- sb/write: registered, permanently refused (D-MTC-7) --------------------------------------
@@ -740,7 +763,9 @@ impl Commander {
         // The two request forms are mutually exclusive: `ref`/`depth`/`maxRefs` select the
         // hierarchical panel mode, `cursor`/`max` the paged one — and the hierarchical-only
         // arguments are meaningless without a `ref`.
-        let hierarchical_keys = ["ref", "depth", "maxRefs"].iter().any(|k| body.get(*k).is_some());
+        let hierarchical_keys = ["ref", "depth", "maxRefs"]
+            .iter()
+            .any(|k| body.get(*k).is_some());
         let paged_keys = ["cursor", "max"].iter().any(|k| body.get(*k).is_some());
         if hierarchical_keys && paged_keys {
             h.dm.record_command("sb/browse", false, ms(started));
@@ -764,7 +789,10 @@ impl Commander {
                 Some(model) => browse_model(&h.cfg.id, p, &model, body),
                 None => Err(CommandError::new(
                     "BROWSE_FAILED",
-                    format!("{BROWSE_NO_PROBE}: no probe model is cached for device `{}` yet", p.device_uuid),
+                    format!(
+                        "{BROWSE_NO_PROBE}: no probe model is cached for device `{}` yet",
+                        p.device_uuid
+                    ),
                 )),
             },
             // The template simulator has no probe: the generated seam serves it through the device
@@ -781,12 +809,23 @@ impl Commander {
         if body.get("ref").is_some() {
             return self.browse_seam_hierarchical(h, body).await;
         }
-        let cursor = body.get("cursor").and_then(Value::as_str).map(str::to_string);
-        let max = body.get("max").and_then(Value::as_u64).unwrap_or(200).clamp(1, 1000) as usize;
+        let cursor = body
+            .get("cursor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let max = body
+            .get("max")
+            .and_then(Value::as_u64)
+            .unwrap_or(200)
+            .clamp(1, 1000) as usize;
 
         let (tx, rx) = oneshot::channel();
         h.control
-            .send(DeviceControl::Browse { cursor, max, reply: tx })
+            .send(DeviceControl::Browse {
+                cursor,
+                max,
+                reply: tx,
+            })
             .await
             .map_err(|_| device_unavailable())?;
         match rx.await {
@@ -802,9 +841,10 @@ impl Commander {
                 }
                 Ok(Some(out))
             }
-            Ok(Err(BrowseError::Unsupported)) => {
-                Err(CommandError::new("BROWSE_UNSUPPORTED", "this adapter has no discovery service"))
-            }
+            Ok(Err(BrowseError::Unsupported)) => Err(CommandError::new(
+                "BROWSE_UNSUPPORTED",
+                "this adapter has no discovery service",
+            )),
             Ok(Err(BrowseError::Failed(e))) => Err(CommandError::new("BROWSE_FAILED", e)),
             Err(_) => Err(device_unavailable()),
         }
@@ -813,11 +853,26 @@ impl Commander {
     /// The `treeBrowser` mode of the generated seam: `"root"` is the device node whose `contains`
     /// refs are the inventory, a known id is a leaf, an unknown ref is `BAD_ARGS`.
     async fn browse_seam_hierarchical(&self, h: &DeviceHandle, body: &Value) -> Reply {
-        let Some(ref_id) = body.get("ref").and_then(Value::as_str).filter(|r| !r.is_empty()) else {
-            return Err(CommandError::new("BAD_ARGS", "`ref` must be a non-empty string"));
+        let Some(ref_id) = body
+            .get("ref")
+            .and_then(Value::as_str)
+            .filter(|r| !r.is_empty())
+        else {
+            return Err(CommandError::new(
+                "BAD_ARGS",
+                "`ref` must be a non-empty string",
+            ));
         };
-        let depth = body.get("depth").and_then(Value::as_u64).unwrap_or(1).clamp(1, 4);
-        let max_refs = body.get("maxRefs").and_then(Value::as_u64).unwrap_or(200).clamp(1, 1000) as usize;
+        let depth = body
+            .get("depth")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .clamp(1, 4);
+        let max_refs = body
+            .get("maxRefs")
+            .and_then(Value::as_u64)
+            .unwrap_or(200)
+            .clamp(1, 1000) as usize;
 
         // Collect the whole inventory through the same control channel the paged mode uses,
         // following its cursors — one source, both browse modes.
@@ -826,15 +881,24 @@ impl Commander {
         loop {
             let (tx, rx) = oneshot::channel();
             h.control
-                .send(DeviceControl::Browse { cursor: cursor.clone(), max: 1000, reply: tx })
+                .send(DeviceControl::Browse {
+                    cursor: cursor.clone(),
+                    max: 1000,
+                    reply: tx,
+                })
                 .await
                 .map_err(|_| device_unavailable())?;
             let page = match rx.await {
                 Ok(Ok(page)) => page,
                 Ok(Err(BrowseError::Unsupported)) => {
-                    return Err(CommandError::new("BROWSE_UNSUPPORTED", "this adapter has no discovery service"));
+                    return Err(CommandError::new(
+                        "BROWSE_UNSUPPORTED",
+                        "this adapter has no discovery service",
+                    ));
                 }
-                Ok(Err(BrowseError::Failed(e))) => return Err(CommandError::new("BROWSE_FAILED", e)),
+                Ok(Err(BrowseError::Failed(e))) => {
+                    return Err(CommandError::new("BROWSE_FAILED", e))
+                }
                 Err(_) => return Err(device_unavailable()),
             };
             entries.extend(page.entries);
@@ -869,7 +933,10 @@ impl Commander {
         }
 
         let Some(node) = entries.iter().find(|e| e.id == ref_id) else {
-            return Err(CommandError::new("BAD_ARGS", format!("unknown browse ref `{ref_id}`")));
+            return Err(CommandError::new(
+                "BAD_ARGS",
+                format!("unknown browse ref `{ref_id}`"),
+            ));
         };
         Ok(Some(json!({
             "id": h.cfg.id,
@@ -894,7 +961,9 @@ impl Commander {
             .map_err(|_| device_unavailable())?;
         let changed = rx.await.map_err(|_| device_unavailable())?;
         h.dm.record_command("sb/pause", true, ms(started));
-        Ok(Some(json!({ "id": h.cfg.id, "paused": true, "changed": changed })))
+        Ok(Some(
+            json!({ "id": h.cfg.id, "paused": true, "changed": changed }),
+        ))
     }
 
     async fn resume(&self, instance: Option<&str>) -> Reply {
@@ -907,7 +976,9 @@ impl Commander {
             .map_err(|_| device_unavailable())?;
         let changed = rx.await.map_err(|_| device_unavailable())?;
         h.dm.record_command("sb/resume", true, ms(started));
-        Ok(Some(json!({ "id": h.cfg.id, "paused": false, "changed": changed })))
+        Ok(Some(
+            json!({ "id": h.cfg.id, "paused": false, "changed": changed }),
+        ))
     }
 
     // --- reconnect ---------------------------------------------------------------------------------
@@ -941,7 +1012,10 @@ impl Commander {
         let started = Instant::now();
         if h.health.is_paused() {
             h.dm.record_command("repoll", false, ms(started));
-            return Err(CommandError::new("PAUSED", "instance is paused - resume first"));
+            return Err(CommandError::new(
+                "PAUSED",
+                "instance is paused - resume first",
+            ));
         }
         let (tx, rx) = oneshot::channel();
         h.control
@@ -1037,7 +1111,11 @@ fn browse_model_paged(
         None => 0usize,
         Some(cursor) => parse_cursor(cursor, generation)?,
     };
-    let max = body.get("max").and_then(Value::as_u64).unwrap_or(200).clamp(1, 1000) as usize;
+    let max = body
+        .get("max")
+        .and_then(Value::as_u64)
+        .unwrap_or(200)
+        .clamp(1, 1000) as usize;
 
     let entries: Vec<Value> = model
         .tree
@@ -1072,22 +1150,52 @@ fn browse_model_hierarchical(
     generation: &str,
     body: &Value,
 ) -> Reply {
-    let Some(ref_id) = body.get("ref").and_then(Value::as_str).filter(|r| !r.is_empty()) else {
-        return Err(CommandError::new("BAD_ARGS", "`ref` must be a non-empty string"));
+    let Some(ref_id) = body
+        .get("ref")
+        .and_then(Value::as_str)
+        .filter(|r| !r.is_empty())
+    else {
+        return Err(CommandError::new(
+            "BAD_ARGS",
+            "`ref` must be a non-empty string",
+        ));
     };
-    let ref_id = if ref_id == "root" { ROOT_NODE_ID } else { ref_id };
-    let depth = body.get("depth").and_then(Value::as_u64).unwrap_or(1).clamp(1, 4);
-    let max_refs = body.get("maxRefs").and_then(Value::as_u64).unwrap_or(200).clamp(1, 1000) as usize;
+    let ref_id = if ref_id == "root" {
+        ROOT_NODE_ID
+    } else {
+        ref_id
+    };
+    let depth = body
+        .get("depth")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .clamp(1, 4);
+    let max_refs = body
+        .get("maxRefs")
+        .and_then(Value::as_u64)
+        .unwrap_or(200)
+        .clamp(1, 1000) as usize;
 
     let Some(index) = model.tree.iter().position(|n| n.id == ref_id) else {
-        return Err(CommandError::new("BAD_ARGS", format!("unknown browse ref `{ref_id}`")));
+        return Err(CommandError::new(
+            "BAD_ARGS",
+            format!("unknown browse ref `{ref_id}`"),
+        ));
     };
 
     let children = children_by_parent(model);
     let mut budget = max_refs;
     let mut truncated = false;
-    let refs =
-        refs_of(index, model, flags, prov, &children, depth as usize, &mut budget, &mut truncated);
+    let refs = refs_of(
+        index,
+        model,
+        flags,
+        prov,
+        &children,
+        depth as usize,
+        &mut budget,
+        &mut truncated,
+    );
     let ref_count = refs.len();
 
     let mut root = browse_target(&model.tree[index], flags[index], prov);
@@ -1121,7 +1229,10 @@ fn parse_cursor(cursor: &str, generation: &str) -> std::result::Result<usize, Co
         ));
     }
     index.parse::<usize>().map_err(|_| {
-        CommandError::new("BROWSE_FAILED", format!("{BROWSE_BAD_CURSOR}: cursor `{cursor}` is malformed"))
+        CommandError::new(
+            "BROWSE_FAILED",
+            format!("{BROWSE_BAD_CURSOR}: cursor `{cursor}` is malformed"),
+        )
     })
 }
 
@@ -1129,8 +1240,12 @@ fn parse_cursor(cursor: &str, generation: &str) -> std::result::Result<usize, Co
 /// configured item lives beneath them. Pre-order guarantees a parent precedes its children, so one
 /// reverse pass propagates the flag all the way up.
 fn configured_flags(model: &ProbeModel, bound: &HashSet<&str>) -> Vec<bool> {
-    let index: HashMap<&str, usize> =
-        model.tree.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
+    let index: HashMap<&str, usize> = model
+        .tree
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i))
+        .collect();
     let mut flags: Vec<bool> = model
         .tree
         .iter()
@@ -1138,7 +1253,11 @@ fn configured_flags(model: &ProbeModel, bound: &HashSet<&str>) -> Vec<bool> {
         .collect();
     for i in (0..model.tree.len()).rev() {
         if flags[i] {
-            if let Some(parent) = model.tree[i].parent_id.as_deref().and_then(|p| index.get(p)) {
+            if let Some(parent) = model.tree[i]
+                .parent_id
+                .as_deref()
+                .and_then(|p| index.get(p))
+            {
                 flags[*parent] = true;
             }
         }
@@ -1186,8 +1305,16 @@ fn refs_of(
             // A node known to be a leaf says so explicitly (panel contract §3.2).
             target.insert("refs".to_string(), Value::Array(Vec::new()));
         } else if depth > 1 {
-            let nested =
-                refs_of(child, model, flags, prov, children, depth - 1, budget, truncated);
+            let nested = refs_of(
+                child,
+                model,
+                flags,
+                prov,
+                children,
+                depth - 1,
+                budget,
+                truncated,
+            );
             target.insert("refs".to_string(), Value::Array(nested));
         }
         // else: a node that MAY have children omits `refs` — the console expands it on demand.
@@ -1246,7 +1373,10 @@ fn browse_target(
     t.insert("kind".to_string(), json!(node.kind.as_str()));
     t.insert("type".to_string(), json!(node.type_name));
     t.insert("subType".to_string(), json!(node.sub_type));
-    t.insert("category".to_string(), json!(node.category.map(Category::as_str)));
+    t.insert(
+        "category".to_string(),
+        json!(node.category.map(Category::as_str)),
+    );
     t.insert("units".to_string(), json!(node.units));
     t.insert("dataItemId".to_string(), json!(data_item_id(node)));
     t.insert("configured".to_string(), json!(configured));
@@ -1367,10 +1497,18 @@ mod tests {
         fn is_metric_defined(&self, _name: &str) -> bool {
             true
         }
-        async fn emit_metric(&self, _name: &str, _values: HashMap<String, f64>) -> edgecommons::Result<()> {
+        async fn emit_metric(
+            &self,
+            _name: &str,
+            _values: HashMap<String, f64>,
+        ) -> edgecommons::Result<()> {
             Ok(())
         }
-        async fn emit_metric_now(&self, _name: &str, _values: HashMap<String, f64>) -> edgecommons::Result<()> {
+        async fn emit_metric_now(
+            &self,
+            _name: &str,
+            _values: HashMap<String, f64>,
+        ) -> edgecommons::Result<()> {
             Ok(())
         }
         async fn flush_metrics(&self) -> edgecommons::Result<()> {
@@ -1405,15 +1543,23 @@ mod tests {
 
     fn sim_signals() -> Vec<SignalInfo> {
         vec![
-            SignalInfo { id: "temperature-1".into(), name: Some("Ambient temperature".into()) },
-            SignalInfo { id: "setpoint-1".into(), name: Some("Setpoint".into()) },
+            SignalInfo {
+                id: "temperature-1".into(),
+                name: Some("Ambient temperature".into()),
+            },
+            SignalInfo {
+                id: "setpoint-1".into(),
+                name: Some("Setpoint".into()),
+            },
         ]
     }
 
     // --- the MTConnect protocol view: a known agent state + a known probe model -------------------
 
     fn probe_model() -> Arc<ProbeModel> {
-        Arc::new(ProbeModel::from_devices(&parse_devices(DEVICES_2_7).unwrap(), DEVICE_UUID).unwrap())
+        Arc::new(
+            ProbeModel::from_devices(&parse_devices(DEVICES_2_7).unwrap(), DEVICE_UUID).unwrap(),
+        )
     }
 
     struct FakeAgent {
@@ -1426,7 +1572,9 @@ mod tests {
             Arc::clone(&self.info)
         }
         fn model(&self, device_uuid: &str) -> Option<Arc<ProbeModel>> {
-            (device_uuid == DEVICE_UUID).then(|| self.model.clone()).flatten()
+            (device_uuid == DEVICE_UUID)
+                .then(|| self.model.clone())
+                .flatten()
         }
     }
 
@@ -1486,7 +1634,10 @@ mod tests {
 
     fn protocol_view(info: AgentInfo, model: Option<Arc<ProbeModel>>) -> ProtocolView {
         ProtocolView {
-            agent: Arc::new(FakeAgent { info: Arc::new(info), model }),
+            agent: Arc::new(FakeAgent {
+                info: Arc::new(info),
+                model,
+            }),
             agent_id: "line-a-agent".into(),
             device_uuid: DEVICE_UUID.into(),
             signals: Arc::new(SignalSlot::new(mtc_signals(), None)),
@@ -1547,7 +1698,14 @@ mod tests {
     }
 
     fn make_dm(cfg: &DeviceConfig, health: Arc<Health>) -> Arc<DeviceMetrics> {
-        Arc::new(DeviceMetrics::new(Arc::new(NoopMetrics), config(), cfg.id.clone(), health, 30, None))
+        Arc::new(DeviceMetrics::new(
+            Arc::new(NoopMetrics),
+            config(),
+            cfg.id.clone(),
+            health,
+            30,
+            None,
+        ))
     }
 
     fn harness(cfg: DeviceConfig, opts: MockOpts) -> Harness {
@@ -1568,8 +1726,13 @@ mod tests {
             while let Some(ctrl) = rx.recv().await {
                 match ctrl {
                     DeviceControl::Write(req) => {
-                        t_writes.lock().unwrap().push((req.signal_id.clone(), req.value.clone()));
-                        let _ = req.ack.send(Err(crate::device::READ_ONLY_MESSAGE.to_string()));
+                        t_writes
+                            .lock()
+                            .unwrap()
+                            .push((req.signal_id.clone(), req.value.clone()));
+                        let _ = req
+                            .ack
+                            .send(Err(crate::device::READ_ONLY_MESSAGE.to_string()));
                     }
                     DeviceControl::ReadNow { ids, reply } => {
                         if opts.read_ok {
@@ -1579,7 +1742,10 @@ mod tests {
                                     if id == "unavailable-1" {
                                         Reading::bad(id.clone(), crate::device::QUALITY_UNAVAILABLE)
                                     } else if id == "unbound-1" {
-                                        Reading::bad(id.clone(), crate::device::QUALITY_NO_SUCH_DATAITEM)
+                                        Reading::bad(
+                                            id.clone(),
+                                            crate::device::QUALITY_NO_SUCH_DATAITEM,
+                                        )
                                     } else {
                                         Reading {
                                             quality_raw: Some(crate::device::QUALITY_OK.into()),
@@ -1600,9 +1766,10 @@ mod tests {
                             type_name: "REAL".into(),
                         };
                         let r = match opts.browse {
-                            BrowseKind::One => {
-                                Ok(BrowsePage { entries: vec![temperature], next_cursor: None })
-                            }
+                            BrowseKind::One => Ok(BrowsePage {
+                                entries: vec![temperature],
+                                next_cursor: None,
+                            }),
                             BrowseKind::Paged => {
                                 if cursor.is_none() {
                                     Ok(BrowsePage {
@@ -1621,7 +1788,9 @@ mod tests {
                                 }
                             }
                             BrowseKind::Unsupported => Err(BrowseError::Unsupported),
-                            BrowseKind::Failed => Err(BrowseError::Failed("mid-browse error".into())),
+                            BrowseKind::Failed => {
+                                Err(BrowseError::Failed("mid-browse error".into()))
+                            }
                         };
                         let _ = reply.send(r);
                     }
@@ -1632,7 +1801,11 @@ mod tests {
                         let _ = reply.send(set_paused(&t_health, false));
                     }
                     DeviceControl::Reconnect { reply } => {
-                        let _ = reply.send(if opts.reconnect_ok { Ok(()) } else { Err("no route to host".into()) });
+                        let _ = reply.send(if opts.reconnect_ok {
+                            Ok(())
+                        } else {
+                            Err("no route to host".into())
+                        });
                     }
                     DeviceControl::Repoll { reply } => {
                         let r = if opts.repoll_paused {
@@ -1657,7 +1830,12 @@ mod tests {
             protocol,
         };
         let commander = Arc::new(Commander::new(vec![handle]));
-        Harness { commander, writes, health, _task: task }
+        Harness {
+            commander,
+            writes,
+            health,
+            _task: task,
+        }
     }
 
     /// An MTConnect harness whose agent has probed the device.
@@ -1686,14 +1864,24 @@ mod tests {
         let h = harness(a_device(), MockOpts::default());
         let out = ok(h.commander.status(None).await);
         assert_eq!(out["id"], json!("plc-1"));
-        assert_eq!(err_code(h.commander.status(Some("nope")).await), "NO_SUCH_INSTANCE");
+        assert_eq!(
+            err_code(h.commander.status(Some("nope")).await),
+            "NO_SUCH_INSTANCE"
+        );
 
         // Two devices: a missing `instance` is BAD_ARGS.
         let mk = |cfg: DeviceConfig| {
             let (tx, _rx) = mpsc::channel(1);
             let health = Arc::new(Health::default());
             let dm = make_dm(&cfg, Arc::clone(&health));
-            DeviceHandle { cfg, control: tx, health, dm, signals: sim_signals(), protocol: None }
+            DeviceHandle {
+                cfg,
+                control: tx,
+                health,
+                dm,
+                signals: sim_signals(),
+                protocol: None,
+            }
         };
         let mut b = a_device();
         b.id = "plc-2".into();
@@ -1713,7 +1901,10 @@ mod tests {
         assert_eq!(out["paused"], json!(false));
         assert_eq!(out["adapter"], json!("sim"));
         assert!(out["metrics"].get("connectAttempts").is_some());
-        assert!(out.get("protocol").is_none(), "a device with no agent publishes no protocol object");
+        assert!(
+            out.get("protocol").is_none(),
+            "a device with no agent publishes no protocol object"
+        );
     }
 
     #[tokio::test]
@@ -1728,15 +1919,29 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                "agentId", "agentVersion", "bufferSize", "capability", "firstSequence",
-                "heartbeatMs", "instanceId", "lastHeartbeatAt", "limitations", "mode",
-                "nextSequence", "probeDigest", "schemaNamespace", "standardVersion",
+                "agentId",
+                "agentVersion",
+                "bufferSize",
+                "capability",
+                "firstSequence",
+                "heartbeatMs",
+                "instanceId",
+                "lastHeartbeatAt",
+                "limitations",
+                "mode",
+                "nextSequence",
+                "probeDigest",
+                "schemaNamespace",
+                "standardVersion",
             ]
         );
         assert_eq!(p["capability"], json!("MTCONNECT_CLIENT"));
         assert_eq!(p["agentId"], json!("line-a-agent"));
         assert_eq!(p["standardVersion"], json!("2.7"));
-        assert_eq!(p["schemaNamespace"], json!("urn:mtconnect.org:MTConnectDevices:2.7"));
+        assert_eq!(
+            p["schemaNamespace"],
+            json!("urn:mtconnect.org:MTConnectDevices:2.7")
+        );
         assert_eq!(p["agentVersion"], json!("2.7.0.12"));
         assert_eq!(p["instanceId"], json!(1_749_000_000_u64));
         assert_eq!(p["bufferSize"], json!(131_072));
@@ -1747,27 +1952,48 @@ mod tests {
         assert_eq!(p["lastHeartbeatAt"], json!("2026-07-27T10:00:00Z"));
         assert_eq!(p["probeDigest"], json!(probe_model().digest_hex()));
         assert!(p["probeDigest"].as_str().unwrap().starts_with("sha256:"));
-        assert_eq!(p["limitations"], json!(["READ_ONLY", "XML_ONLY", "NO_ASSETS"]));
+        assert_eq!(
+            p["limitations"],
+            json!(["READ_ONLY", "XML_ONLY", "NO_ASSETS"])
+        );
     }
 
     #[tokio::test]
     async fn the_protocol_object_is_nullable_until_the_agent_has_taught_us() {
         // Nothing has been learned yet: every learned field is an explicit null, and the object is
         // still the same closed shape — a console binds the same paths from the first second.
-        let h = harness_with(mtc_device(), MockOpts::default(), Some(protocol_view(unlearned_info(), None)));
+        let h = harness_with(
+            mtc_device(),
+            MockOpts::default(),
+            Some(protocol_view(unlearned_info(), None)),
+        );
         let p = ok(h.commander.status(None).await)["protocol"].clone();
         for key in [
-            "standardVersion", "schemaNamespace", "agentVersion", "instanceId", "bufferSize",
-            "firstSequence", "nextSequence", "lastHeartbeatAt", "probeDigest",
+            "standardVersion",
+            "schemaNamespace",
+            "agentVersion",
+            "instanceId",
+            "bufferSize",
+            "firstSequence",
+            "nextSequence",
+            "lastHeartbeatAt",
+            "probeDigest",
         ] {
-            assert_eq!(p[key], Value::Null, "{key} is null until the agent tells us");
+            assert_eq!(
+                p[key],
+                Value::Null,
+                "{key} is null until the agent tells us"
+            );
         }
         // What configuration already knows is never null.
         assert_eq!(p["capability"], json!("MTCONNECT_CLIENT"));
         assert_eq!(p["agentId"], json!("line-a-agent"));
         assert_eq!(p["mode"], json!("poll"));
         assert_eq!(p["heartbeatMs"], json!(10_000));
-        assert_eq!(p["limitations"], json!(["READ_ONLY", "XML_ONLY", "NO_ASSETS"]));
+        assert_eq!(
+            p["limitations"],
+            json!(["READ_ONLY", "XML_ONLY", "NO_ASSETS"])
+        );
     }
 
     // --- sb/signals --------------------------------------------------------------------------------
@@ -1778,9 +2004,19 @@ mod tests {
         let out = ok(h.commander.signals(None).await);
         let sigs = out["signals"].as_array().unwrap();
         assert_eq!(sigs.len(), 2);
-        let setpoint = sigs.iter().find(|s| s["id"] == json!("setpoint-1")).unwrap();
-        assert_eq!(setpoint["writable"], json!(true), "setpoint-1 is on the allow-list");
-        let temp = sigs.iter().find(|s| s["id"] == json!("temperature-1")).unwrap();
+        let setpoint = sigs
+            .iter()
+            .find(|s| s["id"] == json!("setpoint-1"))
+            .unwrap();
+        assert_eq!(
+            setpoint["writable"],
+            json!(true),
+            "setpoint-1 is on the allow-list"
+        );
+        let temp = sigs
+            .iter()
+            .find(|s| s["id"] == json!("temperature-1"))
+            .unwrap();
         assert_eq!(temp["writable"], json!(false), "temperature-1 is not");
     }
 
@@ -1791,7 +2027,10 @@ mod tests {
         let sigs = out["signals"].as_array().unwrap();
         assert_eq!(sigs.len(), 3, "every configured signal, bound or not");
 
-        let x = sigs.iter().find(|s| s["id"] == json!("x-position")).unwrap();
+        let x = sigs
+            .iter()
+            .find(|s| s["id"] == json!("x-position"))
+            .unwrap();
         assert_eq!(
             x["address"],
             json!({
@@ -1808,10 +2047,17 @@ mod tests {
         assert_eq!(x["units"], json!("MILLIMETER"));
         assert_eq!(x["conditionBinding"], json!(["Xtravel"]));
         assert_eq!(x["bound"], json!(true));
-        assert_eq!(x["writable"], json!(false), "MTConnect is read-only: nothing is writable");
+        assert_eq!(
+            x["writable"],
+            json!(false),
+            "MTConnect is read-only: nothing is writable"
+        );
 
         // A signal whose dataItemId is not in the model keeps its binding keys and says so.
-        let ghost = sigs.iter().find(|s| s["id"] == json!("ghost-signal")).unwrap();
+        let ghost = sigs
+            .iter()
+            .find(|s| s["id"] == json!("ghost-signal"))
+            .unwrap();
         assert_eq!(ghost["address"]["dataItemId"], json!("not-in-the-model"));
         assert_eq!(ghost["address"]["category"], Value::Null);
         assert_eq!(ghost["bound"], json!(false));
@@ -1821,7 +2067,10 @@ mod tests {
     /// A protocol view whose slot carries a `selection` block beside the explicit signals.
     fn selecting_view(selection: Value, model: Option<Arc<ProbeModel>>) -> ProtocolView {
         ProtocolView {
-            agent: Arc::new(FakeAgent { info: Arc::new(learned_info()), model }),
+            agent: Arc::new(FakeAgent {
+                info: Arc::new(learned_info()),
+                model,
+            }),
             agent_id: "line-a-agent".into(),
             device_uuid: DEVICE_UUID.into(),
             signals: Arc::new(SignalSlot::new(
@@ -1839,13 +2088,23 @@ mod tests {
         let h = harness_with(
             mtc_device(),
             MockOpts::default(),
-            Some(selecting_view(json!({ "mode": "all" }), Some(probe_model()))),
+            Some(selecting_view(
+                json!({ "mode": "all" }),
+                Some(probe_model()),
+            )),
         );
         let out = ok(h.commander.signals(None).await);
         let sigs = out["signals"].as_array().unwrap();
-        assert_eq!(sigs.len(), 14, "1 explicit (merged over its item) + 13 derived");
+        assert_eq!(
+            sigs.len(),
+            14,
+            "1 explicit (merged over its item) + 13 derived"
+        );
 
-        let x = sigs.iter().find(|s| s["id"] == json!("x-position")).unwrap();
+        let x = sigs
+            .iter()
+            .find(|s| s["id"] == json!("x-position"))
+            .unwrap();
         assert_eq!(x["provenance"], json!("configured"));
         assert_eq!(x["conditionBinding"], json!(["Xtravel"]));
         assert_eq!(x["bound"], json!(true));
@@ -1855,8 +2114,16 @@ mod tests {
         assert_eq!(load["address"]["dataItemId"], json!("Xload"));
         assert_eq!(load["address"]["category"], json!("SAMPLE"));
         assert_eq!(load["units"], json!("PERCENT"));
-        assert_eq!(load["bound"], json!(true), "a derived signal came FROM the model");
-        assert_eq!(load["conditionBinding"], json!(["Xtravel"]), "auto-bound to its component's condition");
+        assert_eq!(
+            load["bound"],
+            json!(true),
+            "a derived signal came FROM the model"
+        );
+        assert_eq!(
+            load["conditionBinding"],
+            json!(["Xtravel"]),
+            "auto-bound to its component's condition"
+        );
         assert_eq!(load["writable"], json!(false));
 
         // Before the first probe the derived half honestly does not exist yet.
@@ -1866,7 +2133,11 @@ mod tests {
             Some(selecting_view(json!({ "mode": "all" }), None)),
         );
         let sigs = ok(h.commander.signals(None).await)["signals"].clone();
-        assert_eq!(sigs.as_array().unwrap().len(), 1, "explicit only until the model is known");
+        assert_eq!(
+            sigs.as_array().unwrap().len(),
+            1,
+            "explicit only until the model is known"
+        );
         assert_eq!(sigs[0]["provenance"], json!("configured"));
     }
 
@@ -1884,29 +2155,47 @@ mod tests {
         let entries = out["entries"].as_array().unwrap();
 
         // The explicit binding: configured, provenance `configured`.
-        let x = entries.iter().find(|e| e["id"] == json!("mtc:/item/Xabs")).unwrap();
+        let x = entries
+            .iter()
+            .find(|e| e["id"] == json!("mtc:/item/Xabs"))
+            .unwrap();
         assert_eq!(x["configured"], json!(true));
         assert_eq!(x["provenance"], json!("configured"));
         // The selection-derived binding: the union flags it, provenance says how it got there.
-        let load = entries.iter().find(|e| e["id"] == json!("mtc:/item/Xload")).unwrap();
+        let load = entries
+            .iter()
+            .find(|e| e["id"] == json!("mtc:/item/Xload"))
+            .unwrap();
         assert_eq!(load["configured"], json!(true));
         assert_eq!(load["provenance"], json!("discovered"));
         // An unserved item is neither.
-        let estop = entries.iter().find(|e| e["id"] == json!("mtc:/item/estop")).unwrap();
+        let estop = entries
+            .iter()
+            .find(|e| e["id"] == json!("mtc:/item/estop"))
+            .unwrap();
         assert_eq!(estop["configured"], json!(false));
         assert_eq!(estop["provenance"], Value::Null);
         // Components carry the union flag and no provenance (they are not data items).
-        let linear = entries.iter().find(|e| e["id"] == json!("mtc:/component/Axes/Linear[X]")).unwrap();
+        let linear = entries
+            .iter()
+            .find(|e| e["id"] == json!("mtc:/component/Axes/Linear[X]"))
+            .unwrap();
         assert_eq!(linear["configured"], json!(true));
         assert_eq!(linear["provenance"], Value::Null);
 
         // The hierarchical mode carries the same fields on its targets.
         let out = ok(h
             .commander
-            .browse(None, &json!({ "ref": "mtc:/component/Axes/Linear[X]", "depth": 1 }))
+            .browse(
+                None,
+                &json!({ "ref": "mtc:/component/Axes/Linear[X]", "depth": 1 }),
+            )
             .await);
         let refs = out["root"]["refs"].as_array().unwrap();
-        let load = refs.iter().find(|r| r["target"]["nodeId"] == json!("mtc:/item/Xload")).unwrap();
+        let load = refs
+            .iter()
+            .find(|r| r["target"]["nodeId"] == json!("mtc:/item/Xload"))
+            .unwrap();
         assert_eq!(load["target"]["provenance"], json!("discovered"));
     }
 
@@ -1914,12 +2203,20 @@ mod tests {
     async fn signals_answers_from_configuration_before_any_probe() {
         // No model cached (the agent has never answered): the inventory still lists every signal
         // with its binding keys — `sb/signals` does no network I/O, by contract.
-        let h = harness_with(mtc_device(), MockOpts::default(), Some(protocol_view(unlearned_info(), None)));
+        let h = harness_with(
+            mtc_device(),
+            MockOpts::default(),
+            Some(protocol_view(unlearned_info(), None)),
+        );
         let sigs = ok(h.commander.signals(None).await)["signals"].clone();
         let sigs = sigs.as_array().unwrap();
         assert_eq!(sigs.len(), 3);
         assert_eq!(sigs[0]["address"]["dataItemId"], json!("Xabs"));
-        assert_eq!(sigs[0]["address"]["type"], Value::Null, "nullable until the probe lands");
+        assert_eq!(
+            sigs[0]["address"]["type"],
+            Value::Null,
+            "nullable until the probe lands"
+        );
         assert_eq!(sigs[0]["bound"], json!(false));
     }
 
@@ -1932,19 +2229,37 @@ mod tests {
             .commander
             .read(None, &json!({ "signals": [ { "signalId": "temperature-1" }, { "name": "Setpoint" }, { "name": "ghost" } ] }))
             .await);
-        assert_eq!(out["mode"], json!("current"), "an MTConnect read is always a /current read");
+        assert_eq!(
+            out["mode"],
+            json!("current"),
+            "an MTConnect read is always a /current read"
+        );
         let reads = out["reads"].as_array().unwrap();
         assert_eq!(reads[0]["signal"]["id"], json!("temperature-1"));
         assert_eq!(reads[0]["quality"], json!("GOOD"));
-        assert_eq!(reads[1]["signal"]["id"], json!("setpoint-1"), "resolved by name");
-        assert_eq!(reads[2]["quality"], json!("BAD"), "an unknown name is a BAD/unresolved entry");
+        assert_eq!(
+            reads[1]["signal"]["id"],
+            json!("setpoint-1"),
+            "resolved by name"
+        );
+        assert_eq!(
+            reads[2]["quality"],
+            json!("BAD"),
+            "an unknown name is a BAD/unresolved entry"
+        );
         assert_eq!(reads[2]["qualityRaw"], json!("UNRESOLVED_REF"));
     }
 
     #[tokio::test]
     async fn read_resolves_names_against_the_configured_mtconnect_signals() {
         let h = mtc_harness();
-        let out = ok(h.commander.read(None, &json!({ "signals": [ { "name": "x-position label" } ] })).await);
+        let out = ok(h
+            .commander
+            .read(
+                None,
+                &json!({ "signals": [ { "name": "x-position label" } ] }),
+            )
+            .await);
         assert_eq!(out["reads"][0]["signal"]["id"], json!("x-position"));
     }
 
@@ -1953,7 +2268,13 @@ mod tests {
         // The published sample carries the protocol's own `UNAVAILABLE`; a read entry names the
         // adapter's per-entry code (HLD §7).
         let h = harness(a_device(), MockOpts::default());
-        let out = ok(h.commander.read(None, &json!({ "signals": [ { "signalId": "unavailable-1" } ] })).await);
+        let out = ok(h
+            .commander
+            .read(
+                None,
+                &json!({ "signals": [ { "signalId": "unavailable-1" } ] }),
+            )
+            .await);
         let entry = &out["reads"][0];
         assert_eq!(entry["value"], Value::Null);
         assert_eq!(entry["quality"], json!("BAD"));
@@ -1965,7 +2286,10 @@ mod tests {
         // A configured signal whose `dataItemId` is not in the device model is named every time it
         // is read, never silently dropped (D-MTC-5).
         let h = harness(a_device(), MockOpts::default());
-        let out = ok(h.commander.read(None, &json!({ "signals": [ { "signalId": "unbound-1" } ] })).await);
+        let out = ok(h
+            .commander
+            .read(None, &json!({ "signals": [ { "signalId": "unbound-1" } ] }))
+            .await);
         assert_eq!(out["reads"][0]["quality"], json!("BAD"));
         assert_eq!(out["reads"][0]["qualityRaw"], json!("MTC_NO_SUCH_DATAITEM"));
     }
@@ -1973,21 +2297,40 @@ mod tests {
     #[tokio::test]
     async fn read_without_a_signals_array_is_bad_args() {
         let h = harness(a_device(), MockOpts::default());
-        assert_eq!(err_code(h.commander.read(None, &json!({})).await), "BAD_ARGS");
+        assert_eq!(
+            err_code(h.commander.read(None, &json!({})).await),
+            "BAD_ARGS"
+        );
     }
 
     #[tokio::test]
     async fn an_unreachable_agent_degrades_the_entries_not_the_command() {
         // The item-vs-session rule (LLD §7): the session answered, the agent did not.
-        let h = harness(a_device(), MockOpts { read_ok: false, ..MockOpts::default() });
+        let h = harness(
+            a_device(),
+            MockOpts {
+                read_ok: false,
+                ..MockOpts::default()
+            },
+        );
         let out = ok(h
             .commander
-            .read(None, &json!({ "signals": [ { "signalId": "temperature-1" }, { "name": "ghost" } ] }))
+            .read(
+                None,
+                &json!({ "signals": [ { "signalId": "temperature-1" }, { "name": "ghost" } ] }),
+            )
             .await);
         assert_eq!(out["mode"], json!("current"));
         assert_eq!(out["reads"][0]["quality"], json!("BAD"));
-        assert_eq!(out["reads"][0]["qualityRaw"], json!("MTC_AGENT_ERROR:UNREACHABLE"));
-        assert_eq!(out["reads"][1]["qualityRaw"], json!("UNRESOLVED_REF"), "an unresolved ref is still its own failure");
+        assert_eq!(
+            out["reads"][0]["qualityRaw"],
+            json!("MTC_AGENT_ERROR:UNREACHABLE")
+        );
+        assert_eq!(
+            out["reads"][1]["qualityRaw"],
+            json!("UNRESOLVED_REF"),
+            "an unresolved ref is still its own failure"
+        );
     }
 
     #[tokio::test]
@@ -2000,20 +2343,50 @@ mod tests {
                 ..MockOpts::default()
             },
         );
-        let out = ok(h.commander.read(None, &json!({ "signals": [ { "signalId": "temperature-1" } ] })).await);
-        assert_eq!(out["reads"][0]["qualityRaw"], json!("MTC_AGENT_ERROR:UNAUTHORIZED"));
+        let out = ok(h
+            .commander
+            .read(
+                None,
+                &json!({ "signals": [ { "signalId": "temperature-1" } ] }),
+            )
+            .await);
+        assert_eq!(
+            out["reads"][0]["qualityRaw"],
+            json!("MTC_AGENT_ERROR:UNAUTHORIZED")
+        );
     }
 
     #[test]
     fn every_seam_failure_maps_to_a_stable_per_entry_code() {
-        assert_eq!(agent_failure_code("agent error OUT_OF_RANGE: past the buffer"), "MTC_AGENT_ERROR:OUT_OF_RANGE");
-        assert_eq!(agent_failure_code("no dataItem `Xabs` in the device model"), "MTC_NO_SUCH_DATAITEM");
+        assert_eq!(
+            agent_failure_code("agent error OUT_OF_RANGE: past the buffer"),
+            "MTC_AGENT_ERROR:OUT_OF_RANGE"
+        );
+        assert_eq!(
+            agent_failure_code("no dataItem `Xabs` in the device model"),
+            "MTC_NO_SUCH_DATAITEM"
+        );
         assert_eq!(agent_failure_code("xml error: unexpected eof"), "MTC_PARSE");
-        assert_eq!(agent_failure_code("request timed out after 10000 ms"), "MTC_AGENT_ERROR:TIMEOUT");
-        assert_eq!(agent_failure_code("agent returned HTTP 503"), "MTC_AGENT_ERROR:HTTP");
-        assert_eq!(agent_failure_code("TLS error: handshake refused"), "MTC_AGENT_ERROR:TLS");
-        assert_eq!(agent_failure_code("authentication error: rejected"), "MTC_AGENT_ERROR:AUTH");
-        assert_eq!(agent_failure_code("device is disconnected"), "MTC_AGENT_ERROR:UNREACHABLE");
+        assert_eq!(
+            agent_failure_code("request timed out after 10000 ms"),
+            "MTC_AGENT_ERROR:TIMEOUT"
+        );
+        assert_eq!(
+            agent_failure_code("agent returned HTTP 503"),
+            "MTC_AGENT_ERROR:HTTP"
+        );
+        assert_eq!(
+            agent_failure_code("TLS error: handshake refused"),
+            "MTC_AGENT_ERROR:TLS"
+        );
+        assert_eq!(
+            agent_failure_code("authentication error: rejected"),
+            "MTC_AGENT_ERROR:AUTH"
+        );
+        assert_eq!(
+            agent_failure_code("device is disconnected"),
+            "MTC_AGENT_ERROR:UNREACHABLE"
+        );
     }
 
     // --- sb/write: registered, permanently refused, never any device I/O --------------------------
@@ -2026,9 +2399,20 @@ mod tests {
         // path at all, so the allow-list never even gets consulted.
         let e = err(h.commander.write(None).await);
         assert_eq!(e.code, "WRITE_NOT_ALLOWED");
-        assert!(e.message.contains("read-only"), "the refusal names the standard's mandate: {}", e.message);
-        assert!(e.message.contains("5.1"), "and the clause that says so: {}", e.message);
-        assert!(h.writes.lock().unwrap().is_empty(), "no write may ever reach a device");
+        assert!(
+            e.message.contains("read-only"),
+            "the refusal names the standard's mandate: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("5.1"),
+            "and the clause that says so: {}",
+            e.message
+        );
+        assert!(
+            h.writes.lock().unwrap().is_empty(),
+            "no write may ever reach a device"
+        );
     }
 
     #[tokio::test]
@@ -2039,7 +2423,12 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(err_code(h.commander.write(None).await), "WRITE_NOT_ALLOWED");
         }
-        assert_eq!(h.health.write_errors.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            h.health
+                .write_errors
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         assert!(h.writes.lock().unwrap().is_empty());
     }
 
@@ -2069,19 +2458,32 @@ mod tests {
         assert_eq!(entries[1]["category"], json!("EVENT"));
 
         // A configured data item is flagged, and so is every ancestor holding one.
-        let x = entries.iter().find(|e| e["id"] == json!("mtc:/item/Xabs")).unwrap();
+        let x = entries
+            .iter()
+            .find(|e| e["id"] == json!("mtc:/item/Xabs"))
+            .unwrap();
         assert_eq!(x["configured"], json!(true));
         assert_eq!(x["type"], json!("POSITION"));
         assert_eq!(x["subType"], json!("ACTUAL"));
         assert_eq!(x["units"], json!("MILLIMETER"));
         assert_eq!(x["parentId"], json!("mtc:/component/Axes/Linear[X]"));
-        let linear = entries.iter().find(|e| e["id"] == json!("mtc:/component/Axes/Linear[X]")).unwrap();
-        assert_eq!(linear["configured"], json!(true), "a component holding a configured item is flagged");
+        let linear = entries
+            .iter()
+            .find(|e| e["id"] == json!("mtc:/component/Axes/Linear[X]"))
+            .unwrap();
+        assert_eq!(
+            linear["configured"],
+            json!(true),
+            "a component holding a configured item is flagged"
+        );
         assert_eq!(linear["kind"], json!("COMPONENT"));
         assert_eq!(linear["dataItemId"], Value::Null);
 
         // An unconfigured item is not.
-        let estop = entries.iter().find(|e| e["id"] == json!("mtc:/item/estop")).unwrap();
+        let estop = entries
+            .iter()
+            .find(|e| e["id"] == json!("mtc:/item/estop"))
+            .unwrap();
         assert_eq!(estop["configured"], json!(false));
     }
 
@@ -2091,16 +2493,29 @@ mod tests {
         let first = ok(h.commander.browse(None, &json!({ "max": 3 })).await);
         assert_eq!(first["entries"].as_array().unwrap().len(), 3);
         let cursor = first["cursor"].as_str().expect("more to come").to_string();
-        assert!(cursor.starts_with(&probe_model().digest_hex()), "the cursor carries its view generation");
+        assert!(
+            cursor.starts_with(&probe_model().digest_hex()),
+            "the cursor carries its view generation"
+        );
 
-        let second = ok(h.commander.browse(None, &json!({ "cursor": cursor, "max": 3 })).await);
+        let second = ok(h
+            .commander
+            .browse(None, &json!({ "cursor": cursor, "max": 3 }))
+            .await);
         let entries = second["entries"].as_array().unwrap();
-        assert_eq!(entries[0]["id"], json!("mtc:/component/Axes"), "paging resumed where it stopped");
+        assert_eq!(
+            entries[0]["id"],
+            json!("mtc:/component/Axes"),
+            "paging resumed where it stopped"
+        );
 
         // The last page has no cursor.
         let all = ok(h.commander.browse(None, &json!({ "max": 1000 })).await);
         assert!(all.get("cursor").is_none());
-        assert_eq!(all["entries"].as_array().unwrap().len(), probe_model().tree.len());
+        assert_eq!(
+            all["entries"].as_array().unwrap().len(),
+            probe_model().tree.len()
+        );
     }
 
     #[tokio::test]
@@ -2118,7 +2533,11 @@ mod tests {
 
     #[tokio::test]
     async fn browse_with_no_cached_probe_is_browse_failed_with_no_probe() {
-        let h = harness_with(mtc_device(), MockOpts::default(), Some(protocol_view(unlearned_info(), None)));
+        let h = harness_with(
+            mtc_device(),
+            MockOpts::default(),
+            Some(protocol_view(unlearned_info(), None)),
+        );
         for body in [json!({}), json!({ "ref": "root" })] {
             let e = err(h.commander.browse(None, &body).await);
             assert_eq!(e.code, "BROWSE_FAILED");
@@ -2133,7 +2552,13 @@ mod tests {
         let h = harness_with(
             mtc_device(),
             MockOpts::default(),
-            Some(protocol_view(AgentInfo { connected: false, ..learned_info() }, Some(probe_model()))),
+            Some(protocol_view(
+                AgentInfo {
+                    connected: false,
+                    ..learned_info()
+                },
+                Some(probe_model()),
+            )),
         );
         let out = ok(h.commander.browse(None, &json!({ "ref": "root" })).await);
         assert_eq!(out["root"]["nodeId"], json!("mtc:/component/"));
@@ -2152,12 +2577,20 @@ mod tests {
             ))
         );
         let root = &out["root"];
-        assert_eq!(root["nodeId"], json!("mtc:/component/"), "`root` is an alias of the device node id");
+        assert_eq!(
+            root["nodeId"],
+            json!("mtc:/component/"),
+            "`root` is an alias of the device node id"
+        );
         assert_eq!(root["nodeClass"], json!("device"));
         assert_eq!(root["dataType"], Value::Null);
 
         let refs = root["refs"].as_array().unwrap();
-        assert_eq!(refs.len(), 4, "two device-level data items + Axes + Controller");
+        assert_eq!(
+            refs.len(),
+            4,
+            "two device-level data items + Axes + Controller"
+        );
         assert_eq!(out["refCount"], json!(4));
         assert_eq!(out["depth"], json!(1));
         assert_eq!(out["truncated"], json!(false));
@@ -2167,10 +2600,17 @@ mod tests {
         assert_eq!(avail["target"]["nodeId"], json!("mtc:/item/avail"));
         assert_eq!(avail["target"]["nodeClass"], json!("dataItem"));
         assert_eq!(avail["target"]["dataType"], json!("AVAILABILITY"));
-        assert_eq!(avail["target"]["refs"], json!([]), "a data item is a known leaf");
+        assert_eq!(
+            avail["target"]["refs"],
+            json!([]),
+            "a data item is a known leaf"
+        );
 
         // A component that may have children omits `refs` — the console expands it on demand.
-        let axes = refs.iter().find(|r| r["target"]["nodeId"] == json!("mtc:/component/Axes")).unwrap();
+        let axes = refs
+            .iter()
+            .find(|r| r["target"]["nodeId"] == json!("mtc:/component/Axes"))
+            .unwrap();
         assert!(axes["target"].get("refs").is_none());
         assert_eq!(axes["target"]["nodeClass"], json!("component"));
         assert_eq!(axes["target"]["configured"], json!(true));
@@ -2180,12 +2620,17 @@ mod tests {
     async fn hierarchical_browse_expands_the_requested_depth_and_round_trips_node_ids() {
         let h = mtc_harness();
         // Expanding a component uses the nodeId the previous reply handed out.
-        let out = ok(h.commander.browse(None, &json!({ "ref": "mtc:/component/Axes", "depth": 2 })).await);
+        let out = ok(h
+            .commander
+            .browse(None, &json!({ "ref": "mtc:/component/Axes", "depth": 2 }))
+            .await);
         let refs = out["root"]["refs"].as_array().unwrap();
         assert_eq!(refs.len(), 2, "Linear[X] and Rotary[C]");
         let linear = &refs[0]["target"];
         assert_eq!(linear["nodeId"], json!("mtc:/component/Axes/Linear[X]"));
-        let nested = linear["refs"].as_array().expect("depth 2 expands the grandchildren");
+        let nested = linear["refs"]
+            .as_array()
+            .expect("depth 2 expands the grandchildren");
         assert_eq!(nested.len(), 4, "Xabs, Xload, Xfreq, Xtravel");
         assert_eq!(nested[0]["target"]["nodeId"], json!("mtc:/item/Xabs"));
         assert_eq!(nested[3]["target"]["category"], json!("CONDITION"));
@@ -2194,7 +2639,10 @@ mod tests {
     #[tokio::test]
     async fn hierarchical_browse_of_a_data_item_is_a_known_leaf() {
         let h = mtc_harness();
-        let out = ok(h.commander.browse(None, &json!({ "ref": "mtc:/item/Xabs" })).await);
+        let out = ok(h
+            .commander
+            .browse(None, &json!({ "ref": "mtc:/item/Xabs" }))
+            .await);
         let root = &out["root"];
         assert_eq!(root["nodeId"], json!("mtc:/item/Xabs"));
         assert_eq!(root["nodeClass"], json!("dataItem"));
@@ -2207,27 +2655,73 @@ mod tests {
     #[tokio::test]
     async fn hierarchical_browse_bounds_depth_and_max_refs() {
         let h = mtc_harness();
-        let out = ok(h.commander.browse(None, &json!({ "ref": "root", "depth": 99, "maxRefs": 5000 })).await);
+        let out = ok(h
+            .commander
+            .browse(
+                None,
+                &json!({ "ref": "root", "depth": 99, "maxRefs": 5000 }),
+            )
+            .await);
         assert_eq!(out["depth"], json!(4), "clamped into 1..4");
 
-        let out = ok(h.commander.browse(None, &json!({ "ref": "root", "maxRefs": 2 })).await);
+        let out = ok(h
+            .commander
+            .browse(None, &json!({ "ref": "root", "maxRefs": 2 }))
+            .await);
         assert_eq!(out["refCount"], json!(2));
-        assert_eq!(out["truncated"], json!(true), "the budget bounds the whole reply");
+        assert_eq!(
+            out["truncated"],
+            json!(true),
+            "the budget bounds the whole reply"
+        );
 
         // The budget spans the levels, not each of them.
-        let out = ok(h.commander.browse(None, &json!({ "ref": "root", "depth": 4, "maxRefs": 6 })).await);
+        let out = ok(h
+            .commander
+            .browse(None, &json!({ "ref": "root", "depth": 4, "maxRefs": 6 }))
+            .await);
         assert_eq!(out["truncated"], json!(true));
     }
 
     #[tokio::test]
     async fn browse_rejects_unknown_refs_and_mode_mixing() {
         let h = mtc_harness();
-        assert_eq!(err_code(h.commander.browse(None, &json!({ "ref": "mtc:/item/ghost" })).await), "BAD_ARGS");
-        assert_eq!(err_code(h.commander.browse(None, &json!({ "ref": "root", "cursor": "x" })).await), "BAD_ARGS");
-        assert_eq!(err_code(h.commander.browse(None, &json!({ "depth": 2, "max": 10 })).await), "BAD_ARGS");
-        assert_eq!(err_code(h.commander.browse(None, &json!({ "depth": 2 })).await), "BAD_ARGS");
-        assert_eq!(err_code(h.commander.browse(None, &json!({ "maxRefs": 10 })).await), "BAD_ARGS");
-        assert_eq!(err_code(h.commander.browse(None, &json!({ "ref": 7 })).await), "BAD_ARGS");
+        assert_eq!(
+            err_code(
+                h.commander
+                    .browse(None, &json!({ "ref": "mtc:/item/ghost" }))
+                    .await
+            ),
+            "BAD_ARGS"
+        );
+        assert_eq!(
+            err_code(
+                h.commander
+                    .browse(None, &json!({ "ref": "root", "cursor": "x" }))
+                    .await
+            ),
+            "BAD_ARGS"
+        );
+        assert_eq!(
+            err_code(
+                h.commander
+                    .browse(None, &json!({ "depth": 2, "max": 10 }))
+                    .await
+            ),
+            "BAD_ARGS"
+        );
+        assert_eq!(
+            err_code(h.commander.browse(None, &json!({ "depth": 2 })).await),
+            "BAD_ARGS"
+        );
+        assert_eq!(
+            err_code(h.commander.browse(None, &json!({ "maxRefs": 10 })).await),
+            "BAD_ARGS"
+        );
+        assert_eq!(
+            err_code(h.commander.browse(None, &json!({ "ref": 7 })).await),
+            "BAD_ARGS"
+        );
     }
 
     // --- sb/browse over the generated seam (the simulator, which has no probe) ---------------------
@@ -2239,11 +2733,29 @@ mod tests {
         assert_eq!(out["entries"].as_array().unwrap().len(), 1);
         assert_eq!(out["entries"][0]["id"], json!("temperature-1"));
 
-        let h = harness(a_device(), MockOpts { browse: BrowseKind::Unsupported, ..MockOpts::default() });
-        assert_eq!(err_code(h.commander.browse(None, &json!({})).await), "BROWSE_UNSUPPORTED");
+        let h = harness(
+            a_device(),
+            MockOpts {
+                browse: BrowseKind::Unsupported,
+                ..MockOpts::default()
+            },
+        );
+        assert_eq!(
+            err_code(h.commander.browse(None, &json!({})).await),
+            "BROWSE_UNSUPPORTED"
+        );
 
-        let h = harness(a_device(), MockOpts { browse: BrowseKind::Failed, ..MockOpts::default() });
-        assert_eq!(err_code(h.commander.browse(None, &json!({})).await), "BROWSE_FAILED");
+        let h = harness(
+            a_device(),
+            MockOpts {
+                browse: BrowseKind::Failed,
+                ..MockOpts::default()
+            },
+        );
+        assert_eq!(
+            err_code(h.commander.browse(None, &json!({})).await),
+            "BROWSE_FAILED"
+        );
     }
 
     #[tokio::test]
@@ -2254,20 +2766,38 @@ mod tests {
         assert_eq!(out["root"]["name"], json!("plc-1"));
         assert_eq!(out["refCount"], json!(1));
 
-        let out = ok(h.commander.browse(None, &json!({ "ref": "temperature-1" })).await);
+        let out = ok(h
+            .commander
+            .browse(None, &json!({ "ref": "temperature-1" }))
+            .await);
         assert_eq!(out["root"]["nodeClass"], json!("signal"));
         assert_eq!(out["root"]["refs"], json!([]));
 
-        assert_eq!(err_code(h.commander.browse(None, &json!({ "ref": "ghost" })).await), "BAD_ARGS");
+        assert_eq!(
+            err_code(h.commander.browse(None, &json!({ "ref": "ghost" })).await),
+            "BAD_ARGS"
+        );
     }
 
     #[tokio::test]
     async fn the_seam_hierarchical_browse_truncates_across_pages() {
-        let h = harness(a_device(), MockOpts { browse: BrowseKind::Paged, ..MockOpts::default() });
-        let out = ok(h.commander.browse(None, &json!({ "ref": "root", "maxRefs": 1 })).await);
+        let h = harness(
+            a_device(),
+            MockOpts {
+                browse: BrowseKind::Paged,
+                ..MockOpts::default()
+            },
+        );
+        let out = ok(h
+            .commander
+            .browse(None, &json!({ "ref": "root", "maxRefs": 1 }))
+            .await);
         assert_eq!(out["refCount"], json!(1));
         assert_eq!(out["truncated"], json!(true));
-        let out = ok(h.commander.browse(None, &json!({ "ref": "pressure-1" })).await);
+        let out = ok(h
+            .commander
+            .browse(None, &json!({ "ref": "pressure-1" }))
+            .await);
         assert_eq!(out["root"]["nodeClass"], json!("signal"));
     }
 
@@ -2289,7 +2819,10 @@ mod tests {
         assert_eq!(err_code(h.commander.repoll(None).await), "PAUSED");
 
         // pausing again is idempotent.
-        assert_eq!(ok(h.commander.pause(None, None).await)["changed"], json!(false));
+        assert_eq!(
+            ok(h.commander.pause(None, None).await)["changed"],
+            json!(false)
+        );
 
         // resume clears it and repoll works again.
         let out = ok(h.commander.resume(None).await);
@@ -2303,7 +2836,13 @@ mod tests {
     async fn a_paused_refusal_from_the_device_task_is_also_paused() {
         // The command layer saw an unpaused instance, but a pause raced in ahead of the repoll —
         // the device task's refusal maps to the same PAUSED code.
-        let h = harness(a_device(), MockOpts { repoll_paused: true, ..MockOpts::default() });
+        let h = harness(
+            a_device(),
+            MockOpts {
+                repoll_paused: true,
+                ..MockOpts::default()
+            },
+        );
         assert_eq!(err_code(h.commander.repoll(None).await), "PAUSED");
     }
 
@@ -2312,10 +2851,22 @@ mod tests {
     #[tokio::test]
     async fn reconnect_confirms_or_reports_reconnect_failed() {
         let h = harness(a_device(), MockOpts::default());
-        assert_eq!(ok(h.commander.reconnect(None).await)["connected"], json!(true));
+        assert_eq!(
+            ok(h.commander.reconnect(None).await)["connected"],
+            json!(true)
+        );
 
-        let h = harness(a_device(), MockOpts { reconnect_ok: false, ..MockOpts::default() });
-        assert_eq!(err_code(h.commander.reconnect(None).await), "RECONNECT_FAILED");
+        let h = harness(
+            a_device(),
+            MockOpts {
+                reconnect_ok: false,
+                ..MockOpts::default()
+            },
+        );
+        assert_eq!(
+            err_code(h.commander.reconnect(None).await),
+            "RECONNECT_FAILED"
+        );
     }
 
     #[tokio::test]
@@ -2336,9 +2887,19 @@ mod tests {
             protocol: None,
         };
         let commander = Commander::new(vec![handle]);
-        assert_eq!(err_code(commander.reconnect(None).await), "DEVICE_UNAVAILABLE");
         assert_eq!(
-            err_code(commander.read(None, &json!({ "signals": [ { "signalId": "temperature-1" } ] })).await),
+            err_code(commander.reconnect(None).await),
+            "DEVICE_UNAVAILABLE"
+        );
+        assert_eq!(
+            err_code(
+                commander
+                    .read(
+                        None,
+                        &json!({ "signals": [ { "signalId": "temperature-1" } ] })
+                    )
+                    .await
+            ),
             "DEVICE_UNAVAILABLE"
         );
     }
@@ -2364,25 +2925,34 @@ mod tests {
 
         let mut cfg = mtc_device();
         cfg.signals = mtc_signals();
-        let registry = SignalRegistry::new(&[crate::mtconnect::config::DeviceConfig {
-            id: cfg.id.clone(),
-            agent_id: "line-a-agent".into(),
-            device_uuid: DEVICE_UUID.into(),
-            signals: mtc_signals(),
-            selection: None,
-        }], crate::app::ChannelBudgets::default());
+        let registry = SignalRegistry::new(
+            &[crate::mtconnect::config::DeviceConfig {
+                id: cfg.id.clone(),
+                agent_id: "line-a-agent".into(),
+                device_uuid: DEVICE_UUID.into(),
+                signals: mtc_signals(),
+                selection: None,
+            }],
+            crate::app::ChannelBudgets::default(),
+        );
         let view =
             ProtocolView::of(&cfg, &agents, &registry).expect("an mtconnect device gets a view");
         assert_eq!(view.agent_id, "line-a-agent");
         assert_eq!(view.device_uuid, DEVICE_UUID);
         assert_eq!(view.signals().signals.len(), 3);
-        assert!(view.model().is_none(), "nothing is cached before the first probe");
+        assert!(
+            view.model().is_none(),
+            "nothing is cached before the first probe"
+        );
         assert_eq!(view.status_object()["agentId"], json!("line-a-agent"));
 
         // The simulator has no agent, and an unknown agent id resolves to nothing.
         assert!(ProtocolView::of(&a_device(), &agents, &registry).is_none());
         let mut orphan = mtc_device();
-        orphan.connection.extra.insert("agentId".into(), json!("nope"));
+        orphan
+            .connection
+            .extra
+            .insert("agentId".into(), json!("nope"));
         assert!(ProtocolView::of(&orphan, &agents, &registry).is_none());
     }
 
@@ -2404,7 +2974,11 @@ mod tests {
         let h = harness(a_device(), MockOpts::default());
         let regs = registrations(&h.commander);
         let verbs: Vec<&str> = regs.iter().map(|(v, _, _)| *v).collect();
-        assert_eq!(verbs, VERBS.to_vec(), "the nine verbs, in the documented order");
+        assert_eq!(
+            verbs,
+            VERBS.to_vec(),
+            "the nine verbs, in the documented order"
+        );
         for (verb, scope, _) in &regs {
             assert_eq!(*scope, CommandScope::Instance, "{verb} is instance-scoped");
         }
@@ -2419,14 +2993,26 @@ mod tests {
         let regs = registrations(&h.commander);
         let status = &regs.iter().find(|(v, _, _)| *v == "sb/status").unwrap().2;
 
-        let out = status.handle(request(json!({})), None).await.unwrap().unwrap();
-        assert_eq!(out["id"], json!("plc-1"), "component-addressed: the sole configured device");
+        let out = status
+            .handle(request(json!({})), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            out["id"],
+            json!("plc-1"),
+            "component-addressed: the sole configured device"
+        );
         let out = status
             .handle(request(json!({})), Some("plc-1".to_string()))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(out["id"], json!("plc-1"), "instance-addressed: the topic's token");
+        assert_eq!(
+            out["id"],
+            json!("plc-1"),
+            "instance-addressed: the topic's token"
+        );
     }
 
     #[tokio::test]
@@ -2457,7 +3043,14 @@ mod tests {
             let (tx, _rx) = mpsc::channel(1);
             let health = Arc::new(Health::default());
             let dm = make_dm(&cfg, Arc::clone(&health));
-            DeviceHandle { cfg, control: tx, health, dm, signals: sim_signals(), protocol: None }
+            DeviceHandle {
+                cfg,
+                control: tx,
+                health,
+                dm,
+                signals: sim_signals(),
+                protocol: None,
+            }
         };
         let mut b = a_device();
         b.id = "plc-2".into();
@@ -2489,43 +3082,84 @@ mod tests {
     fn the_five_views_are_registered_with_the_right_ids_orders_scope_and_requirements() {
         let ps = panels();
         let ids: Vec<&str> = ps.iter().map(|p| p["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, vec!["overview", "device-structure", "signals", "conditions", "diagnostics"]);
+        assert_eq!(
+            ids,
+            vec![
+                "overview",
+                "device-structure",
+                "signals",
+                "conditions",
+                "diagnostics"
+            ]
+        );
         let titles: Vec<&str> = ps.iter().map(|p| p["title"].as_str().unwrap()).collect();
         assert_eq!(
             titles,
-            vec!["Overview", "Device Structure", "Signals", "Conditions & Events", "Diagnostics"]
+            vec![
+                "Overview",
+                "Device Structure",
+                "Signals",
+                "Conditions & Events",
+                "Diagnostics"
+            ]
         );
         let orders: Vec<u64> = ps.iter().map(|p| p["order"].as_u64().unwrap()).collect();
         assert_eq!(orders, vec![10, 20, 30, 40, 50]);
 
-        let requirements: Vec<Value> = ps.iter().map(|p| p["rendererRequirements"].clone()).collect();
+        let requirements: Vec<Value> = ps
+            .iter()
+            .map(|p| p["rendererRequirements"].clone())
+            .collect();
         assert_eq!(
             requirements,
             vec![
-                json!(["action-bar.v1", "command-availability.v1", "instance-selector.v1",
-                       "metric-series.v1", "status-dashboard.v1"]),
+                json!([
+                    "action-bar.v1",
+                    "command-availability.v1",
+                    "instance-selector.v1",
+                    "metric-series.v1",
+                    "status-dashboard.v1"
+                ]),
                 json!(["instance-selector.v1", "tree-columns.v1"]),
                 json!(["instance-selector.v1", "signal-columns.v1"]),
                 json!(["event-feed.v1", "instance-selector.v1", "metric-series.v1"]),
-                json!(["event-feed.v1", "instance-selector.v1", "metric-series.v1",
-                       "status-dashboard.v1"]),
+                json!([
+                    "event-feed.v1",
+                    "instance-selector.v1",
+                    "metric-series.v1",
+                    "status-dashboard.v1"
+                ]),
             ]
         );
 
         for p in &ps {
-            assert_eq!(p["scope"], json!("instance"), "every view is instance-scoped");
-            let tokens: Vec<&str> =
-                p["rendererRequirements"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+            assert_eq!(
+                p["scope"],
+                json!("instance"),
+                "every view is instance-scoped"
+            );
+            let tokens: Vec<&str> = p["rendererRequirements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_str().unwrap())
+                .collect();
             let mut sorted = tokens.clone();
             sorted.sort_unstable();
             sorted.dedup();
             assert_eq!(tokens, sorted, "requirement tokens are unique and sorted");
             for widget in p["widgets"].as_array().unwrap() {
                 assert!(widget["id"].is_string() && widget["kind"].is_string());
-                if widget.get("verb").is_some() || widget.get("browseVerb").is_some()
-                    || widget.get("signalsVerb").is_some() || widget.get("actions").is_some()
+                if widget.get("verb").is_some()
+                    || widget.get("browseVerb").is_some()
+                    || widget.get("signalsVerb").is_some()
+                    || widget.get("actions").is_some()
                 {
-                    assert_eq!(widget["scope"], json!("instance"), "command-backed widgets repeat the scope");
+                    assert_eq!(
+                        widget["scope"],
+                        json!("instance"),
+                        "command-backed widgets repeat the scope"
+                    );
                 }
             }
         }
@@ -2536,8 +3170,14 @@ mod tests {
         // D-MTC-7: there is nothing to write, so no widget names a `writeVerb` and no view binds
         // `sb/write` — the permanent refusal rides the command-availability surface instead.
         let manifest = serde_json::to_string(&panels()).unwrap();
-        assert!(!manifest.contains("writeVerb"), "no widget may advertise a write surface");
-        assert!(!manifest.contains("sb/write"), "no view may bind the refused verb");
+        assert!(
+            !manifest.contains("writeVerb"),
+            "no widget may advertise a write surface"
+        );
+        assert!(
+            !manifest.contains("sb/write"),
+            "no view may bind the refused verb"
+        );
     }
 
     #[test]
@@ -2549,20 +3189,38 @@ mod tests {
         let status = &widgets[0];
         assert_eq!(status["kind"], json!("statusDashboard"));
         assert_eq!(status["verb"], json!("sb/status"));
-        assert_eq!(status["refresh"], json!({ "onEnter": true, "manual": true, "intervalMs": 5000 }));
-        let labels: Vec<&str> =
-            status["fields"].as_array().unwrap().iter().map(|f| f["label"].as_str().unwrap()).collect();
+        assert_eq!(
+            status["refresh"],
+            json!({ "onEnter": true, "manual": true, "intervalMs": 5000 })
+        );
+        let labels: Vec<&str> = status["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["label"].as_str().unwrap())
+            .collect();
         assert_eq!(
             labels,
             vec![
-                "Adapter state", "Connected", "Paused", "Endpoint", "Agent version",
-                "Standard version", "Mode", "Instance ID", "Next sequence", "Heartbeat age",
+                "Adapter state",
+                "Connected",
+                "Paused",
+                "Endpoint",
+                "Agent version",
+                "Standard version",
+                "Mode",
+                "Instance ID",
+                "Next sequence",
+                "Heartbeat age",
                 "Probe digest",
             ]
         );
         // Every protocol field binds a path that `sb/status` really publishes.
         let object = ProtocolView {
-            agent: Arc::new(FakeAgent { info: Arc::new(learned_info()), model: Some(probe_model()) }),
+            agent: Arc::new(FakeAgent {
+                info: Arc::new(learned_info()),
+                model: Some(probe_model()),
+            }),
             agent_id: "line-a-agent".into(),
             device_uuid: DEVICE_UUID.into(),
             signals: Arc::new(SignalSlot::new(Vec::new(), None)),
@@ -2598,11 +3256,23 @@ mod tests {
         assert_eq!(tree["maxRefs"], json!(200));
         assert_eq!(tree["browseVerb"], json!("sb/browse"));
         assert_eq!(tree["readVerb"], json!("sb/read"));
-        let columns: Vec<&str> =
-            tree["columns"].as_array().unwrap().iter().map(|c| c["label"].as_str().unwrap()).collect();
+        let columns: Vec<&str> = tree["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["label"].as_str().unwrap())
+            .collect();
         assert_eq!(
             columns,
-            vec!["Name", "Kind", "Type", "SubType", "Category", "DataItem", "Configured"]
+            vec![
+                "Name",
+                "Kind",
+                "Type",
+                "SubType",
+                "Category",
+                "DataItem",
+                "Configured"
+            ]
         );
     }
 
@@ -2611,17 +3281,36 @@ mod tests {
         let grid = &panels()[2]["widgets"][0];
         assert_eq!(grid["kind"], json!("signalGrid"));
         assert_eq!(grid["signalsVerb"], json!("sb/signals"));
-        assert_eq!(grid["subscriptionsVerb"], json!("sb/signals"), "the renderer-compat alias binds the same verb");
+        assert_eq!(
+            grid["subscriptionsVerb"],
+            json!("sb/signals"),
+            "the renderer-compat alias binds the same verb"
+        );
         assert_eq!(grid["readVerb"], json!("sb/read"));
-        let columns: Vec<&str> =
-            grid["columns"].as_array().unwrap().iter().map(|c| c["label"].as_str().unwrap()).collect();
+        let columns: Vec<&str> = grid["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["label"].as_str().unwrap())
+            .collect();
         assert_eq!(
             columns,
-            vec!["Signal", "Name", "DataItem", "Category", "Type", "Units", "Quality binding"]
+            vec![
+                "Signal",
+                "Name",
+                "DataItem",
+                "Category",
+                "Type",
+                "Units",
+                "Quality binding"
+            ]
         );
         // Each column binds a path the reply really carries.
         let rows = ProtocolView {
-            agent: Arc::new(FakeAgent { info: Arc::new(learned_info()), model: Some(probe_model()) }),
+            agent: Arc::new(FakeAgent {
+                info: Arc::new(learned_info()),
+                model: Some(probe_model()),
+            }),
             agent_id: "line-a-agent".into(),
             device_uuid: DEVICE_UUID.into(),
             signals: Arc::new(SignalSlot::new(mtc_signals(), None)),
@@ -2631,7 +3320,9 @@ mod tests {
             let path = column["path"].as_str().unwrap();
             let mut value = &rows[0];
             for key in path.split('.') {
-                value = value.get(key).unwrap_or_else(|| panic!("sb/signals publishes `{path}`"));
+                value = value
+                    .get(key)
+                    .unwrap_or_else(|| panic!("sb/signals publishes `{path}`"));
             }
         }
     }
@@ -2643,7 +3334,11 @@ mod tests {
         assert_eq!(conditions["kind"], json!("eventFeed"));
         assert_eq!(
             conditions["families"],
-            json!(["MtconnectConditionEvent", "MtconnectDataLossEvent", "MtconnectAgentEvent"])
+            json!([
+                "MtconnectConditionEvent",
+                "MtconnectDataLossEvent",
+                "MtconnectAgentEvent"
+            ])
         );
         assert_eq!(conditions["limit"], json!(100));
 
@@ -2652,7 +3347,11 @@ mod tests {
         assert_eq!(diagnostics[1]["kind"], json!("eventFeed"));
         assert_eq!(
             diagnostics[1]["families"],
-            json!(["MtconnectAgentEvent", "MtconnectModelDriftEvent", "MtconnectDataLossEvent"])
+            json!([
+                "MtconnectAgentEvent",
+                "MtconnectModelDriftEvent",
+                "MtconnectDataLossEvent"
+            ])
         );
         let series: Vec<&str> = diagnostics[2]["series"]
             .as_array()
@@ -2660,6 +3359,9 @@ mod tests {
             .iter()
             .map(|s| s["label"].as_str().unwrap())
             .collect();
-        assert_eq!(series, vec!["Stream gaps", "Reconnects", "Heartbeats", "Parse errors"]);
+        assert_eq!(
+            series,
+            vec!["Stream gaps", "Reconnects", "Heartbeats", "Parse errors"]
+        );
     }
 }

@@ -72,7 +72,9 @@ impl ScriptedAgent {
         let seen = Arc::clone(&agent.requests);
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 let probe = Arc::clone(&probe);
                 let current = Arc::clone(&current);
                 let sample = Arc::clone(&sample);
@@ -105,8 +107,11 @@ impl ScriptedAgent {
 
                     match endpoint {
                         "probe" | "current" => {
-                            let body =
-                                doc_from(if endpoint == "probe" { &probe } else { &current });
+                            let body = doc_from(if endpoint == "probe" {
+                                &probe
+                            } else {
+                                &current
+                            });
                             let response = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                                 body.len()
@@ -114,13 +119,14 @@ impl ScriptedAgent {
                             let _ = sock.write_all(response.as_bytes()).await;
                         }
                         "sample" => {
-                            let behavior = sample.lock().unwrap().pop_front().unwrap_or_else(|| {
-                                if allow.load(Ordering::Relaxed) {
-                                    SampleBehavior::Parts(vec![HEARTBEAT.to_string()])
-                                } else {
-                                    SampleBehavior::Refuse
-                                }
-                            });
+                            let behavior =
+                                sample.lock().unwrap().pop_front().unwrap_or_else(|| {
+                                    if allow.load(Ordering::Relaxed) {
+                                        SampleBehavior::Parts(vec![HEARTBEAT.to_string()])
+                                    } else {
+                                        SampleBehavior::Refuse
+                                    }
+                                });
                             match behavior {
                                 SampleBehavior::Refuse => {
                                     let _ = sock
@@ -195,7 +201,9 @@ fn runtime_for(agent: &ScriptedAgent, extra: serde_json::Value) -> Arc<AgentRunt
     for (k, v) in extra.as_object().cloned().unwrap_or_default() {
         entry[k] = v;
     }
-    let cfg = parse_agents(&json!({ "agents": [entry] })).unwrap().remove(0);
+    let cfg = parse_agents(&json!({ "agents": [entry] }))
+        .unwrap()
+        .remove(0);
     AgentRuntime::new(cfg, &AgentCredentials::default()).unwrap()
 }
 
@@ -275,19 +283,29 @@ async fn the_machine_probes_snapshots_then_streams_from_next_sequence() {
     rt.spawn().unwrap();
 
     // The /current snapshot arrives first, then the agent-up announcement rides behind it.
-    wait_for(&mut handle.rx, "the snapshot", |e| {
-        matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 37))
+    wait_for(
+        &mut handle.rx,
+        "the snapshot",
+        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 37)),
+    )
+    .await;
+    wait_for(&mut handle.rx, "agent up", |e| {
+        matches!(e, InstanceEvent::AgentUp(_))
     })
     .await;
-    wait_for(&mut handle.rx, "agent up", |e| matches!(e, InstanceEvent::AgentUp(_))).await;
     // ...then the stream delivers what is new.
-    wait_for(&mut handle.rx, "the streamed observation", |e| {
-        matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 43))
-    })
+    wait_for(
+        &mut handle.rx,
+        "the streamed observation",
+        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 43)),
+    )
     .await;
 
     let info = rt.info();
-    assert_eq!(info.mode, "stream", "an established stream is the published mode");
+    assert_eq!(
+        info.mode, "stream",
+        "an established stream is the published mode"
+    );
     assert!(info.connected);
     assert_eq!(info.instance_id, Some(1_749_000_000));
 
@@ -295,9 +313,18 @@ async fn the_machine_probes_snapshots_then_streams_from_next_sequence() {
     // stream resuming exactly at the snapshot's nextSequence with interval+heartbeat.
     let requests = agent.requests();
     assert!(requests[0].starts_with("/probe"), "{requests:?}");
-    assert!(requests.iter().any(|r| r.starts_with("/current")), "{requests:?}");
-    let sample = requests.iter().find(|r| r.starts_with("/sample")).expect("a stream request");
-    assert!(sample.contains("from=42"), "resumes at the snapshot's nextSequence: {sample}");
+    assert!(
+        requests.iter().any(|r| r.starts_with("/current")),
+        "{requests:?}"
+    );
+    let sample = requests
+        .iter()
+        .find(|r| r.starts_with("/sample"))
+        .expect("a stream request");
+    assert!(
+        sample.contains("from=42"),
+        "resumes at the snapshot's nextSequence: {sample}"
+    );
     assert!(sample.contains("interval=250"), "{sample}");
     assert!(sample.contains("heartbeat=60000"), "{sample}");
 
@@ -325,9 +352,11 @@ async fn out_of_range_republishes_a_snapshot_and_resumes() {
     rt.spawn().unwrap();
 
     // The initial snapshot (seq 37, next 42).
-    wait_for(&mut handle.rx, "the initial snapshot", |e| {
-        matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 37))
-    })
+    wait_for(
+        &mut handle.rx,
+        "the initial snapshot",
+        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 37)),
+    )
     .await;
 
     // Ladder 2: the loss is quantified — the agent's firstSequence (153) minus our cursor (42).
@@ -335,24 +364,40 @@ async fn out_of_range_republishes_a_snapshot_and_resumes() {
         matches!(e, InstanceEvent::DataLoss { .. })
     })
     .await;
-    assert!(matches!(loss, InstanceEvent::DataLoss { skipped: 111 }), "{loss:?}");
+    assert!(
+        matches!(loss, InstanceEvent::DataLoss { skipped: 111 }),
+        "{loss:?}"
+    );
 
     // The recovery snapshot REPUBLISHES the same values as fresh (dedupe floors bypassed): the
     // same /current document, the same sequence 37, deliberately said again.
-    wait_for(&mut handle.rx, "the republished snapshot", |e| {
-        matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 37))
-    })
+    wait_for(
+        &mut handle.rx,
+        "the republished snapshot",
+        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 37)),
+    )
     .await;
     // And the stream resumes and delivers.
-    wait_for(&mut handle.rx, "the post-recovery observation", |e| {
-        matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 43))
-    })
+    wait_for(
+        &mut handle.rx,
+        "the post-recovery observation",
+        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 43)),
+    )
     .await;
 
     let requests = agent.requests();
-    let currents = requests.iter().filter(|r| r.starts_with("/current")).count();
-    assert!(currents >= 2, "the recovery fetched a fresh snapshot: {requests:?}");
-    let samples: Vec<&String> = requests.iter().filter(|r| r.starts_with("/sample")).collect();
+    let currents = requests
+        .iter()
+        .filter(|r| r.starts_with("/current"))
+        .count();
+    assert!(
+        currents >= 2,
+        "the recovery fetched a fresh snapshot: {requests:?}"
+    );
+    let samples: Vec<&String> = requests
+        .iter()
+        .filter(|r| r.starts_with("/sample"))
+        .collect();
     assert!(samples.len() >= 2, "{requests:?}");
     assert!(
         samples.last().unwrap().contains("from=42"),
@@ -373,12 +418,23 @@ async fn an_agent_restart_reprobes_surfaces_drift_and_resumes() {
 
     // The restarted agent: new instanceId in the stream, a changed device model behind /probe,
     // and a /current from the new incarnation.
-    agent.push_sample(SampleBehavior::Parts(vec![streams_part(NEW_INSTANCE, 4, &[(3, 9.5)])]));
-    agent.push_sample(SampleBehavior::Parts(vec![streams_part(NEW_INSTANCE, 6, &[(5, 10.5)])]));
+    agent.push_sample(SampleBehavior::Parts(vec![streams_part(
+        NEW_INSTANCE,
+        4,
+        &[(3, 9.5)],
+    )]));
+    agent.push_sample(SampleBehavior::Parts(vec![streams_part(
+        NEW_INSTANCE,
+        6,
+        &[(5, 10.5)],
+    )]));
     agent.push_probe(&PROBE.replace("name=\"OKUMA-CNC\"", "name=\"OKUMA-CNC-REFITTED\""));
     agent.push_current(
         &CURRENT
-            .replace("instanceId=\"1749000000\"", &format!("instanceId=\"{NEW_INSTANCE}\""))
+            .replace(
+                "instanceId=\"1749000000\"",
+                &format!("instanceId=\"{NEW_INSTANCE}\""),
+            )
             .replace("nextSequence=\"42\"", "nextSequence=\"4\"")
             // A restarted buffer cannot hold pre-restart sequence numbers: keep the recovery
             // snapshot coherent with the new incarnation.
@@ -390,9 +446,11 @@ async fn an_agent_restart_reprobes_surfaces_drift_and_resumes() {
     rt.spawn().unwrap();
 
     // The restart's own observation is published fresh (sequence numbering restarted at 3).
-    wait_for(&mut handle.rx, "the post-restart observation", |e| {
-        matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 3))
-    })
+    wait_for(
+        &mut handle.rx,
+        "the post-restart observation",
+        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 3)),
+    )
     .await;
 
     // Ladder 3: the model was re-verified and its digest CHANGED — surfaced, never remapped.
@@ -400,15 +458,22 @@ async fn an_agent_restart_reprobes_surfaces_drift_and_resumes() {
         matches!(e, InstanceEvent::ModelDrift { .. })
     })
     .await;
-    let InstanceEvent::ModelDrift { old, new } = drift else { unreachable!() };
+    let InstanceEvent::ModelDrift { old, new } = drift else {
+        unreachable!()
+    };
     assert_ne!(old, new, "the digest change is the drift");
 
     // The machine resumed streaming against the new incarnation.
-    wait_for(&mut handle.rx, "the resumed stream", |e| {
-        matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 5))
+    wait_for(
+        &mut handle.rx,
+        "the resumed stream",
+        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 5)),
+    )
+    .await;
+    wait_info(&rt, "the new instance id", |i| {
+        i.instance_id == Some(NEW_INSTANCE)
     })
     .await;
-    wait_info(&rt, "the new instance id", |i| i.instance_id == Some(NEW_INSTANCE)).await;
 
     let requests = agent.requests();
     let probes = requests.iter().filter(|r| r.starts_with("/probe")).count();
@@ -447,11 +512,17 @@ async fn repeated_establish_failures_degrade_to_polling_and_recover() {
     );
 
     // Degraded is not down: /current polling keeps data flowing between stream retries.
-    wait_for(&mut handle.rx, "poll-delivered data while degraded", |e| {
-        matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 57))
-    })
+    wait_for(
+        &mut handle.rx,
+        "poll-delivered data while degraded",
+        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 57)),
+    )
     .await;
-    assert_eq!(rt.info().mode, "poll", "degraded mode is honest in sb/status");
+    assert_eq!(
+        rt.info().mode,
+        "poll",
+        "degraded mode is honest in sb/status"
+    );
 
     // The agent starts serving streams again: the machine recovers on its own.
     agent.allow_stream.store(true, Ordering::Relaxed);
@@ -467,15 +538,28 @@ async fn repeated_establish_failures_degrade_to_polling_and_recover() {
 #[tokio::test]
 async fn poll_only_never_requests_a_stream() {
     let agent = ScriptedAgent::start(PROBE, CURRENT).await;
-    let rt = runtime_for(&agent, json!({ "streaming": "poll-only", "pollIntervalMs": 25 }));
+    let rt = runtime_for(
+        &agent,
+        json!({ "streaming": "poll-only", "pollIntervalMs": 25 }),
+    );
     let mut handle = rt.attach(DEVICE);
     rt.spawn().unwrap();
 
-    wait_for(&mut handle.rx, "polled data", |e| matches!(e, InstanceEvent::Snapshot(_))).await;
+    wait_for(&mut handle.rx, "polled data", |e| {
+        matches!(e, InstanceEvent::Snapshot(_))
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(120)).await;
 
     let requests = agent.requests();
-    assert!(requests.iter().filter(|r| r.starts_with("/current")).count() >= 2, "{requests:?}");
+    assert!(
+        requests
+            .iter()
+            .filter(|r| r.starts_with("/current"))
+            .count()
+            >= 2,
+        "{requests:?}"
+    );
     assert!(
         !requests.iter().any(|r| r.starts_with("/sample")),
         "poll-only must never open a stream: {requests:?}"
@@ -517,19 +601,29 @@ async fn one_stream_serves_many_devices_each_seeing_only_its_own() {
     let mut mazak = rt.attach("MAZAK.999");
     rt.spawn().unwrap();
 
-    let okuma_obs = wait_for(&mut okuma.rx, "the CNC's streamed observation", |e| {
-        matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 58))
-    })
+    let okuma_obs = wait_for(
+        &mut okuma.rx,
+        "the CNC's streamed observation",
+        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 58)),
+    )
     .await;
     if let InstanceEvent::Snapshot(obs) = &okuma_obs {
-        assert!(obs.iter().all(|o| o.data_item_id != "m-avail"), "no cross-device leakage");
+        assert!(
+            obs.iter().all(|o| o.data_item_id != "m-avail"),
+            "no cross-device leakage"
+        );
     }
-    let mazak_obs = wait_for(&mut mazak.rx, "the mill's streamed observation", |e| {
-        matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 59))
-    })
+    let mazak_obs = wait_for(
+        &mut mazak.rx,
+        "the mill's streamed observation",
+        |e| matches!(e, InstanceEvent::Snapshot(obs) if obs.iter().any(|o| o.sequence == 59)),
+    )
     .await;
     if let InstanceEvent::Snapshot(obs) = &mazak_obs {
-        assert!(obs.iter().all(|o| o.data_item_id == "m-avail"), "only its own items");
+        assert!(
+            obs.iter().all(|o| o.data_item_id == "m-avail"),
+            "only its own items"
+        );
     }
 
     rt.shutdown().await;

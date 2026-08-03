@@ -172,22 +172,38 @@ mod tests {
         assert_eq!(MtcError::TooLarge { limit: 1 }.code(), "TOO_LARGE");
         assert_eq!(MtcError::Multipart("x".into()).code(), "MULTIPART");
         assert_eq!(MtcError::Xml("x".into()).code(), "PARSE");
-        assert_eq!(MtcError::UnsupportedVersion("9".into()).code(), "UNSUPPORTED_VERSION");
+        assert_eq!(
+            MtcError::UnsupportedVersion("9".into()).code(),
+            "UNSUPPORTED_VERSION"
+        );
         assert_eq!(MtcError::OutOfRange { first: 3 }.code(), "OUT_OF_RANGE");
-        assert_eq!(MtcError::InstanceChanged { old: 1, new: 2 }.code(), "INSTANCE_CHANGED");
+        assert_eq!(
+            MtcError::InstanceChanged { old: 1, new: 2 }.code(),
+            "INSTANCE_CHANGED"
+        );
         assert_eq!(MtcError::NoSuchDevice("d".into()).code(), "NO_SUCH_DEVICE");
-        assert_eq!(MtcError::NoSuchDataItem("d".into()).code(), "NO_SUCH_DATAITEM");
+        assert_eq!(
+            MtcError::NoSuchDataItem("d".into()).code(),
+            "NO_SUCH_DATAITEM"
+        );
         assert_eq!(MtcError::Config("c".into()).code(), "CONFIG");
         // An agent-reported code rides through verbatim: it IS the operator's code.
         assert_eq!(
-            MtcError::AgentError { code: "UNAUTHORIZED".into(), message: "no".into() }.code(),
+            MtcError::AgentError {
+                code: "UNAUTHORIZED".into(),
+                message: "no".into()
+            }
+            .code(),
             "UNAUTHORIZED"
         );
     }
 
     #[test]
     fn errors_render_without_leaking_more_than_their_code() {
-        assert_eq!(MtcError::Http { status: 401 }.to_string(), "agent returned HTTP 401");
+        assert_eq!(
+            MtcError::Http { status: 401 }.to_string(),
+            "agent returned HTTP 401"
+        );
         assert_eq!(
             MtcError::InstanceChanged { old: 1, new: 2 }.to_string(),
             "agent instanceId changed 1 -> 2"
@@ -200,7 +216,14 @@ mod tests {
         c.record_ok(2);
         c.record_ok(0);
         c.record_err();
-        assert_eq!(c, ParseCounters { documents_parsed: 2, parse_errors: 1, unknown_elements: 2 });
+        assert_eq!(
+            c,
+            ParseCounters {
+                documents_parsed: 2,
+                parse_errors: 1,
+                unknown_elements: 2
+            }
+        );
         assert_eq!(c.to_string(), "parsed=2 errors=1 unknown=2");
     }
 }

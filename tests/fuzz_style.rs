@@ -72,8 +72,9 @@ fn random_delimited_body(rng: &mut Rng, max_len: usize) -> Vec<u8> {
 fn random_multipart_bodies_reassemble_across_random_chunk_splits() {
     for seed in 0..300u64 {
         let mut rng = Rng::new(seed + 1);
-        let boundary: String =
-            (0..1 + rng.below(24)).map(|_| char::from(b'A' + rng.below(26) as u8)).collect();
+        let boundary: String = (0..1 + rng.below(24))
+            .map(|_| char::from(b'A' + rng.below(26) as u8))
+            .collect();
 
         // Build 1..5 parts, remembering the expected bodies.
         let mut wire = Vec::new();
@@ -110,9 +111,11 @@ fn random_multipart_bodies_reassemble_across_random_chunk_splits() {
         let mut offset = 0;
         while offset < wire.len() {
             let take = (1 + rng.below(64)).min(wire.len() - offset);
-            reader.push(&wire[offset..offset + take]).unwrap_or_else(|e| {
-                panic!("seed {seed}: push refused a valid body: {e}");
-            });
+            reader
+                .push(&wire[offset..offset + take])
+                .unwrap_or_else(|e| {
+                    panic!("seed {seed}: push refused a valid body: {e}");
+                });
             offset += take;
             loop {
                 match reader.next_part() {
@@ -124,8 +127,14 @@ fn random_multipart_bodies_reassemble_across_random_chunk_splits() {
         }
         let got_bodies: Vec<&[u8]> = got.iter().map(|p| p.body.as_slice()).collect();
         let want: Vec<&[u8]> = expected.iter().map(Vec::as_slice).collect();
-        assert_eq!(got_bodies, want, "seed {seed}: bodies must reassemble byte-for-byte");
-        assert!(reader.is_finished(), "seed {seed}: the terminator must be recognized");
+        assert_eq!(
+            got_bodies, want,
+            "seed {seed}: bodies must reassemble byte-for-byte"
+        );
+        assert!(
+            reader.is_finished(),
+            "seed {seed}: the terminator must be recognized"
+        );
     }
 }
 
@@ -137,7 +146,9 @@ fn random_garbage_never_panics_the_splitter_and_never_grows_its_buffer_unbounded
         let mut reader =
             MultipartReader::from_content_type("multipart/mixed; boundary=FUZZ", CAP).unwrap();
         for _ in 0..40 {
-            let chunk: Vec<u8> = (0..rng.below(200)).map(|_| (rng.next() & 0xff) as u8).collect();
+            let chunk: Vec<u8> = (0..rng.below(200))
+                .map(|_| (rng.next() & 0xff) as u8)
+                .collect();
             if reader.push(&chunk).is_err() {
                 // The bounded accumulator refused — that IS the guarantee. Start over.
                 reader.reset();
@@ -155,7 +166,8 @@ fn random_garbage_never_panics_the_splitter_and_never_grows_its_buffer_unbounded
                 }
             }
             assert!(
-                reader.buffered().len() <= CAP + mtconnect_adapter::mtconnect::multipart::MAX_PART_HEADER_BYTES,
+                reader.buffered().len()
+                    <= CAP + mtconnect_adapter::mtconnect::multipart::MAX_PART_HEADER_BYTES,
                 "seed {seed}: the buffer must stay bounded"
             );
         }
@@ -189,9 +201,15 @@ fn mutate(rng: &mut Rng, base: &str) -> Vec<u8> {
 fn mutated_streams_documents_parse_or_fail_but_never_panic() {
     for seed in 0..400u64 {
         let mut rng = Rng::new(seed + 40_000);
-        let base = if rng.chance(70) { CURRENT_2_7 } else { ERRORS_2_7 };
+        let base = if rng.chance(70) {
+            CURRENT_2_7
+        } else {
+            ERRORS_2_7
+        };
         let mutated = mutate(&mut rng, base);
-        let Ok(text) = std::str::from_utf8(&mutated) else { continue };
+        let Ok(text) = std::str::from_utf8(&mutated) else {
+            continue;
+        };
         // Ok or Err are both acceptable outcomes; a panic is the only failure.
         let _ = parse_streams(text);
         let _ = parse_errors(text);

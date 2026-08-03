@@ -193,10 +193,13 @@ impl Shaper {
             return vec![readings];
         }
 
-        let buffer = self.buffers.entry(reading.signal_id.clone()).or_insert_with(|| Buffer {
-            readings: Vec::new(),
-            deadline: now + Duration::from_millis(u64::from(policy.batch_ms)),
-        });
+        let buffer = self
+            .buffers
+            .entry(reading.signal_id.clone())
+            .or_insert_with(|| Buffer {
+                readings: Vec::new(),
+                deadline: now + Duration::from_millis(u64::from(policy.batch_ms)),
+            });
         if policy.latest_only {
             buffer.readings.clear();
         }
@@ -221,7 +224,10 @@ impl Shaper {
             .map(|(id, b)| (b.deadline, id.clone()))
             .collect();
         expired.sort();
-        expired.into_iter().filter_map(|(_, id)| self.flush_signal(&id)).collect()
+        expired
+            .into_iter()
+            .filter_map(|(_, id)| self.flush_signal(&id))
+            .collect()
     }
 
     /// Flush every open window — shutdown, link loss, reconnect: buffered readings are data, and
@@ -233,7 +239,9 @@ impl Shaper {
             .map(|(id, b)| (b.deadline, id.clone()))
             .collect();
         all.sort();
-        all.into_iter().filter_map(|(_, id)| self.flush_signal(&id)).collect()
+        all.into_iter()
+            .filter_map(|(_, id)| self.flush_signal(&id))
+            .collect()
     }
 
     /// Discard every open window — the pause discipline: nothing reaches the wire while paused,
@@ -274,9 +282,10 @@ impl Shaper {
         if (reading.quality, reading.quality_raw.clone()) != state.last_quality {
             return false; // a quality transition must never be suppressed
         }
-        let (Some(value), Some(last)) =
-            (reading.value.as_ref().and_then(serde_json::Value::as_f64), state.last_value)
-        else {
+        let (Some(value), Some(last)) = (
+            reading.value.as_ref().and_then(serde_json::Value::as_f64),
+            state.last_value,
+        ) else {
             return false; // non-numeric/array values (and a missing baseline) always pass
         };
         (value - last).abs() < deadband
@@ -289,7 +298,10 @@ impl Shaper {
         let state = self
             .entries
             .entry(reading.signal_id.clone())
-            .or_insert_with(|| EntryState { last_value: None, last_quality: (reading.quality, reading.quality_raw.clone()) });
+            .or_insert_with(|| EntryState {
+                last_value: None,
+                last_quality: (reading.quality, reading.quality_raw.clone()),
+            });
         state.last_quality = (reading.quality, reading.quality_raw.clone());
         if let Some(v) = numeric {
             state.last_value = Some(v);
@@ -303,11 +315,18 @@ mod tests {
     use serde_json::json;
 
     fn policy(batch_ms: u32) -> PublishPolicy {
-        PublishPolicy { batch_ms, latest_only: false, deadband: None }
+        PublishPolicy {
+            batch_ms,
+            latest_only: false,
+            deadband: None,
+        }
     }
 
     fn table(entries: &[(&str, PublishPolicy)]) -> HashMap<String, PublishPolicy> {
-        entries.iter().map(|(id, p)| ((*id).to_string(), p.clone())).collect()
+        entries
+            .iter()
+            .map(|(id, p)| ((*id).to_string(), p.clone()))
+            .collect()
     }
 
     fn good(id: &str, value: f64) -> Reading {
@@ -330,10 +349,17 @@ mod tests {
         let mut s = Shaper::new();
         let out = s.offer(good("a", 1.0), t0());
         assert_eq!(out, vec![vec![good("a", 1.0)]]);
-        assert_eq!(s.next_deadline(), None, "nothing buffered, nothing to sleep on");
+        assert_eq!(
+            s.next_deadline(),
+            None,
+            "nothing buffered, nothing to sleep on"
+        );
         assert_eq!(
             s.take_counters(),
-            Some(ShapingCounters { published: 1, ..Default::default() })
+            Some(ShapingCounters {
+                published: 1,
+                ..Default::default()
+            })
         );
     }
 
@@ -342,22 +368,45 @@ mod tests {
         let mut s = Shaper::new();
         s.set_policies(table(&[(
             "a",
-            PublishPolicy { batch_ms: 0, latest_only: false, deadband: Some(0.5) },
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: Some(0.5),
+            },
         )]));
-        assert_eq!(s.offer(good("a", 1.0), t0()).len(), 1, "the first reading always passes");
-        assert!(s.offer(good("a", 1.2), t0()).is_empty(), "sub-deadband change dropped");
-        assert_eq!(s.offer(good("a", 2.0), t0()).len(), 1, "a real change publishes immediately");
+        assert_eq!(
+            s.offer(good("a", 1.0), t0()).len(),
+            1,
+            "the first reading always passes"
+        );
+        assert!(
+            s.offer(good("a", 1.2), t0()).is_empty(),
+            "sub-deadband change dropped"
+        );
+        assert_eq!(
+            s.offer(good("a", 2.0), t0()).len(),
+            1,
+            "a real change publishes immediately"
+        );
     }
 
     #[test]
     fn a_trivial_policy_is_recognized_so_the_fast_path_stays_fast() {
         assert!(policy(0).is_trivial());
         assert!(!policy(100).is_trivial());
-        assert!(
-            !PublishPolicy { batch_ms: 0, latest_only: false, deadband: Some(1.0) }.is_trivial()
-        );
+        assert!(!PublishPolicy {
+            batch_ms: 0,
+            latest_only: false,
+            deadband: Some(1.0)
+        }
+        .is_trivial());
         // latest_only with a zero window degenerates to immediate — trivial.
-        assert!(PublishPolicy { batch_ms: 0, latest_only: true, deadband: None }.is_trivial());
+        assert!(PublishPolicy {
+            batch_ms: 0,
+            latest_only: true,
+            deadband: None
+        }
+        .is_trivial());
     }
 
     // --- batching -------------------------------------------------------------------------------
@@ -368,7 +417,10 @@ mod tests {
         s.set_policies(table(&[("a", policy(250))]));
         let start = t0();
 
-        assert!(s.offer(good("a", 1.0), start).is_empty(), "buffered, not published");
+        assert!(
+            s.offer(good("a", 1.0), start).is_empty(),
+            "buffered, not published"
+        );
         assert!(s.offer(good("a", 2.0), ms(start, 100)).is_empty());
         assert!(s.offer(good("a", 3.0), ms(start, 200)).is_empty());
 
@@ -378,12 +430,23 @@ mod tests {
 
         let flushed = s.due(ms(start, 250));
         assert_eq!(flushed.len(), 1, "ONE update for the whole window");
-        let values: Vec<_> = flushed[0].iter().map(|r| r.value.clone().unwrap()).collect();
-        assert_eq!(values, vec![json!(1.0), json!(2.0), json!(3.0)], "arrival order");
+        let values: Vec<_> = flushed[0]
+            .iter()
+            .map(|r| r.value.clone().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec![json!(1.0), json!(2.0), json!(3.0)],
+            "arrival order"
+        );
         assert_eq!(s.next_deadline(), None, "the window closed");
         assert_eq!(
             s.take_counters(),
-            Some(ShapingCounters { published: 1, coalesced: 3, ..Default::default() })
+            Some(ShapingCounters {
+                published: 1,
+                coalesced: 3,
+                ..Default::default()
+            })
         );
     }
 
@@ -404,7 +467,11 @@ mod tests {
         s.offer(second.clone(), ms(start, 50));
 
         let flushed = s.due(ms(start, 100));
-        assert_eq!(flushed[0], vec![first, second], "readings ride the flush untouched");
+        assert_eq!(
+            flushed[0],
+            vec![first, second],
+            "readings ride the flush untouched"
+        );
     }
 
     #[test]
@@ -416,13 +483,21 @@ mod tests {
         s.offer(good("b", 9.0), ms(start, 10));
         s.offer(good("a", 2.0), ms(start, 20));
 
-        assert_eq!(s.next_deadline(), Some(ms(start, 100)), "the EARLIEST window");
+        assert_eq!(
+            s.next_deadline(),
+            Some(ms(start, 100)),
+            "the EARLIEST window"
+        );
         let flushed = s.due(ms(start, 100));
         assert_eq!(flushed.len(), 1, "only a's window expired");
         assert_eq!(flushed[0].len(), 2);
         assert_eq!(flushed[0][0].signal_id, "a");
 
-        assert_eq!(s.next_deadline(), Some(ms(start, 310)), "b's window is still open");
+        assert_eq!(
+            s.next_deadline(),
+            Some(ms(start, 310)),
+            "b's window is still open"
+        );
         let flushed = s.due(ms(start, 310));
         assert_eq!(flushed[0][0].signal_id, "b");
     }
@@ -436,7 +511,11 @@ mod tests {
         s.due(ms(start, 100));
 
         s.offer(good("a", 2.0), ms(start, 500));
-        assert_eq!(s.next_deadline(), Some(ms(start, 600)), "the window opens at arrival");
+        assert_eq!(
+            s.next_deadline(),
+            Some(ms(start, 600)),
+            "the window opens at arrival"
+        );
     }
 
     #[test]
@@ -444,7 +523,11 @@ mod tests {
         let mut s = Shaper::new();
         s.set_policies(table(&[(
             "a",
-            PublishPolicy { batch_ms: 200, latest_only: true, deadband: None },
+            PublishPolicy {
+                batch_ms: 200,
+                latest_only: true,
+                deadband: None,
+            },
         )]));
         let start = t0();
         s.offer(good("a", 1.0), start);
@@ -461,7 +544,11 @@ mod tests {
     #[test]
     fn multiple_expired_windows_flush_in_deadline_then_id_order() {
         let mut s = Shaper::new();
-        s.set_policies(table(&[("b", policy(50)), ("a", policy(100)), ("c", policy(50))]));
+        s.set_policies(table(&[
+            ("b", policy(50)),
+            ("a", policy(100)),
+            ("c", policy(50)),
+        ]));
         let start = t0();
         s.offer(good("c", 3.0), start);
         s.offer(good("b", 2.0), start);
@@ -469,7 +556,11 @@ mod tests {
 
         let flushed = s.due(ms(start, 100));
         let order: Vec<_> = flushed.iter().map(|u| u[0].signal_id.clone()).collect();
-        assert_eq!(order, vec!["b", "c", "a"], "deadline first, id as the tiebreak");
+        assert_eq!(
+            order,
+            vec!["b", "c", "a"],
+            "deadline first, id as the tiebreak"
+        );
     }
 
     // --- quality flushes ------------------------------------------------------------------------
@@ -483,9 +574,17 @@ mod tests {
         s.offer(good("a", 2.0), ms(start, 10));
 
         let flushed = s.offer(Reading::bad("a", "UNAVAILABLE"), ms(start, 20));
-        assert_eq!(flushed.len(), 1, "a quality problem must not sit in a window");
+        assert_eq!(
+            flushed.len(),
+            1,
+            "a quality problem must not sit in a window"
+        );
         let ids: Vec<_> = flushed[0].iter().map(|r| r.value.clone()).collect();
-        assert_eq!(ids, vec![Some(json!(1.0)), Some(json!(2.0)), None], "buffered first, BAD last");
+        assert_eq!(
+            ids,
+            vec![Some(json!(1.0)), Some(json!(2.0)), None],
+            "buffered first, BAD last"
+        );
         assert_eq!(s.next_deadline(), None, "the window closed with the flush");
     }
 
@@ -499,7 +598,11 @@ mod tests {
             ..good("a", 5.0)
         };
         let flushed = s.offer(uncertain.clone(), t0());
-        assert_eq!(flushed, vec![vec![uncertain]], "no buffer to drain — it goes out alone, now");
+        assert_eq!(
+            flushed,
+            vec![vec![uncertain]],
+            "no buffer to drain — it goes out alone, now"
+        );
     }
 
     // --- deadband -------------------------------------------------------------------------------
@@ -509,13 +612,34 @@ mod tests {
         let mut s = Shaper::new();
         s.set_policies(table(&[(
             "a",
-            PublishPolicy { batch_ms: 0, latest_only: false, deadband: Some(1.0) },
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: Some(1.0),
+            },
         )]));
-        assert_eq!(s.offer(good("a", 10.0), t0()).len(), 1, "first always passes");
-        assert!(s.offer(good("a", 10.5), t0()).is_empty(), "|10.5-10.0| < 1.0");
-        assert!(s.offer(good("a", 10.9), t0()).is_empty(), "still against 10.0 — the last ACCEPTED");
-        assert_eq!(s.offer(good("a", 11.0), t0()).len(), 1, "|11.0-10.0| >= 1.0 passes");
-        assert!(s.offer(good("a", 11.5), t0()).is_empty(), "the anchor moved to 11.0");
+        assert_eq!(
+            s.offer(good("a", 10.0), t0()).len(),
+            1,
+            "first always passes"
+        );
+        assert!(
+            s.offer(good("a", 10.5), t0()).is_empty(),
+            "|10.5-10.0| < 1.0"
+        );
+        assert!(
+            s.offer(good("a", 10.9), t0()).is_empty(),
+            "still against 10.0 — the last ACCEPTED"
+        );
+        assert_eq!(
+            s.offer(good("a", 11.0), t0()).len(),
+            1,
+            "|11.0-10.0| >= 1.0 passes"
+        );
+        assert!(
+            s.offer(good("a", 11.5), t0()).is_empty(),
+            "the anchor moved to 11.0"
+        );
         assert_eq!(
             s.take_counters().unwrap().deadband_dropped,
             3,
@@ -528,7 +652,11 @@ mod tests {
         let mut s = Shaper::new();
         s.set_policies(table(&[(
             "a",
-            PublishPolicy { batch_ms: 0, latest_only: false, deadband: Some(100.0) },
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: Some(100.0),
+            },
         )]));
         s.offer(good("a", 10.0), t0());
 
@@ -546,11 +674,19 @@ mod tests {
             quality_raw: Some("MTC_CONDITION:WARNING:ALM-9".into()),
             ..good("a", 10.0)
         };
-        assert_eq!(s.offer(other_alarm, t0()).len(), 1, "a qualityRaw change must pass");
+        assert_eq!(
+            s.offer(other_alarm, t0()).len(),
+            1,
+            "a qualityRaw change must pass"
+        );
 
         // Recovery is a transition as well.
         let recovered = good("a", 10.0);
-        assert_eq!(s.offer(recovered, t0()).len(), 1, "UNCERTAIN->GOOD must pass");
+        assert_eq!(
+            s.offer(recovered, t0()).len(),
+            1,
+            "UNCERTAIN->GOOD must pass"
+        );
 
         // And only now does the deadband suppress a same-quality subthreshold change.
         assert!(s.offer(good("a", 10.1), t0()).is_empty());
@@ -561,15 +697,26 @@ mod tests {
         let mut s = Shaper::new();
         s.set_policies(table(&[(
             "a",
-            PublishPolicy { batch_ms: 0, latest_only: false, deadband: Some(100.0) },
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: Some(100.0),
+            },
         )]));
         s.offer(good("a", 1.0), t0());
         let array = Reading::good("a", json!([1.0, 2.0]));
-        assert_eq!(s.offer(array, t0()).len(), 1, "a TIME_SERIES array is never suppressed");
+        assert_eq!(
+            s.offer(array, t0()).len(),
+            1,
+            "a TIME_SERIES array is never suppressed"
+        );
         let text = Reading::good("a", json!("ACTIVE"));
         assert_eq!(s.offer(text, t0()).len(), 1, "a string is never suppressed");
         // After non-numeric values the anchor is still the last accepted NUMERIC value.
-        assert!(s.offer(good("a", 1.5), t0()).is_empty(), "anchored on 1.0, not the array");
+        assert!(
+            s.offer(good("a", 1.5), t0()).is_empty(),
+            "anchored on 1.0, not the array"
+        );
     }
 
     #[test]
@@ -577,14 +724,28 @@ mod tests {
         let mut s = Shaper::new();
         s.set_policies(table(&[(
             "a",
-            PublishPolicy { batch_ms: 0, latest_only: false, deadband: Some(1.0) },
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: Some(1.0),
+            },
         )]));
         s.offer(good("a", 10.0), t0());
-        assert!(s.offer(good("a", 10.1), t0()).is_empty(), "suppressed before the resync");
+        assert!(
+            s.offer(good("a", 10.1), t0()).is_empty(),
+            "suppressed before the resync"
+        );
 
         s.reset_deadband();
-        assert_eq!(s.offer(good("a", 10.1), t0()).len(), 1, "the first after a resync passes");
-        assert!(s.offer(good("a", 10.2), t0()).is_empty(), "and the gate is armed again");
+        assert_eq!(
+            s.offer(good("a", 10.1), t0()).len(),
+            1,
+            "the first after a resync passes"
+        );
+        assert!(
+            s.offer(good("a", 10.2), t0()).is_empty(),
+            "and the gate is armed again"
+        );
     }
 
     #[test]
@@ -592,7 +753,11 @@ mod tests {
         let mut s = Shaper::new();
         s.set_policies(table(&[(
             "a",
-            PublishPolicy { batch_ms: 100, latest_only: false, deadband: Some(1.0) },
+            PublishPolicy {
+                batch_ms: 100,
+                latest_only: false,
+                deadband: Some(1.0),
+            },
         )]));
         let start = t0();
         s.offer(good("a", 10.0), start);
@@ -600,8 +765,15 @@ mod tests {
         s.offer(good("a", 12.0), ms(start, 20)); // buffered
 
         let flushed = s.due(ms(start, 100));
-        let values: Vec<_> = flushed[0].iter().map(|r| r.value.clone().unwrap()).collect();
-        assert_eq!(values, vec![json!(10.0), json!(12.0)], "the dropped reading never buffered");
+        let values: Vec<_> = flushed[0]
+            .iter()
+            .map(|r| r.value.clone().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec![json!(10.0), json!(12.0)],
+            "the dropped reading never buffered"
+        );
     }
 
     // --- lifecycle ------------------------------------------------------------------------------
@@ -628,7 +800,11 @@ mod tests {
         s.offer(good("a", 1.0), t0());
         s.offer(good("a", 2.0), t0());
 
-        assert_eq!(s.clear_buffers(), 2, "the discarded readings are counted for the log line");
+        assert_eq!(
+            s.clear_buffers(),
+            2,
+            "the discarded readings are counted for the log line"
+        );
         assert_eq!(s.next_deadline(), None);
         assert!(s.flush_all().is_empty(), "nothing left to flush");
         let counters = s.take_counters().unwrap();
@@ -638,7 +814,11 @@ mod tests {
     #[test]
     fn a_policy_swap_flushes_the_windows_of_changed_and_removed_signals_only() {
         let mut s = Shaper::new();
-        s.set_policies(table(&[("a", policy(60_000)), ("b", policy(60_000)), ("c", policy(60_000))]));
+        s.set_policies(table(&[
+            ("a", policy(60_000)),
+            ("b", policy(60_000)),
+            ("c", policy(60_000)),
+        ]));
         let start = t0();
         s.offer(good("a", 1.0), start);
         s.offer(good("b", 2.0), start);
@@ -648,8 +828,16 @@ mod tests {
         let flushed = s.set_policies(table(&[("a", policy(100)), ("c", policy(60_000))]));
         let mut ids: Vec<_> = flushed.iter().map(|u| u[0].signal_id.clone()).collect();
         ids.sort();
-        assert_eq!(ids, vec!["a", "b"], "changed + removed flush with their old buffers");
-        assert_eq!(s.next_deadline(), Some(ms(start, 60_000)), "c's window keeps running");
+        assert_eq!(
+            ids,
+            vec!["a", "b"],
+            "changed + removed flush with their old buffers"
+        );
+        assert_eq!(
+            s.next_deadline(),
+            Some(ms(start, 60_000)),
+            "c's window keeps running"
+        );
 
         // b is unshaped now: its next reading publishes immediately.
         assert_eq!(s.offer(good("b", 9.0), ms(start, 10)).len(), 1);
@@ -689,15 +877,26 @@ mod tests {
         ]))
         .unwrap();
         let policies = policies_from_signals(&signals);
-        assert!(!policies.contains_key("plain"), "the default is not worth a table entry");
+        assert!(
+            !policies.contains_key("plain"),
+            "the default is not worth a table entry"
+        );
         assert_eq!(policies["batched"], policy(250));
         assert_eq!(
             policies["banded"],
-            PublishPolicy { batch_ms: 0, latest_only: false, deadband: Some(0.5) }
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: Some(0.5)
+            }
         );
         assert_eq!(
             policies["latest"],
-            PublishPolicy { batch_ms: 100, latest_only: true, deadband: None }
+            PublishPolicy {
+                batch_ms: 100,
+                latest_only: true,
+                deadband: None
+            }
         );
     }
 }

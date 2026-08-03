@@ -92,7 +92,10 @@ impl SequenceState {
         let outcome = match self.instance_id {
             None => HeaderOutcome::First,
             Some(old) if old == header.instance_id => HeaderOutcome::Same,
-            Some(old) => HeaderOutcome::InstanceChanged { old, new: header.instance_id },
+            Some(old) => HeaderOutcome::InstanceChanged {
+                old,
+                new: header.instance_id,
+            },
         };
         if matches!(outcome, HeaderOutcome::InstanceChanged { .. }) {
             self.reset_for_new_instance();
@@ -110,7 +113,8 @@ impl SequenceState {
         match self.last_published.get(data_item_id) {
             Some(&seen) if sequence <= seen => false,
             _ => {
-                self.last_published.insert(data_item_id.to_string(), sequence);
+                self.last_published
+                    .insert(data_item_id.to_string(), sequence);
                 true
             }
         }
@@ -148,15 +152,25 @@ mod tests {
     use super::*;
 
     fn header(instance_id: u64, next: Option<u64>) -> MtcHeader {
-        MtcHeader { instance_id, next_sequence: next, ..MtcHeader::default() }
+        MtcHeader {
+            instance_id,
+            next_sequence: next,
+            ..MtcHeader::default()
+        }
     }
 
     #[test]
     fn the_dedupe_floor_is_per_data_item_not_global() {
         let mut s = SequenceState::new();
         assert!(s.should_publish("Xabs", 37));
-        assert!(!s.should_publish("Xabs", 37), "the same observation twice is one publish");
-        assert!(!s.should_publish("Xabs", 12), "an older sequence is not news");
+        assert!(
+            !s.should_publish("Xabs", 37),
+            "the same observation twice is one publish"
+        );
+        assert!(
+            !s.should_publish("Xabs", 12),
+            "an older sequence is not news"
+        );
         assert!(s.should_publish("Xabs", 38));
 
         // A DIFFERENT data item with a lower sequence is still new — this is exactly the case a
@@ -194,7 +208,10 @@ mod tests {
         );
         assert_eq!(s.instance_id, Some(8));
         assert_eq!(s.next, 2);
-        assert!(s.should_publish("Xabs", 1), "a fresh sequence is published, not discarded");
+        assert!(
+            s.should_publish("Xabs", 1),
+            "a fresh sequence is published, not discarded"
+        );
     }
 
     #[test]
@@ -202,7 +219,10 @@ mod tests {
         let mut s = SequenceState::new();
         s.should_publish("Xabs", 37);
         s.reset_dedupe();
-        assert!(s.should_publish("Xabs", 37), "the same value, deliberately republished");
+        assert!(
+            s.should_publish("Xabs", 37),
+            "the same value, deliberately republished"
+        );
         assert_eq!(s.instance_id, None, "resetting the floors is not a resync");
     }
 
@@ -210,7 +230,11 @@ mod tests {
     fn skipped_counts_what_the_buffer_ran_past() {
         let mut s = SequenceState::new();
         s.observe_header(&header(1, Some(100)));
-        assert_eq!(s.skipped_before(153), 53, "the agent's floor minus our cursor");
+        assert_eq!(
+            s.skipped_before(153),
+            53,
+            "the agent's floor minus our cursor"
+        );
         assert_eq!(s.skipped_before(100), 0);
         assert_eq!(s.skipped_before(7), 0, "never negative");
     }
@@ -226,7 +250,12 @@ mod tests {
 
         assert!(AcqState::Streaming { next: 1 }.is_delivering());
         assert!(AcqState::Polling.is_delivering());
-        for s in [AcqState::Connecting, AcqState::Recovering, AcqState::Resyncing, AcqState::Backoff] {
+        for s in [
+            AcqState::Connecting,
+            AcqState::Recovering,
+            AcqState::Resyncing,
+            AcqState::Backoff,
+        ] {
             assert!(!s.is_delivering(), "{s:?} delivers nothing");
         }
     }

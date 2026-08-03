@@ -26,7 +26,7 @@
 //! * Report **per-instance connectivity** ([`connectivity_of`]).
 //! * Serve **read/write/browse/reconnect/pause commands** — and allow-list the writes.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
 
 use edgecommons::prelude::*;
@@ -37,7 +37,6 @@ use tokio::sync::oneshot;
 
 use crate::device::{BrowseError, BrowsePage, ConnectionConfig, Reading};
 use crate::mtconnect::selection::ChannelBudget;
-
 
 /// One device == one entry of `component.instances[]`.
 #[derive(Debug, Clone, Deserialize)]
@@ -86,8 +85,7 @@ pub fn compile_mtconnect(
     agents: &[crate::mtconnect::config::AgentConfig],
     defaults: PublishDefaults,
     budgets: &ChannelBudgets,
-) -> std::result::Result<Vec<crate::mtconnect::config::DeviceConfig>, crate::mtconnect::MtcError>
-{
+) -> std::result::Result<Vec<crate::mtconnect::config::DeviceConfig>, crate::mtconnect::MtcError> {
     use crate::mtconnect::MtcError;
 
     if let Some(bad) = devices
@@ -104,7 +102,10 @@ pub fn compile_mtconnect(
     }
 
     let mut compiled = Vec::new();
-    for device in devices.iter_mut().filter(|d| d.adapter == crate::device::KIND) {
+    for device in devices
+        .iter_mut()
+        .filter(|d| d.adapter == crate::device::KIND)
+    {
         let (agent_id, device_uuid) = crate::device::connection_binding(&device.connection)
             .map_err(|e| MtcError::Config(format!("instance `{}`: {e}", device.id)))?;
         let agent = agents.iter().find(|a| a.id == agent_id).ok_or_else(|| {
@@ -175,7 +176,10 @@ impl ChannelBudgets {
                 // floor budget makes that visible on the first derivation instead of hiding it.
                 Err(e) => {
                     tracing::warn!(instance = %id, error = %e, "cannot resolve the UNS channel budget");
-                    ChannelBudget { max_tokens: 0, max_bytes: 0 }
+                    ChannelBudget {
+                        max_tokens: 0,
+                        max_bytes: 0,
+                    }
                 }
             };
             tracing::debug!(
@@ -204,7 +208,10 @@ pub fn channel_budget_of(uns: &Uns) -> ChannelBudget {
     let Ok(topic) = uns.topic_with_channel(UnsClass::Data, PROBE) else {
         // Not even a one-token channel is publishable: the identity itself has consumed the
         // topic. Nothing derives — every signal reports the pathological floor.
-        return ChannelBudget { max_tokens: 0, max_bytes: 0 };
+        return ChannelBudget {
+            max_tokens: 0,
+            max_bytes: 0,
+        };
     };
     // `topic` is `<prefix>/x`, so the prefix (`ecv1/…/data`) is what this instance spends.
     let prefix_len = topic.len().saturating_sub(PROBE.len() + 1);
@@ -234,12 +241,17 @@ pub fn publish_defaults_of(global: &serde_json::Value) -> PublishDefaults {
         .and_then(serde_json::Value::as_u64)
         .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(0);
-    let publish_mode = match defaults.and_then(|d| d.get("publishMode")).and_then(serde_json::Value::as_str)
+    let publish_mode = match defaults
+        .and_then(|d| d.get("publishMode"))
+        .and_then(serde_json::Value::as_str)
     {
         Some("interval") => crate::mtconnect::config::PublishMode::Interval,
         _ => crate::mtconnect::config::PublishMode::OnChange,
     };
-    PublishDefaults { batch_ms, publish_mode }
+    PublishDefaults {
+        batch_ms,
+        publish_mode,
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -277,7 +289,10 @@ pub struct Backoff {
 
 impl Default for Backoff {
     fn default() -> Self {
-        Self { base_ms: 1_000, max_ms: 60_000 }
+        Self {
+            base_ms: 1_000,
+            max_ms: 60_000,
+        }
     }
 }
 
@@ -495,7 +510,9 @@ pub const COMPONENT_PATH_KEY: &str = "componentPath";
 /// A non-object body is left alone: there is nowhere to put the key, and the facade never produces
 /// one.
 pub fn stamp_component_path(body: &mut serde_json::Value, component_path: Option<&str>) {
-    let Some(obj) = body.as_object_mut() else { return };
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
     let value = match component_path {
         Some(path) => serde_json::Value::String(path.to_string()),
         None => serde_json::Value::Null,
@@ -523,7 +540,11 @@ pub fn connectivity_of(cfg: &DeviceConfig, health: &Health) -> InstanceConnectiv
     let link = health.link();
     let connected = link == LinkState::Online;
     let paused = health.is_paused();
-    let state = if paused && connected { "PAUSED" } else { link.as_str() };
+    let state = if paused && connected {
+        "PAUSED"
+    } else {
+        link.as_str()
+    };
 
     let mut attributes = serde_json::Map::new();
     attributes.insert("adapter".to_string(), json!(cfg.adapter));
@@ -572,9 +593,13 @@ pub enum DeviceControl {
     Resume { reply: oneshot::Sender<bool> },
     /// Drop + re-establish, one immediate attempt (`reconnect`). `Ok(())` ⇒ connected, `Err` ⇒
     /// failed (mapped to `RECONNECT_FAILED`).
-    Reconnect { reply: oneshot::Sender<std::result::Result<(), String>> },
+    Reconnect {
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Force an immediate poll now (`repoll`). Reply = signals read, or `Err` when refused (paused).
-    Repoll { reply: oneshot::Sender<std::result::Result<u64, String>> },
+    Repoll {
+        reply: oneshot::Sender<std::result::Result<u64, String>>,
+    },
 }
 
 #[cfg(test)]
@@ -588,14 +613,22 @@ mod tests {
         use edgecommons::messaging::message::{HierEntry, MessageIdentity};
         let hier = if rooted {
             vec![
-                HierEntry { level: "site".into(), value: "plant1".into() },
-                HierEntry { level: "device".into(), value: device.into() },
+                HierEntry {
+                    level: "site".into(),
+                    value: "plant1".into(),
+                },
+                HierEntry {
+                    level: "device".into(),
+                    value: device.into(),
+                },
             ]
         } else {
-            vec![HierEntry { level: "device".into(), value: device.into() }]
+            vec![HierEntry {
+                level: "device".into(),
+                value: device.into(),
+            }]
         };
-        let identity =
-            MessageIdentity::new(hier, component, instance.map(str::to_string)).unwrap();
+        let identity = MessageIdentity::new(hier, component, instance.map(str::to_string)).unwrap();
         Uns::new(identity, rooted)
     }
 
@@ -611,10 +644,16 @@ mod tests {
 
         // The budget is not a copy of the rules — it agrees with the builder itself, at the edge.
         assert!(u.topic_with_channel(UnsClass::Data, "a/b/c").is_ok());
-        assert!(u.topic_with_channel(UnsClass::Data, "a/b/c/d").is_err(), "one token over");
-        assert!(u.topic_with_channel(UnsClass::Data, &"x".repeat(b.max_bytes)).is_ok());
         assert!(
-            u.topic_with_channel(UnsClass::Data, &"x".repeat(b.max_bytes + 1)).is_err(),
+            u.topic_with_channel(UnsClass::Data, "a/b/c/d").is_err(),
+            "one token over"
+        );
+        assert!(u
+            .topic_with_channel(UnsClass::Data, &"x".repeat(b.max_bytes))
+            .is_ok());
+        assert!(
+            u.topic_with_channel(UnsClass::Data, &"x".repeat(b.max_bytes + 1))
+                .is_err(),
             "one byte over"
         );
     }
@@ -633,7 +672,8 @@ mod tests {
         );
         let leaf_preserving = "materials-materials/stock-stock/stock";
         assert_eq!(
-            u.topic_with_channel(UnsClass::Data, leaf_preserving).unwrap(),
+            u.topic_with_channel(UnsClass::Data, leaf_preserving)
+                .unwrap(),
             "ecv1/gw-01/MtconnectAdapter/cnc-1/data/materials-materials/stock-stock/stock"
         );
 
@@ -660,10 +700,18 @@ mod tests {
         // The token budget is a property of the grammar; the BYTE budget is what a long identity
         // spends, so a derived channel cannot be bought with a verbose instance name.
         assert_eq!(short.max_tokens, long.max_tokens);
-        assert!(long.max_bytes < short.max_bytes - 60, "{} vs {}", long.max_bytes, short.max_bytes);
+        assert!(
+            long.max_bytes < short.max_bytes - 60,
+            "{} vs {}",
+            long.max_bytes,
+            short.max_bytes
+        );
 
         // A rooted (site) topic spends one more level: two channel tokens, not three.
-        assert_eq!(channel_budget_of(&uns("gw", "mtc", Some("a"), true)).max_tokens, 2);
+        assert_eq!(
+            channel_budget_of(&uns("gw", "mtc", Some("a"), true)).max_tokens,
+            2
+        );
     }
 
     #[test]
@@ -672,16 +720,38 @@ mod tests {
         // rather than pretending there is room.
         let u = uns(&"d".repeat(240), "mtconnect-adapter", Some("cnc-1"), false);
         assert!(u.topic_with_channel(UnsClass::Data, "x").is_err());
-        assert_eq!(channel_budget_of(&u), ChannelBudget { max_tokens: 0, max_bytes: 0 });
+        assert_eq!(
+            channel_budget_of(&u),
+            ChannelBudget {
+                max_tokens: 0,
+                max_bytes: 0
+            }
+        );
     }
 
     #[test]
     fn budgets_default_for_an_instance_that_was_never_resolved() {
         let mut budgets = ChannelBudgets::default();
         assert_eq!(budgets.get("cnc-1"), ChannelBudget::default());
-        budgets.insert("cnc-1", ChannelBudget { max_tokens: 2, max_bytes: 40 });
-        assert_eq!(budgets.get("cnc-1"), ChannelBudget { max_tokens: 2, max_bytes: 40 });
-        assert_eq!(budgets.get("cnc-2"), ChannelBudget::default(), "unknown ids fall back");
+        budgets.insert(
+            "cnc-1",
+            ChannelBudget {
+                max_tokens: 2,
+                max_bytes: 40,
+            },
+        );
+        assert_eq!(
+            budgets.get("cnc-1"),
+            ChannelBudget {
+                max_tokens: 2,
+                max_bytes: 40
+            }
+        );
+        assert_eq!(
+            budgets.get("cnc-2"),
+            ChannelBudget::default(),
+            "unknown ids fall back"
+        );
     }
 
     #[test]
@@ -710,16 +780,27 @@ mod tests {
             "connection": { "endpoint": "sim://plc-1" }
         }))
         .unwrap();
-        assert!(!d.writes.permits("setpoint-1"), "nothing is writable by default");
+        assert!(
+            !d.writes.permits("setpoint-1"),
+            "nothing is writable by default"
+        );
 
-        let w = Writes { allow: vec!["setpoint-1".into()] };
+        let w = Writes {
+            allow: vec!["setpoint-1".into()],
+        };
         assert!(w.permits("setpoint-1"));
-        assert!(!w.permits("setpoint-2"), "only the listed signal, not its neighbours");
+        assert!(
+            !w.permits("setpoint-2"),
+            "only the listed signal, not its neighbours"
+        );
     }
 
     #[test]
     fn reconnect_backoff_is_exponential_capped_and_jittered() {
-        let b = Backoff { base_ms: 1_000, max_ms: 10_000 };
+        let b = Backoff {
+            base_ms: 1_000,
+            max_ms: 10_000,
+        };
         assert_eq!(b.delay(0, 1.0).as_millis(), 1_000);
         assert_eq!(b.delay(2, 1.0).as_millis(), 4_000);
         assert_eq!(b.delay(20, 1.0).as_millis(), 10_000, "capped");
@@ -753,8 +834,16 @@ mod tests {
         assert_eq!(c.instance, "plc-1");
         assert!(!c.connected);
         assert_eq!(c.state.as_deref(), Some("CONNECTING"));
-        assert_eq!(c.detail.as_deref(), Some("sim://plc-1"), "the endpoint, for a human");
-        assert_eq!(c.attributes["adapter"], json!("sim"), "the open bag carries domain data");
+        assert_eq!(
+            c.detail.as_deref(),
+            Some("sim://plc-1"),
+            "the endpoint, for a human"
+        );
+        assert_eq!(
+            c.attributes["adapter"],
+            json!("sim"),
+            "the open bag carries domain data"
+        );
         assert_eq!(c.attributes["paused"], json!(false));
 
         health.set_link(LinkState::Online);
@@ -764,7 +853,11 @@ mod tests {
         // it as the provider), so the state reaches every passive fleet view — a live device is
         // distinguishable from a reconnecting one without knowing this adapter's internals.
         assert_eq!(c.state.as_deref(), Some("ONLINE"));
-        assert_eq!(c.to_json()["state"], json!("ONLINE"), "the state rides the keepalive element");
+        assert_eq!(
+            c.to_json()["state"],
+            json!("ONLINE"),
+            "the state rides the keepalive element"
+        );
 
         health.set_link(LinkState::Backoff);
         assert!(!connectivity_of(&cfg, &health).connected);
@@ -784,8 +877,16 @@ mod tests {
         let c = connectivity_of(&cfg, &health);
         // D-SC-7: PAUSED reaches the keepalive too, so a deliberately paused instance is
         // distinguishable from a silently stale one on the passive surface.
-        assert_eq!(c.state.as_deref(), Some("PAUSED"), "paused + online = PAUSED");
-        assert_eq!(c.to_json()["state"], json!("PAUSED"), "the state rides the keepalive element");
+        assert_eq!(
+            c.state.as_deref(),
+            Some("PAUSED"),
+            "paused + online = PAUSED"
+        );
+        assert_eq!(
+            c.to_json()["state"],
+            json!("PAUSED"),
+            "the state rides the keepalive element"
+        );
         assert!(c.connected, "connected stays truthful while paused");
         assert_eq!(c.attributes["paused"], json!(true));
 
@@ -815,7 +916,10 @@ mod tests {
     fn the_worker_auto_stamps_received_ts_at_read_completion() {
         let mut readings = vec![
             reading("a"),
-            Reading { received_ts: Some("2026-01-01T00:00:00Z".into()), ..reading("b") },
+            Reading {
+                received_ts: Some("2026-01-01T00:00:00Z".into()),
+                ..reading("b")
+            },
         ];
         stamp_received(&mut readings, "2026-02-02T00:00:00Z");
         assert_eq!(
@@ -846,7 +950,10 @@ mod tests {
     #[test]
     fn the_receive_moment_is_the_server_ts_fallback_and_then_not_an_extra() {
         // No capture stamp: a direct client's receive moment IS the capture moment.
-        let r = Reading { received_ts: Some("R".into()), ..reading("a") };
+        let r = Reading {
+            received_ts: Some("R".into()),
+            ..reading("a")
+        };
         assert_eq!(sample_timestamps(&r), (Some("R".into()), None));
     }
 
@@ -887,7 +994,10 @@ mod tests {
             s.extra.as_ref().unwrap()["receivedTs"],
             json!("2026-07-27T10:00:04.900000Z")
         );
-        assert!(s.source_ts.is_none(), "MTConnect has no device-authored time");
+        assert!(
+            s.source_ts.is_none(),
+            "MTConnect has no device-authored time"
+        );
     }
 
     #[test]
@@ -896,7 +1006,10 @@ mod tests {
         let r = Reading::bad("x-load", "UNAVAILABLE");
         let s = build_sample(&r);
         assert_eq!(s.value, None);
-        assert!(s.explicit_null, "a legitimate protocol null, deliberately published");
+        assert!(
+            s.explicit_null,
+            "a legitimate protocol null, deliberately published"
+        );
         assert_eq!(s.quality, Some(edgecommons::facades::Quality::Bad));
         assert_eq!(s.quality_raw.as_deref(), Some("UNAVAILABLE"));
     }
@@ -907,7 +1020,11 @@ mod tests {
             .with_extra("sequence", json!(37))
             .with_extra("resetTriggered", json!("MANUAL"));
         let extra = build_sample(&r).extra.expect("extras");
-        assert_eq!(extra["sequence"], json!(37), "exact once-only ordering, on every sample");
+        assert_eq!(
+            extra["sequence"],
+            json!(37),
+            "exact once-only ordering, on every sample"
+        );
         assert_eq!(extra["resetTriggered"], json!("MANUAL"));
     }
 
@@ -919,9 +1036,16 @@ mod tests {
             ..Reading::good("spindle-speed", json!(1200))
         };
         let s = build_sample(&r);
-        assert_eq!(s.value, Some(json!(1200)), "a warned value is still a value");
+        assert_eq!(
+            s.value,
+            Some(json!(1200)),
+            "a warned value is still a value"
+        );
         assert_eq!(s.quality, Some(edgecommons::facades::Quality::Uncertain));
-        assert_eq!(s.quality_raw.as_deref(), Some("MTC_CONDITION:WARNING:ALM-2"));
+        assert_eq!(
+            s.quality_raw.as_deref(),
+            Some("MTC_CONDITION:WARNING:ALM-2")
+        );
     }
 
     // --- the canonical componentPath, on every update (D-MtconnectAdapter-L13) ------------------
@@ -940,7 +1064,10 @@ mod tests {
         let mut body = facade_body();
         stamp_component_path(&mut body, Some("Axes/Linear[X]"));
         assert_eq!(body[COMPONENT_PATH_KEY], json!("Axes/Linear[X]"));
-        assert_eq!(COMPONENT_PATH_KEY, "componentPath", "the agreed key, not an alias");
+        assert_eq!(
+            COMPONENT_PATH_KEY, "componentPath",
+            "the agreed key, not an alias"
+        );
         // Beside the canonical members, never inside one of them.
         assert_eq!(body["signal"]["id"], json!("x-position"));
         assert_eq!(body["samples"].as_array().expect("samples").len(), 1);
@@ -949,7 +1076,10 @@ mod tests {
             "per-signal-static: it rides the update, not every sample"
         );
         assert!(body["signal"].get(COMPONENT_PATH_KEY).is_none());
-        assert!(body.get("device").is_some(), "the facade's own members are untouched");
+        assert!(
+            body.get("device").is_some(),
+            "the facade's own members are untouched"
+        );
     }
 
     #[test]
@@ -978,7 +1108,10 @@ mod tests {
         let mut body = facade_body();
         stamp_component_path(&mut body, Some(""));
         assert_eq!(body[COMPONENT_PATH_KEY], json!(""));
-        assert!(body.as_object().expect("object").contains_key(COMPONENT_PATH_KEY));
+        assert!(body
+            .as_object()
+            .expect("object")
+            .contains_key(COMPONENT_PATH_KEY));
     }
 
     #[test]
@@ -989,7 +1122,10 @@ mod tests {
         let mut body = facade_body();
         stamp_component_path(&mut body, None);
         assert_eq!(body[COMPONENT_PATH_KEY], json!(null));
-        assert!(body.as_object().expect("object").contains_key(COMPONENT_PATH_KEY));
+        assert!(body
+            .as_object()
+            .expect("object")
+            .contains_key(COMPONENT_PATH_KEY));
     }
 
     #[test]
@@ -1000,7 +1136,11 @@ mod tests {
         for path in [deep, "Axes/Linear[X]", "Controller[cnc]"] {
             let mut body = facade_body();
             stamp_component_path(&mut body, Some(path));
-            assert_eq!(body[COMPONENT_PATH_KEY], json!(path), "the untruncated path, verbatim");
+            assert_eq!(
+                body[COMPONENT_PATH_KEY],
+                json!(path),
+                "the untruncated path, verbatim"
+            );
         }
     }
 
@@ -1011,7 +1151,11 @@ mod tests {
         stamp_component_path(&mut body, Some("Axes/Rotary[C]"));
         assert_eq!(body[COMPONENT_PATH_KEY], json!("Axes/Rotary[C]"));
         assert_eq!(
-            body.as_object().expect("object").keys().filter(|k| *k == COMPONENT_PATH_KEY).count(),
+            body.as_object()
+                .expect("object")
+                .keys()
+                .filter(|k| *k == COMPONENT_PATH_KEY)
+                .count(),
             1
         );
     }
@@ -1029,8 +1173,16 @@ mod tests {
         health.set_signal_inventory(2);
         assert_eq!(health.signals_subscribed(), 0, "0 while disconnected");
         health.set_link(LinkState::Online);
-        assert_eq!(health.signals_subscribed(), 2, "the sb/signals inventory size while connected");
+        assert_eq!(
+            health.signals_subscribed(),
+            2,
+            "the sb/signals inventory size while connected"
+        );
         health.set_link(LinkState::Backoff);
-        assert_eq!(health.signals_subscribed(), 0, "a broken link serves nothing");
+        assert_eq!(
+            health.signals_subscribed(),
+            0,
+            "a broken link serves nothing"
+        );
     }
 }

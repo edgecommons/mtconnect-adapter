@@ -23,12 +23,18 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 
 #[test]
 fn the_owned_client_imports_nothing_from_edgecommons() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("mtconnect");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("mtconnect");
     assert!(root.is_dir(), "src/mtconnect must exist");
 
     let mut files = Vec::new();
     rust_sources(&root, &mut files);
-    assert!(files.len() >= 9, "the module tree of LLD §1: {} files found", files.len());
+    assert!(
+        files.len() >= 9,
+        "the module tree of LLD §1: {} files found",
+        files.len()
+    );
 
     let mut violations = Vec::new();
     for file in &files {
@@ -49,7 +55,9 @@ fn the_owned_client_imports_nothing_from_edgecommons() {
 
 #[test]
 fn the_module_tree_is_the_one_the_design_names() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("mtconnect");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("mtconnect");
     for module in [
         "mod.rs",
         "config.rs",
@@ -63,6 +71,9 @@ fn the_module_tree_is_the_one_the_design_names() {
         "sequence.rs",
         "error.rs",
     ] {
-        assert!(root.join(module).is_file(), "src/mtconnect/{module} is missing");
+        assert!(
+            root.join(module).is_file(),
+            "src/mtconnect/{module} is missing"
+        );
     }
 }

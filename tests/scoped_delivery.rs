@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use edgecommons::commands::{CommandInbox, InstanceConnectivitySource, ReloadAction};
 use edgecommons::config::model::Config;
 use edgecommons::messaging::{
-    Message, MessageBuilder, MessageHandler, MessagingService, Qos, ReplyFuture, topic_matches,
+    topic_matches, Message, MessageBuilder, MessageHandler, MessagingService, Qos, ReplyFuture,
 };
 use edgecommons::metrics::{Metric, MetricService};
 use serde_json::{json, Value};
@@ -83,7 +83,10 @@ impl FakeMessaging {
         let mut replies = self.replies.lock().unwrap();
         assert_eq!(replies.len(), 1, "exactly one reply expected");
         let (topic, message) = replies.pop().expect("a reply");
-        assert_eq!(topic, REPLY_TO, "the reply must go to the reply_to of the request");
+        assert_eq!(
+            topic, REPLY_TO,
+            "the reply must go to the reply_to of the request"
+        );
         message.body
     }
 }
@@ -120,7 +123,10 @@ impl MessagingService for FakeMessaging {
         _max_messages: usize,
         _max_concurrency: usize,
     ) -> edgecommons::Result<()> {
-        self.handlers.lock().unwrap().insert(filter.to_string(), handler);
+        self.handlers
+            .lock()
+            .unwrap()
+            .insert(filter.to_string(), handler);
         Ok(())
     }
 
@@ -133,7 +139,8 @@ impl MessagingService for FakeMessaging {
         max_concurrency: usize,
         _timeout: Duration,
     ) -> edgecommons::Result<()> {
-        self.subscribe(filter, handler, max_messages, max_concurrency).await
+        self.subscribe(filter, handler, max_messages, max_concurrency)
+            .await
     }
 
     async fn subscribe_northbound(
@@ -144,7 +151,8 @@ impl MessagingService for FakeMessaging {
         max_messages: usize,
         max_concurrency: usize,
     ) -> edgecommons::Result<()> {
-        self.subscribe(filter, handler, max_messages, max_concurrency).await
+        self.subscribe(filter, handler, max_messages, max_concurrency)
+            .await
     }
 
     async fn unsubscribe(&self, filter: &str) -> edgecommons::Result<()> {
@@ -305,7 +313,10 @@ impl Harness {
                 control: tx,
                 health: Arc::clone(&health),
                 dm,
-                signals: vec![SignalInfo { id: "setpoint-1".into(), name: Some("Setpoint".into()) }],
+                signals: vec![SignalInfo {
+                    id: "setpoint-1".into(),
+                    name: Some("Setpoint".into()),
+                }],
                 // These devices are the template simulator: no MTConnect agent behind them, so
                 // there is no published protocol view to read (the addressing contract this suite
                 // proves is protocol-independent).
@@ -329,7 +340,13 @@ impl Harness {
         register_all(&inbox, handles).expect("the nine verbs register");
         Arc::clone(&inbox).start().await;
 
-        Self { messaging, inbox, control_log, healths, _tasks: tasks }
+        Self {
+            messaging,
+            inbox,
+            control_log,
+            healths,
+            _tasks: tasks,
+        }
     }
 
     /// Deliver `verb` on the component-scope topic (`instance` = `None`) or on the instance-scope
@@ -339,7 +356,10 @@ impl Harness {
             Some(id) => format!("ecv1/{DEVICE}/{COMPONENT}/{id}/cmd/{verb}"),
             None => format!("ecv1/{DEVICE}/{COMPONENT}/cmd/{verb}"),
         };
-        let request = MessageBuilder::new(verb, "1.0").payload(body).reply_to(REPLY_TO).build();
+        let request = MessageBuilder::new(verb, "1.0")
+            .payload(body)
+            .reply_to(REPLY_TO)
+            .build();
         self.messaging.simulate(&topic, request).await;
         self.messaging.take_reply()
     }
@@ -407,7 +427,9 @@ async fn a_body_instance_alone_still_addresses_the_verb() {
     // A component-addressed delivery whose body names a device: the library folds the body into
     // `addressed_instance`, so the handler routes on it without ever reading the body.
     let h = Harness::start(&["plc-1", "plc-2"]).await;
-    let body = h.send("sb/status", None, json!({ "instance": "plc-2" })).await;
+    let body = h
+        .send("sb/status", None, json!({ "instance": "plc-2" }))
+        .await;
     assert_eq!(body["result"]["id"], json!("plc-2"));
     h.inbox.stop().await;
 }
@@ -417,7 +439,9 @@ async fn a_body_instance_conflicting_with_the_topic_is_refused_before_dispatch()
     // The conflict is a LIBRARY decision, made before dispatch: the reply is BAD_ARGS and the
     // handler never ran — nothing reached a device task and neither device was paused.
     let h = Harness::start(&["plc-1", "plc-2"]).await;
-    let body = h.send("sb/pause", Some("plc-1"), json!({ "instance": "plc-2" })).await;
+    let body = h
+        .send("sb/pause", Some("plc-1"), json!({ "instance": "plc-2" }))
+        .await;
     assert_eq!(body["ok"], json!(false));
     assert_eq!(body["error"]["code"], json!("BAD_ARGS"));
     assert!(
@@ -425,7 +449,10 @@ async fn a_body_instance_conflicting_with_the_topic_is_refused_before_dispatch()
         "no handler may run on an addressing error - nothing may reach a device"
     );
     for health in &h.healths {
-        assert!(!health.is_paused(), "no device may be paused by a refused command");
+        assert!(
+            !health.is_paused(),
+            "no device may be paused by a refused command"
+        );
     }
 
     // The same verb, correctly addressed, does reach the device — the refusal above was about the
@@ -444,24 +471,44 @@ async fn describe_advertises_sb_write_as_permanently_unsupported() {
     // is set after the verbs and before the panels, inside the pre-activation window.
     let h = Harness::start(&["plc-1"]).await;
     let body = h.send("describe", None, json!({})).await;
-    let commands = body["result"]["commands"].as_array().expect("a commands array");
+    let commands = body["result"]["commands"]
+        .as_array()
+        .expect("a commands array");
 
-    let write = commands.iter().find(|c| c["verb"] == json!("sb/write")).expect("sb/write is registered");
+    let write = commands
+        .iter()
+        .find(|c| c["verb"] == json!("sb/write"))
+        .expect("sb/write is registered");
     assert_eq!(write["availability"]["state"], json!("unsupported"));
-    assert_eq!(write["availability"]["reason"], json!("MTConnect is read-only"));
+    assert_eq!(
+        write["availability"]["reason"],
+        json!("MTConnect is read-only")
+    );
 
     // Every other verb is plainly available — availability is a capability statement about this
     // protocol, not a blanket disablement.
     for verb in VERBS.iter().filter(|v| **v != "sb/write") {
-        let entry = commands.iter().find(|c| c["verb"] == json!(verb)).expect("registered");
+        let entry = commands
+            .iter()
+            .find(|c| c["verb"] == json!(verb))
+            .expect("registered");
         assert!(entry.get("availability").is_none(), "{verb} is available");
     }
 
     // And the wire refusal matches what the manifest says.
-    let reply = h.send("sb/write", Some("plc-1"), json!({ "signalId": "setpoint-1", "value": 1 })).await;
+    let reply = h
+        .send(
+            "sb/write",
+            Some("plc-1"),
+            json!({ "signalId": "setpoint-1", "value": 1 }),
+        )
+        .await;
     assert_eq!(reply["ok"], json!(false));
     assert_eq!(reply["error"]["code"], json!("WRITE_NOT_ALLOWED"));
-    assert!(h.control_calls().is_empty(), "a refused write never reaches a device task");
+    assert!(
+        h.control_calls().is_empty(),
+        "a refused write never reaches a device task"
+    );
 
     // The five HLD §8 views are on the same descriptor, in order, and none of them is a write
     // surface.
@@ -470,7 +517,16 @@ async fn describe_advertises_sb_write_as_permanently_unsupported() {
     assert_eq!(panels["defaultView"], json!("overview"));
     let views = panels["views"].as_array().expect("a views array");
     let ids: Vec<&str> = views.iter().map(|p| p["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, vec!["overview", "device-structure", "signals", "conditions", "diagnostics"]);
+    assert_eq!(
+        ids,
+        vec![
+            "overview",
+            "device-structure",
+            "signals",
+            "conditions",
+            "diagnostics"
+        ]
+    );
     assert!(!serde_json::to_string(views).unwrap().contains("writeVerb"));
     h.inbox.stop().await;
 }
@@ -481,13 +537,19 @@ async fn describe_advertises_every_verb_as_instance_scoped() {
     // selector". Every verb this adapter registers says so on the wire.
     let h = Harness::start(&["plc-1"]).await;
     let body = h.send("describe", None, json!({})).await;
-    let commands = body["result"]["commands"].as_array().expect("a commands array");
+    let commands = body["result"]["commands"]
+        .as_array()
+        .expect("a commands array");
     for verb in VERBS {
         let entry = commands
             .iter()
             .find(|c| c["verb"] == json!(verb))
             .unwrap_or_else(|| panic!("{verb} is advertised"));
-        assert_eq!(entry["scope"], json!("instance"), "{verb} must advertise instance scope");
+        assert_eq!(
+            entry["scope"],
+            json!("instance"),
+            "{verb} must advertise instance scope"
+        );
     }
     h.inbox.stop().await;
 }

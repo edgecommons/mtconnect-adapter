@@ -147,10 +147,17 @@ impl Observation {
 pub fn decode(entry: &StreamEntry, meta: Option<&DataItemMeta>) -> Option<Observation> {
     let elem = &entry.elem;
     let data_item_id = elem.attr("dataItemId")?.to_string();
-    let sequence = elem.attr("sequence").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let sequence = elem
+        .attr("sequence")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
     let timestamp = elem.attr("timestamp").unwrap_or_default().to_string();
     let repr = meta.map_or_else(
-        || elem.attr("representation").map(Repr::parse).unwrap_or_default(),
+        || {
+            elem.attr("representation")
+                .map(Repr::parse)
+                .unwrap_or_default()
+        },
         |m| m.representation,
     );
 
@@ -252,8 +259,13 @@ fn decode_value(
 fn decode_entries(elem: &XmlElem, repr: Repr) -> Value {
     let mut out = serde_json::Map::new();
     for entry in elem.children_named("Entry") {
-        let Some(key) = entry.attr("key") else { continue };
-        if entry.attr("removed").is_some_and(|v| v.eq_ignore_ascii_case("true")) {
+        let Some(key) = entry.attr("key") else {
+            continue;
+        };
+        if entry
+            .attr("removed")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        {
             out.insert(key.to_string(), Value::Null);
             continue;
         }
@@ -344,7 +356,10 @@ mod tests {
     }
 
     fn by_id(obs: &[Observation], id: &str) -> Observation {
-        obs.iter().find(|o| o.data_item_id == id).expect("observation").clone()
+        obs.iter()
+            .find(|o| o.data_item_id == id)
+            .expect("observation")
+            .clone()
     }
 
     #[test]
@@ -352,7 +367,10 @@ mod tests {
         let obs = decoded();
         let x = by_id(&obs, "Xabs");
         assert_eq!(x.sequence, 37, "the once-only ordering key");
-        assert_eq!(x.timestamp, "2026-07-27T10:00:04.250000Z", "the agent's capture stamp");
+        assert_eq!(
+            x.timestamp, "2026-07-27T10:00:04.250000Z",
+            "the agent's capture stamp"
+        );
         assert_eq!(x.element, "Position");
         assert_eq!(x.name.as_deref(), Some("Xabs"));
         assert_eq!(x.sub_type.as_deref(), Some("ACTUAL"));
@@ -364,7 +382,10 @@ mod tests {
         let obs = decoded();
         assert_eq!(by_id(&obs, "Xabs").value, ObsValue::Scalar(json!(123.456)));
         // MILLIMETER_3D: three numbers, published as an array rather than a mangled string.
-        assert_eq!(by_id(&obs, "Ppos").value, ObsValue::Scalar(json!([10.5, 20.25, 30])));
+        assert_eq!(
+            by_id(&obs, "Ppos").value,
+            ObsValue::Scalar(json!([10.5, 20.25, 30]))
+        );
         // TIME_SERIES: the whole window, with its sample rate as an extra.
         let ts = by_id(&obs, "Xfreq");
         assert_eq!(ts.value, ObsValue::Scalar(json!([0.1, 0.2, 0.35, 0.4])));
@@ -381,7 +402,10 @@ mod tests {
         // Case is the agent's business, not ours.
         assert_eq!(
             decode_value(
-                &XmlElem { text: "unavailable".into(), ..XmlElem::default() },
+                &XmlElem {
+                    text: "unavailable".into(),
+                    ..XmlElem::default()
+                },
                 Category::Sample,
                 Repr::Value,
                 None
@@ -393,12 +417,21 @@ mod tests {
     #[test]
     fn events_stay_verbatim_unless_the_model_says_the_type_is_numeric() {
         let obs = decoded();
-        assert_eq!(by_id(&obs, "execution").value, ObsValue::Scalar(json!("ACTIVE")));
+        assert_eq!(
+            by_id(&obs, "execution").value,
+            ObsValue::Scalar(json!("ACTIVE"))
+        );
         // A program name that looks like a number must NOT become one.
-        assert_eq!(by_id(&obs, "program").value, ObsValue::Scalar(json!("O1234-PART-A")));
+        assert_eq!(
+            by_id(&obs, "program").value,
+            ObsValue::Scalar(json!("O1234-PART-A"))
+        );
         // PART_COUNT is numeric by type, with no units declared.
         assert_eq!(by_id(&obs, "part-count").value, ObsValue::Scalar(json!(42)));
-        assert_eq!(by_id(&obs, "avail").value, ObsValue::Scalar(json!("AVAILABLE")));
+        assert_eq!(
+            by_id(&obs, "avail").value,
+            ObsValue::Scalar(json!("AVAILABLE"))
+        );
     }
 
     #[test]
@@ -458,7 +491,11 @@ mod tests {
         )
         .unwrap();
         let m = model();
-        let o = decode(&removed.device_streams[0].entries[0], m.item("tool-offsets")).unwrap();
+        let o = decode(
+            &removed.device_streams[0].entries[0],
+            m.item("tool-offsets"),
+        )
+        .unwrap();
         assert_eq!(o.value, ObsValue::Scalar(json!({ "T1": 3, "T2": null })));
     }
 
@@ -478,14 +515,21 @@ mod tests {
         .unwrap();
         // No model entry: the representation is read off the observation itself.
         let o = decode(&doc.device_streams[0].entries[0], None).unwrap();
-        assert_eq!(o.value, ObsValue::Scalar(json!({ "G54": { "X": 1.5, "Y": -2 } })));
+        assert_eq!(
+            o.value,
+            ObsValue::Scalar(json!({ "G54": { "X": 1.5, "Y": -2 } }))
+        );
     }
 
     #[test]
     fn an_observation_for_an_unmodelled_data_item_still_decodes_conservatively() {
         // A stream can run ahead of a re-probe. The observation is kept (as text), never dropped.
         let doc = parse_streams(CURRENT_2_7).unwrap();
-        let mazak = doc.device_streams.iter().find(|d| d.uuid == "MAZAK.999").unwrap();
+        let mazak = doc
+            .device_streams
+            .iter()
+            .find(|d| d.uuid == "MAZAK.999")
+            .unwrap();
         let o = decode(&mazak.entries[0], None).unwrap();
         assert_eq!(o.data_item_id, "m-avail");
         assert_eq!(o.value, ObsValue::Scalar(json!("AVAILABLE")));
@@ -495,7 +539,10 @@ mod tests {
     fn an_element_without_a_data_item_id_is_the_one_undecodable_case() {
         let entry = StreamEntry {
             category: Category::Event,
-            elem: XmlElem { name: "Availability".into(), ..XmlElem::default() },
+            elem: XmlElem {
+                name: "Availability".into(),
+                ..XmlElem::default()
+            },
             component: None,
         };
         assert!(decode(&entry, None).is_none());
@@ -503,11 +550,21 @@ mod tests {
 
     #[test]
     fn a_missing_sequence_or_timestamp_degrades_rather_than_dropping_the_value() {
-        let mut elem = XmlElem { name: "Execution".into(), ..XmlElem::default() };
+        let mut elem = XmlElem {
+            name: "Execution".into(),
+            ..XmlElem::default()
+        };
         elem.attrs.insert("dataItemId".into(), "execution".into());
         elem.text = "READY".into();
-        let o = decode(&StreamEntry { category: Category::Event, elem, component: None }, None)
-            .unwrap();
+        let o = decode(
+            &StreamEntry {
+                category: Category::Event,
+                elem,
+                component: None,
+            },
+            None,
+        )
+        .unwrap();
         assert_eq!(o.sequence, 0);
         assert_eq!(o.timestamp, "");
         assert_eq!(o.value, ObsValue::Scalar(json!("READY")));
@@ -518,7 +575,10 @@ mod tests {
         assert_eq!(CondState::parse("Normal"), Some(CondState::Normal));
         assert_eq!(CondState::parse("WARNING"), Some(CondState::Warning));
         assert_eq!(CondState::parse("fault"), Some(CondState::Fault));
-        assert_eq!(CondState::parse("Unavailable"), Some(CondState::Unavailable));
+        assert_eq!(
+            CondState::parse("Unavailable"),
+            Some(CondState::Unavailable)
+        );
         assert_eq!(CondState::parse("Nonsense"), None);
         assert!(CondState::Fault.severity() > CondState::Unavailable.severity());
         assert!(CondState::Unavailable.severity() > CondState::Warning.severity());
@@ -530,10 +590,20 @@ mod tests {
 
         // An unrecognized condition element is treated as Unavailable, never as Normal: a state
         // this client cannot read must not look healthy.
-        let mut elem = XmlElem { name: "Whatever".into(), ..XmlElem::default() };
+        let mut elem = XmlElem {
+            name: "Whatever".into(),
+            ..XmlElem::default()
+        };
         elem.attrs.insert("dataItemId".into(), "c1".into());
-        let o = decode(&StreamEntry { category: Category::Condition, elem, component: None }, None)
-            .unwrap();
+        let o = decode(
+            &StreamEntry {
+                category: Category::Condition,
+                elem,
+                component: None,
+            },
+            None,
+        )
+        .unwrap();
         assert_eq!(o.value, ObsValue::Condition(CondState::Unavailable));
         assert!(o.is_unavailable());
     }
@@ -549,25 +619,40 @@ mod tests {
         assert_eq!(parse_number("O1234"), None);
         assert_eq!(numeric_or_string(" 5 "), json!(5));
         assert_eq!(numeric_or_string("ACTIVE"), json!("ACTIVE"));
-        assert_eq!(numeric_vector("1 2 x"), None, "a partly numeric vector is not a vector");
+        assert_eq!(
+            numeric_vector("1 2 x"),
+            None,
+            "a partly numeric vector is not a vector"
+        );
         assert_eq!(numeric_vector(""), None);
     }
 
     #[test]
     fn an_empty_sample_text_is_an_empty_string_not_a_dropped_observation() {
-        let elem = XmlElem { name: "Position".into(), ..XmlElem::default() };
+        let elem = XmlElem {
+            name: "Position".into(),
+            ..XmlElem::default()
+        };
         assert_eq!(
             decode_value(&elem, Category::Sample, Repr::Value, None),
             ObsValue::Scalar(json!(""))
         );
         // A non-numeric sample text survives as a string rather than being coerced to 0.
-        let elem = XmlElem { name: "Position".into(), text: "HOME".into(), ..XmlElem::default() };
+        let elem = XmlElem {
+            name: "Position".into(),
+            text: "HOME".into(),
+            ..XmlElem::default()
+        };
         assert_eq!(
             decode_value(&elem, Category::Sample, Repr::Value, None),
             ObsValue::Scalar(json!("HOME"))
         );
         // An UNAVAILABLE data set is unavailable, not an empty object.
-        let elem = XmlElem { name: "X".into(), text: UNAVAILABLE.into(), ..XmlElem::default() };
+        let elem = XmlElem {
+            name: "X".into(),
+            text: UNAVAILABLE.into(),
+            ..XmlElem::default()
+        };
         assert_eq!(
             decode_value(&elem, Category::Event, Repr::DataSet, None),
             ObsValue::Unavailable

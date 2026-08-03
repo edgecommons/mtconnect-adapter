@@ -75,11 +75,11 @@ pub use config::{
 };
 pub use error::{MtcError, ParseCounters};
 pub use model::{BrowseNode, Category, DataItemMeta, DeviceNode, NodeKind, ProbeModel, Repr};
+pub use observations::{CondState, ObsValue, Observation};
 pub use selection::{
     served_set, ChannelBudget, DerivedChannel, Matcher, Provenance, SelectionConfig, SelectionMode,
     ServedSet, ServedSignal,
 };
-pub use observations::{CondState, ObsValue, Observation};
 pub use sequence::{AcqState, HeaderOutcome, SequenceState};
 pub use stats::{AgentStats, AgentStatsSnapshot};
 pub use stream::{ChunkSource, HeartbeatWatch, PartOutcome, StreamExit};
@@ -183,7 +183,9 @@ pub enum AgentCtl {
     },
     /// Drop and re-establish acquisition (`reconnect`): the model cache is refreshed and every
     /// dedupe floor reset, so the next poll republishes as fresh.
-    Reconnect { reply: oneshot::Sender<Result<(), MtcError>> },
+    Reconnect {
+        reply: oneshot::Sender<Result<(), MtcError>>,
+    },
     /// Stop the acquisition task.
     Shutdown,
 }
@@ -309,19 +311,33 @@ impl AgentRuntime {
     /// The cached model for a device, when it has been probed.
     #[must_use]
     pub fn model(&self, device_uuid: &str) -> Option<Arc<ProbeModel>> {
-        self.models.read().expect("models").get(device_uuid).cloned()
+        self.models
+            .read()
+            .expect("models")
+            .get(device_uuid)
+            .cloned()
     }
 
     /// Attach a device instance: it gets its own bounded queue of [`InstanceEvent`]s. Attaching the
     /// same uuid twice replaces the previous sink (a reconnecting instance, not a second device).
     pub fn attach(self: &Arc<Self>, device_uuid: &str) -> AgentHandle {
         let (tx, rx) = mpsc::channel(INSTANCE_QUEUE_DEPTH);
-        self.sinks.write().expect("sinks").insert(device_uuid.to_string(), tx);
+        self.sinks
+            .write()
+            .expect("sinks")
+            .insert(device_uuid.to_string(), tx);
         // A live stream carries only changes: the streaming task owes this instance a `/current`
         // snapshot of its device. (A one-permit notify: many attaches collapse into one pass.)
-        self.attach_pending.lock().expect("attach queue").push(device_uuid.to_string());
+        self.attach_pending
+            .lock()
+            .expect("attach queue")
+            .push(device_uuid.to_string());
         self.attach_notify.notify_one();
-        AgentHandle { agent: Arc::clone(self), device_uuid: device_uuid.to_string(), rx }
+        AgentHandle {
+            agent: Arc::clone(self),
+            device_uuid: device_uuid.to_string(),
+            rx,
+        }
     }
 
     /// Detach a device instance (its session closed).
@@ -367,7 +383,10 @@ impl AgentRuntime {
                 return Err(e);
             }
         };
-        self.parse.lock().expect("parse counters").record_ok(doc.unknown_elements);
+        self.parse
+            .lock()
+            .expect("parse counters")
+            .record_ok(doc.unknown_elements);
 
         let model = Arc::new(ProbeModel::from_devices(&doc, device_uuid)?);
         let digest = model.digest_hex();
@@ -381,13 +400,14 @@ impl AgentRuntime {
 
         self.update_info(|info| {
             info.standard_version = doc.ns_version.map(|v| v.to_string());
-            info.schema_namespace = doc.ns_version.map(|v| {
-                format!("urn:mtconnect.org:MTConnectDevices:{v}")
-            });
+            info.schema_namespace = doc
+                .ns_version
+                .map(|v| format!("urn:mtconnect.org:MTConnectDevices:{v}"));
             if doc.header.version.is_some() {
                 info.agent_version = doc.header.version.clone();
             }
-            info.probe_digests.insert(device_uuid.to_string(), digest.clone());
+            info.probe_digests
+                .insert(device_uuid.to_string(), digest.clone());
         });
 
         if changed {
@@ -435,7 +455,8 @@ impl AgentRuntime {
     pub async fn snapshot_cycle(&self, republish_all: bool) -> Result<PollReport, MtcError> {
         let started = std::time::Instant::now();
         let fetched = self.client.current(None).await;
-        self.stats.record_latency(elapsed_ms(started), fetched.is_ok());
+        self.stats
+            .record_latency(elapsed_ms(started), fetched.is_ok());
         let text = match fetched {
             Ok(text) => text,
             Err(e) => {
@@ -482,7 +503,10 @@ impl AgentRuntime {
                 return Err(e);
             }
         };
-        self.parse.lock().expect("parse counters").record_ok(doc.unknown_elements);
+        self.parse
+            .lock()
+            .expect("parse counters")
+            .record_ok(doc.unknown_elements);
         Ok(self.ingest_streams_doc(&doc, republish_all))
     }
 
@@ -522,7 +546,9 @@ impl AgentRuntime {
                     .elem
                     .attr("dataItemId")
                     .and_then(|id| model.as_ref().and_then(|m| m.item(id).cloned()));
-                let Some(obs) = observations::decode(entry, meta.as_ref()) else { continue };
+                let Some(obs) = observations::decode(entry, meta.as_ref()) else {
+                    continue;
+                };
                 report.observations += 1;
                 let is_new = {
                     let mut seq = self.seq.lock().expect("sequence state");
@@ -580,7 +606,8 @@ impl AgentRuntime {
     ) -> Result<Vec<Observation>, MtcError> {
         let started = std::time::Instant::now();
         let fetched = self.client.current(None).await;
-        self.stats.record_latency(elapsed_ms(started), fetched.is_ok());
+        self.stats
+            .record_latency(elapsed_ms(started), fetched.is_ok());
         let text = match fetched {
             Ok(text) => text,
             Err(e) => {
@@ -596,7 +623,10 @@ impl AgentRuntime {
                 return Err(e);
             }
         };
-        self.parse.lock().expect("parse counters").record_ok(doc.unknown_elements);
+        self.parse
+            .lock()
+            .expect("parse counters")
+            .record_ok(doc.unknown_elements);
 
         let Some(ds) = doc.device_streams.iter().find(|d| d.uuid == device_uuid) else {
             return Err(MtcError::NoSuchDevice(device_uuid.to_string()));
@@ -604,7 +634,9 @@ impl AgentRuntime {
         let model = self.model(device_uuid);
         let mut out = Vec::new();
         for entry in &ds.entries {
-            let Some(id) = entry.elem.attr("dataItemId") else { continue };
+            let Some(id) = entry.elem.attr("dataItemId") else {
+                continue;
+            };
             if !data_item_ids.is_empty() && !data_item_ids.iter().any(|w| w == id) {
                 continue;
             }
@@ -643,12 +675,15 @@ impl AgentRuntime {
         {
             return self.snapshot(device_uuid, data_item_ids).await;
         }
-        let budget = Duration::from_millis(u64::from(self.cfg.request_timeout_ms)) + Duration::from_secs(2);
+        let budget =
+            Duration::from_millis(u64::from(self.cfg.request_timeout_ms)) + Duration::from_secs(2);
         match tokio::time::timeout(budget, rx).await {
             Ok(Ok(result)) => result,
             // The task went away mid-request: answer from a direct read rather than failing.
             Ok(Err(_)) => self.snapshot(device_uuid, data_item_ids).await,
-            Err(_) => Err(MtcError::Timeout { ms: budget.as_millis() as u64 }),
+            Err(_) => Err(MtcError::Timeout {
+                ms: budget.as_millis() as u64,
+            }),
         }
     }
 
@@ -661,14 +696,22 @@ impl AgentRuntime {
             return self.reconnect().await;
         }
         let (tx, rx) = oneshot::channel();
-        if self.ctl_tx.send(AgentCtl::Reconnect { reply: tx }).await.is_err() {
+        if self
+            .ctl_tx
+            .send(AgentCtl::Reconnect { reply: tx })
+            .await
+            .is_err()
+        {
             return self.reconnect().await;
         }
-        let budget = Duration::from_millis(u64::from(self.cfg.request_timeout_ms)) + Duration::from_secs(2);
+        let budget =
+            Duration::from_millis(u64::from(self.cfg.request_timeout_ms)) + Duration::from_secs(2);
         match tokio::time::timeout(budget, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => self.reconnect().await,
-            Err(_) => Err(MtcError::Timeout { ms: budget.as_millis() as u64 }),
+            Err(_) => Err(MtcError::Timeout {
+                ms: budget.as_millis() as u64,
+            }),
         }
     }
 
@@ -793,8 +836,7 @@ impl AgentRuntime {
                 };
                 // The *request* (headers in, status + headers out) is bounded like any one-shot;
                 // only the body is open-ended, and liveness there is the heartbeat's job.
-                let open_timeout =
-                    Duration::from_millis(u64::from(self.cfg.request_timeout_ms));
+                let open_timeout = Duration::from_millis(u64::from(self.cfg.request_timeout_ms));
                 let open_started = std::time::Instant::now();
                 let opened = match tokio::time::timeout(
                     open_timeout,
@@ -803,9 +845,12 @@ impl AgentRuntime {
                 .await
                 {
                     Ok(result) => result,
-                    Err(_) => Err(MtcError::Timeout { ms: open_timeout.as_millis() as u64 }),
+                    Err(_) => Err(MtcError::Timeout {
+                        ms: open_timeout.as_millis() as u64,
+                    }),
                 };
-                self.stats.record_latency(elapsed_ms(open_started), opened.is_ok());
+                self.stats
+                    .record_latency(elapsed_ms(open_started), opened.is_ok());
                 if opened.is_ok() {
                     // Every established stream comes back through here - the ladders and the
                     // degradation floor alike - so this is where a re-establishment is counted.
@@ -873,8 +918,7 @@ impl AgentRuntime {
                         );
                         continue 'stream;
                     }
-                    StreamExit::TransportLost(e)
-                    | StreamExit::Malformed(e) => {
+                    StreamExit::TransportLost(e) | StreamExit::Malformed(e) => {
                         tracing::warn!(agent = %self.cfg.id, error = %e, "stream dropped; re-establishing");
                         continue 'stream;
                     }
@@ -919,8 +963,10 @@ impl AgentRuntime {
         reader: &mut MultipartReader,
         ctl: &mut mpsc::Receiver<AgentCtl>,
     ) -> StreamExit {
-        let mut watch =
-            HeartbeatWatch::new(self.cfg.heartbeat_ms, tokio::time::Instant::now().into_std());
+        let mut watch = HeartbeatWatch::new(
+            self.cfg.heartbeat_ms,
+            tokio::time::Instant::now().into_std(),
+        );
         let mut undecodable: u32 = 0;
         loop {
             let now = tokio::time::Instant::now();
@@ -1000,7 +1046,10 @@ impl AgentRuntime {
     fn handle_part(&self, part: &multipart::Part) -> PartOutcome {
         match classify_part(part) {
             PartDoc::Streams(doc) => {
-                self.parse.lock().expect("parse counters").record_ok(doc.unknown_elements);
+                self.parse
+                    .lock()
+                    .expect("parse counters")
+                    .record_ok(doc.unknown_elements);
                 let report = self.ingest_streams_doc(&doc, false);
                 if report.observations == 0 {
                     PartOutcome::Heartbeat
@@ -1012,7 +1061,10 @@ impl AgentRuntime {
                 }
             }
             PartDoc::Errors(doc) => {
-                self.parse.lock().expect("parse counters").record_ok(doc.unknown_elements);
+                self.parse
+                    .lock()
+                    .expect("parse counters")
+                    .record_ok(doc.unknown_elements);
                 self.stats.record_document(0);
                 // An error document's header still names the agent incarnation: a restart
                 // discovered here is still a restart (ladder 3 beats ladder 2).
@@ -1128,7 +1180,11 @@ impl AgentRuntime {
 
     /// Capped exponential backoff with full jitter over this agent's `reconnect` bounds.
     fn backoff_delay(&self, attempt: u32) -> Duration {
-        let exp = self.cfg.reconnect.initial_ms.saturating_mul(1_u64 << attempt.min(20));
+        let exp = self
+            .cfg
+            .reconnect
+            .initial_ms
+            .saturating_mul(1_u64 << attempt.min(20));
         let cap = exp.min(self.cfg.reconnect.max_ms);
         Duration::from_millis((rand01() * cap as f64) as u64)
     }
@@ -1147,8 +1203,13 @@ impl AgentRuntime {
     }
 
     fn broadcast(&self, event: &InstanceEvent) {
-        let sinks: Vec<mpsc::Sender<InstanceEvent>> =
-            self.sinks.read().expect("sinks").values().cloned().collect();
+        let sinks: Vec<mpsc::Sender<InstanceEvent>> = self
+            .sinks
+            .read()
+            .expect("sinks")
+            .values()
+            .cloned()
+            .collect();
         for tx in sinks {
             if tx.try_send(event.clone()).is_err() {
                 self.dropped_events.fetch_add(1, Ordering::Relaxed);
@@ -1199,7 +1260,9 @@ fn dedupe_key(device_uuid: &str, data_item_id: &str) -> String {
 /// A jitter source with no new dependency: a fresh `RandomState` hash is random per call.
 fn rand01() -> f64 {
     use std::hash::{BuildHasher, Hasher};
-    let n = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    let n = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
     (n % 1_000_000) as f64 / 1_000_000.0
 }
 
@@ -1227,14 +1290,20 @@ mod tests {
         assert!(rt.attached().is_empty());
         let mut handle = rt.attach("OKUMA.123456");
         let _second = rt.attach("MAZAK.999");
-        assert_eq!(rt.attached(), vec!["MAZAK.999".to_string(), "OKUMA.123456".to_string()]);
+        assert_eq!(
+            rt.attached(),
+            vec!["MAZAK.999".to_string(), "OKUMA.123456".to_string()]
+        );
 
         // One agent, many devices: an event for one device reaches only that device's queue.
         rt.ingest_streams(CURRENT_2_7, false).unwrap();
         let event = handle.rx.try_recv().expect("the CNC's observations");
         match event {
             InstanceEvent::Snapshot(obs) => {
-                assert!(obs.iter().all(|o| o.data_item_id != "m-avail"), "no other device's data");
+                assert!(
+                    obs.iter().all(|o| o.data_item_id != "m-avail"),
+                    "no other device's data"
+                );
             }
             other => panic!("expected a snapshot, got {other:?}"),
         }
@@ -1249,7 +1318,10 @@ mod tests {
         let _h = rt.attach("MAZAK.999");
         let report = rt.ingest_streams(CURRENT_2_7, false).unwrap();
         assert_eq!(report.device_streams, 2, "the document had two");
-        assert_eq!(report.observations, 1, "only the attached device's observation was decoded");
+        assert_eq!(
+            report.observations, 1,
+            "only the attached device's observation was decoded"
+        );
         assert_eq!(report.published, 1);
     }
 
@@ -1271,8 +1343,13 @@ mod tests {
         // dispatched nothing at all.
         let first_events: Vec<InstanceEvent> =
             std::iter::from_fn(|| handle.rx.try_recv().ok()).collect();
-        assert!(first_events.iter().any(|e| matches!(e, InstanceEvent::Snapshot(_))));
-        assert!(handle.rx.try_recv().is_err(), "nothing was dispatched the second time");
+        assert!(first_events
+            .iter()
+            .any(|e| matches!(e, InstanceEvent::Snapshot(_))));
+        assert!(
+            handle.rx.try_recv().is_err(),
+            "nothing was dispatched the second time"
+        );
 
         // A forced republish (a resume, a repoll) deliberately says the same thing again.
         let third = rt.ingest_streams(CURRENT_2_7, true).unwrap();
@@ -1290,13 +1367,18 @@ mod tests {
             events.push(e);
         }
         assert!(
-            events.iter().any(|e| matches!(e, InstanceEvent::AgentUp(_))),
+            events
+                .iter()
+                .any(|e| matches!(e, InstanceEvent::AgentUp(_))),
             "the first document proves the agent is up"
         );
         assert!(rt.info().connected);
 
         rt.ingest_streams(HEARTBEAT_2_7, false).unwrap();
-        assert!(handle.rx.try_recv().is_err(), "an already-up agent is not announced again");
+        assert!(
+            handle.rx.try_recv().is_err(),
+            "an already-up agent is not announced again"
+        );
     }
 
     #[tokio::test]
@@ -1307,7 +1389,11 @@ mod tests {
         assert_eq!(report.observations, 0);
         assert_eq!(report.published, 0);
         let info = rt.info();
-        assert_eq!(info.next_sequence, Some(42), "liveness moved the cursor, not the data");
+        assert_eq!(
+            info.next_sequence,
+            Some(42),
+            "liveness moved the cursor, not the data"
+        );
         assert_eq!(info.instance_id, Some(1_749_000_000));
         assert_eq!(info.mode, "poll");
     }
@@ -1324,8 +1410,14 @@ mod tests {
             .replace("instanceId=\"1749000000\"", "instanceId=\"1749999999\"")
             .replace("sequence=\"37\"", "sequence=\"3\"");
         let report = rt.ingest_streams(&restarted, false).unwrap();
-        assert!(report.published > 0, "a restarted agent's low sequences are not stale");
-        assert!(rt.needs_resync(), "a restarted agent's model is re-probed before it is trusted");
+        assert!(
+            report.published > 0,
+            "a restarted agent's low sequences are not stale"
+        );
+        assert!(
+            rt.needs_resync(),
+            "a restarted agent's model is re-probed before it is trusted"
+        );
         assert_eq!(rt.info().instance_id, Some(1_749_999_999));
     }
 
@@ -1336,7 +1428,10 @@ mod tests {
         rt.ingest_streams(CURRENT_2_7, false).unwrap();
         while handle.rx.try_recv().is_ok() {}
 
-        assert!(matches!(rt.ingest_streams("<MTConnectStreams>", false), Err(MtcError::Xml(_))));
+        assert!(matches!(
+            rt.ingest_streams("<MTConnectStreams>", false),
+            Err(MtcError::Xml(_))
+        ));
         let counters = rt.parse_counters();
         assert_eq!(counters.parse_errors, 1);
         assert_eq!(counters.documents_parsed, 1);
@@ -1351,7 +1446,10 @@ mod tests {
         let handle = rt.attach("OKUMA.123456");
         drop(handle); // the receiver is gone: every send fails
         rt.ingest_streams(CURRENT_2_7, false).unwrap();
-        assert!(rt.dropped_events() > 0, "a lost consumer is counted, never a stalled poll");
+        assert!(
+            rt.dropped_events() > 0,
+            "a lost consumer is counted, never a stalled poll"
+        );
     }
 
     #[test]
@@ -1364,9 +1462,15 @@ mod tests {
         assert_eq!(v["connected"], false);
         assert_eq!(v["mode"], "poll");
         assert_eq!(v["heartbeatMs"], 10_000);
-        assert_eq!(v["limitations"], json!(["READ_ONLY", "XML_ONLY", "NO_ASSETS"]));
+        assert_eq!(
+            v["limitations"],
+            json!(["READ_ONLY", "XML_ONLY", "NO_ASSETS"])
+        );
         assert!(v["instanceId"].is_null());
-        assert!(!v.to_string().contains("password"), "nothing secret is published");
+        assert!(
+            !v.to_string().contains("password"),
+            "nothing secret is published"
+        );
     }
 
     #[test]
@@ -1390,6 +1494,9 @@ mod tests {
         )
         .unwrap();
         let err = rt.request_snapshot("U", &[]).await.unwrap_err();
-        assert!(matches!(err, MtcError::Transport(_) | MtcError::Timeout { .. }), "{err:?}");
+        assert!(
+            matches!(err, MtcError::Transport(_) | MtcError::Timeout { .. }),
+            "{err:?}"
+        );
     }
 }

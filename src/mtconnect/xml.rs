@@ -317,7 +317,11 @@ pub fn parse_devices(xml: &str) -> Result<DevicesDoc, MtcError> {
     let doc = parse_document(xml)?;
     expect_root(&doc.root, "MTConnectDevices")?;
 
-    let header = doc.root.child("Header").map(MtcHeader::from_elem).unwrap_or_default();
+    let header = doc
+        .root
+        .child("Header")
+        .map(MtcHeader::from_elem)
+        .unwrap_or_default();
     let mut unknown = doc.unresolved_entities;
     let mut devices = Vec::new();
     for child in &doc.root.children {
@@ -333,7 +337,12 @@ pub fn parse_devices(xml: &str) -> Result<DevicesDoc, MtcError> {
             _ => unknown += 1,
         }
     }
-    Ok(DevicesDoc { header, ns_version: doc.ns_version, devices, unknown_elements: unknown })
+    Ok(DevicesDoc {
+        header,
+        ns_version: doc.ns_version,
+        devices,
+        unknown_elements: unknown,
+    })
 }
 
 /// Count elements inside a `<Device>` subtree the parser does not structurally recognize.
@@ -369,7 +378,11 @@ pub fn parse_streams(xml: &str) -> Result<StreamsDoc, MtcError> {
 pub fn streams_from_doc(doc: XmlDoc) -> Result<StreamsDoc, MtcError> {
     expect_root(&doc.root, "MTConnectStreams")?;
 
-    let header = doc.root.child("Header").map(MtcHeader::from_elem).unwrap_or_default();
+    let header = doc
+        .root
+        .child("Header")
+        .map(MtcHeader::from_elem)
+        .unwrap_or_default();
     let mut unknown = doc.unresolved_entities;
     let mut device_streams = Vec::new();
 
@@ -395,7 +408,12 @@ pub fn streams_from_doc(doc: XmlDoc) -> Result<StreamsDoc, MtcError> {
         }
     }
 
-    Ok(StreamsDoc { header, ns_version: doc.ns_version, device_streams, unknown_elements: unknown })
+    Ok(StreamsDoc {
+        header,
+        ns_version: doc.ns_version,
+        device_streams,
+        unknown_elements: unknown,
+    })
 }
 
 fn collect_component_streams(e: &XmlElem, out: &mut Vec<StreamEntry>, unknown: &mut u64) {
@@ -404,7 +422,10 @@ fn collect_component_streams(e: &XmlElem, out: &mut Vec<StreamEntry>, unknown: &
             *unknown += 1;
             continue;
         }
-        let component = cs.attr("name").or_else(|| cs.attr("component")).map(str::to_string);
+        let component = cs
+            .attr("name")
+            .or_else(|| cs.attr("component"))
+            .map(str::to_string);
         for group in &cs.children {
             let category = match group.name.as_str() {
                 "Samples" => Category::Sample,
@@ -417,7 +438,11 @@ fn collect_component_streams(e: &XmlElem, out: &mut Vec<StreamEntry>, unknown: &
                 }
             };
             for obs in &group.children {
-                out.push(StreamEntry { category, elem: obs.clone(), component: component.clone() });
+                out.push(StreamEntry {
+                    category,
+                    elem: obs.clone(),
+                    component: component.clone(),
+                });
             }
         }
     }
@@ -445,7 +470,10 @@ pub fn errors_from_doc(doc: XmlDoc) -> Result<ErrorsDoc, MtcError> {
         )));
     }
 
-    let header = root.child("Header").map(MtcHeader::from_elem).unwrap_or_default();
+    let header = root
+        .child("Header")
+        .map(MtcHeader::from_elem)
+        .unwrap_or_default();
     let mut unknown = doc.unresolved_entities;
     let mut errors = Vec::new();
     let mut push = |e: &XmlElem| {
@@ -473,14 +501,22 @@ pub fn errors_from_doc(doc: XmlDoc) -> Result<ErrorsDoc, MtcError> {
         }
     }
 
-    Ok(ErrorsDoc { header, ns_version: doc.ns_version, errors, unknown_elements: unknown })
+    Ok(ErrorsDoc {
+        header,
+        ns_version: doc.ns_version,
+        errors,
+        unknown_elements: unknown,
+    })
 }
 
 fn expect_root(root: &XmlElem, want: &str) -> Result<(), MtcError> {
     if root.name == want {
         Ok(())
     } else {
-        Err(MtcError::Xml(format!("expected a `{want}` document, got `{}`", root.name)))
+        Err(MtcError::Xml(format!(
+            "expected a `{want}` document, got `{}`",
+            root.name
+        )))
     }
 }
 
@@ -513,18 +549,27 @@ pub fn parse_document(xml: &str) -> Result<XmlDoc, MtcError> {
             Err(e) => return Err(MtcError::Xml(format!("{e}"))),
             Ok(Event::Eof) => break,
             Ok(Event::Start(s)) => {
-                push_element(&mut stack, element_from_start(&s, &mut ns_uri, &mut unresolved_entities)?)?;
+                push_element(
+                    &mut stack,
+                    element_from_start(&s, &mut ns_uri, &mut unresolved_entities)?,
+                )?;
             }
             Ok(Event::Empty(s)) => {
                 // An empty element opens and closes in one event.
-                push_element(&mut stack, element_from_start(&s, &mut ns_uri, &mut unresolved_entities)?)?;
+                push_element(
+                    &mut stack,
+                    element_from_start(&s, &mut ns_uri, &mut unresolved_entities)?,
+                )?;
                 close_element(&mut stack, &mut root);
             }
             Ok(Event::End(_)) => close_element(&mut stack, &mut root),
             Ok(Event::Text(t)) => {
                 if let Some(top) = stack.last_mut() {
                     let decoded = t.decode().map_err(|e| MtcError::Xml(format!("{e}")))?;
-                    push_text(&mut top.text, &unescape_inert(&decoded, &mut unresolved_entities));
+                    push_text(
+                        &mut top.text,
+                        &unescape_inert(&decoded, &mut unresolved_entities),
+                    );
                 }
             }
             Ok(Event::CData(c)) => {
@@ -545,7 +590,8 @@ pub fn parse_document(xml: &str) -> Result<XmlDoc, MtcError> {
                 if let Some(top) = stack.last_mut() {
                     // An unresolvable reference stays **literal** — visible for diagnosis, and
                     // never a value fetched from disk or the network.
-                    top.text.push_str(&resolved.unwrap_or_else(|| format!("&{raw};")));
+                    top.text
+                        .push_str(&resolved.unwrap_or_else(|| format!("&{raw};")));
                 }
             }
             // Declarations, DTDs, comments and processing instructions carry no data this client
@@ -555,7 +601,9 @@ pub fn parse_document(xml: &str) -> Result<XmlDoc, MtcError> {
     }
 
     if !stack.is_empty() {
-        return Err(MtcError::Xml("document ended inside an open element".into()));
+        return Err(MtcError::Xml(
+            "document ended inside an open element".into(),
+        ));
     }
     let root = root.ok_or_else(|| MtcError::Xml("document has no root element".into()))?;
 
@@ -565,12 +613,18 @@ pub fn parse_document(xml: &str) -> Result<XmlDoc, MtcError> {
             return Err(MtcError::UnsupportedVersion(v.to_string()));
         }
     }
-    Ok(XmlDoc { root, ns_version, unresolved_entities })
+    Ok(XmlDoc {
+        root,
+        ns_version,
+        unresolved_entities,
+    })
 }
 
 fn push_element(stack: &mut Vec<XmlElem>, elem: XmlElem) -> Result<(), MtcError> {
     if stack.len() + 1 > MAX_DEPTH {
-        return Err(MtcError::Xml(format!("element nesting exceeds {MAX_DEPTH}")));
+        return Err(MtcError::Xml(format!(
+            "element nesting exceeds {MAX_DEPTH}"
+        )));
     }
     stack.push(elem);
     Ok(())
@@ -604,7 +658,9 @@ fn element_from_start(
         let attr = attr.map_err(|e| MtcError::Xml(format!("attribute: {e}")))?;
         count += 1;
         if count > MAX_ATTRIBUTES {
-            return Err(MtcError::Xml(format!("element `{name}` exceeds {MAX_ATTRIBUTES} attributes")));
+            return Err(MtcError::Xml(format!(
+                "element `{name}` exceeds {MAX_ATTRIBUTES} attributes"
+            )));
         }
         if attr.value.len() > MAX_ATTR_VALUE_BYTES {
             return Err(MtcError::Xml(format!(
@@ -619,7 +675,12 @@ fn element_from_start(
         attrs.insert(key, value);
     }
 
-    Ok(XmlElem { name, attrs, text: String::new(), children: Vec::new() })
+    Ok(XmlElem {
+        name,
+        attrs,
+        text: String::new(),
+        children: Vec::new(),
+    })
 }
 
 /// The local part of a possibly-prefixed name (`m:DataItem` → `DataItem`).
@@ -678,7 +739,10 @@ fn resolve_reference(body: &str) -> Option<String> {
         "apos" => Some("'".into()),
         _ => {
             let digits = body.strip_prefix('#')?;
-            let code = match digits.strip_prefix('x').or_else(|| digits.strip_prefix('X')) {
+            let code = match digits
+                .strip_prefix('x')
+                .or_else(|| digits.strip_prefix('X'))
+            {
                 Some(hex) => u32::from_str_radix(hex, 16).ok()?,
                 None => digits.parse::<u32>().ok()?,
             };
@@ -724,7 +788,9 @@ mod tests {
             let d = doc.device("OKUMA.123456").expect("the fixture's device");
             assert_eq!(d.attr("name"), Some("OKUMA-CNC"));
             let items = d.child("DataItems").unwrap();
-            assert!(items.children_named("DataItem").any(|i| i.attr("id") == Some("avail")));
+            assert!(items
+                .children_named("DataItem")
+                .any(|i| i.attr("id") == Some("avail")));
         }
     }
 
@@ -757,18 +823,33 @@ mod tests {
     #[test]
     fn a_streams_document_demultiplexes_by_device_and_tags_each_category() {
         let doc = parse_streams(CURRENT_2_7).unwrap();
-        assert_eq!(doc.device_streams.len(), 2, "one stream serves many devices");
-        let cnc = doc.device_streams.iter().find(|d| d.uuid == "OKUMA.123456").unwrap();
-        assert!(cnc.entries.iter().any(|e| e.category == Category::Sample
-            && e.elem.attr("dataItemId") == Some("Xabs")));
-        assert!(cnc.entries.iter().any(|e| e.category == Category::Event
-            && e.elem.attr("dataItemId") == Some("avail")));
+        assert_eq!(
+            doc.device_streams.len(),
+            2,
+            "one stream serves many devices"
+        );
+        let cnc = doc
+            .device_streams
+            .iter()
+            .find(|d| d.uuid == "OKUMA.123456")
+            .unwrap();
+        assert!(cnc
+            .entries
+            .iter()
+            .any(|e| e.category == Category::Sample && e.elem.attr("dataItemId") == Some("Xabs")));
+        assert!(cnc
+            .entries
+            .iter()
+            .any(|e| e.category == Category::Event && e.elem.attr("dataItemId") == Some("avail")));
         let cond = cnc
             .entries
             .iter()
             .find(|e| e.category == Category::Condition)
             .expect("a Condition entry");
-        assert_eq!(cond.elem.name, "Fault", "the condition STATE is the element name");
+        assert_eq!(
+            cond.elem.name, "Fault",
+            "the condition STATE is the element name"
+        );
         assert_eq!(cond.component.as_deref(), Some("X"));
         assert!(!doc.is_heartbeat());
     }
@@ -819,10 +900,16 @@ mod tests {
         // both an attribute and element text. Neither is expanded: the parser has no code path to
         // the filesystem, and the reference is left literal and counted.
         let doc = parse_devices(XXE).unwrap();
-        assert!(doc.unknown_elements >= 1, "the unresolved reference is counted");
+        assert!(
+            doc.unknown_elements >= 1,
+            "the unresolved reference is counted"
+        );
         let d = &doc.devices[0];
         let text = format!("{:?}", d);
-        assert!(!text.contains("root:x:0:0"), "no /etc/passwd content anywhere in the tree");
+        assert!(
+            !text.contains("root:x:0:0"),
+            "no /etc/passwd content anywhere in the tree"
+        );
         assert!(!text.contains("BEGIN PRIVATE KEY"));
         assert!(text.contains("&xxe;"), "the reference stays literal");
         // A DOCTYPE is inert, not an error: the document still parses.
@@ -863,7 +950,11 @@ mod tests {
             </MTConnectStreams>"#;
         let s = parse_streams(streams).unwrap();
         assert_eq!(s.unknown_elements, 1, "the unknown group");
-        assert_eq!(s.device_streams[0].entries.len(), 1, "the known group still delivered");
+        assert_eq!(
+            s.device_streams[0].entries.len(),
+            1,
+            "the known group still delivered"
+        );
     }
 
     #[test]
@@ -880,7 +971,10 @@ mod tests {
 
     #[test]
     fn malformed_documents_are_errors_not_panics() {
-        assert!(parse_document("").is_err(), "an empty body is not a document");
+        assert!(
+            parse_document("").is_err(),
+            "an empty body is not a document"
+        );
         assert!(parse_document("<a><b></a>").is_err(), "mismatched end tag");
         assert!(parse_document("<a>").is_err(), "truncated document");
         assert!(parse_document("not xml at all").is_err());
@@ -888,14 +982,29 @@ mod tests {
 
     #[test]
     fn structural_caps_bound_a_hostile_document() {
-        let deep = format!("{}{}", "<a>".repeat(MAX_DEPTH + 2), "</a>".repeat(MAX_DEPTH + 2));
-        assert!(matches!(parse_document(&deep), Err(MtcError::Xml(_))), "depth cap");
+        let deep = format!(
+            "{}{}",
+            "<a>".repeat(MAX_DEPTH + 2),
+            "</a>".repeat(MAX_DEPTH + 2)
+        );
+        assert!(
+            matches!(parse_document(&deep), Err(MtcError::Xml(_))),
+            "depth cap"
+        );
 
-        let attrs: String = (0..MAX_ATTRIBUTES + 5).map(|i| format!(" a{i}=\"1\"")).collect();
-        assert!(parse_document(&format!("<a{attrs}/>")).is_err(), "attribute-count cap");
+        let attrs: String = (0..MAX_ATTRIBUTES + 5)
+            .map(|i| format!(" a{i}=\"1\""))
+            .collect();
+        assert!(
+            parse_document(&format!("<a{attrs}/>")).is_err(),
+            "attribute-count cap"
+        );
 
         let long = "x".repeat(MAX_ATTR_VALUE_BYTES + 1);
-        assert!(parse_document(&format!("<a v=\"{long}\"/>")).is_err(), "attribute-length cap");
+        assert!(
+            parse_document(&format!("<a v=\"{long}\"/>")).is_err(),
+            "attribute-length cap"
+        );
     }
 
     #[test]

@@ -17,12 +17,16 @@ use serde_json::{json, Value};
 
 fn schema() -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.schema.json");
-    serde_json::from_str(&std::fs::read_to_string(path).expect("read schema")).expect("parse schema")
+    serde_json::from_str(&std::fs::read_to_string(path).expect("read schema"))
+        .expect("parse schema")
 }
 
 fn config(name: &str) -> Value {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-configs").join(name);
-    serde_json::from_str(&std::fs::read_to_string(path).expect("read config")).expect("parse config")
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("test-configs")
+        .join(name);
+    serde_json::from_str(&std::fs::read_to_string(path).expect("read config"))
+        .expect("parse config")
 }
 
 /// Validate one `component.global` object.
@@ -72,13 +76,22 @@ fn the_shipped_mtconnect_configuration_compiles_through_the_semantic_validator()
         .iter()
         .map(|v| serde_json::from_value(v.clone()).expect("instance"))
         .collect();
-    let compiled = compile_mtconnect(&mut devices, &agents, PublishDefaults::default(), &ChannelBudgets::default()).expect("bindings resolve");
+    let compiled = compile_mtconnect(
+        &mut devices,
+        &agents,
+        PublishDefaults::default(),
+        &ChannelBudgets::default(),
+    )
+    .expect("bindings resolve");
 
     assert_eq!(compiled.len(), 1);
     assert_eq!(compiled[0].device_uuid, "OKUMA.123456");
     assert_eq!(compiled[0].signals.len(), 5);
     // The endpoint is derived from the agent + uuid, not configured.
-    assert_eq!(devices[0].connection.endpoint, "mtconnect://127.0.0.1:5000/OKUMA.123456");
+    assert_eq!(
+        devices[0].connection.endpoint,
+        "mtconnect://127.0.0.1:5000/OKUMA.123456"
+    );
 }
 
 #[test]
@@ -94,7 +107,14 @@ fn the_shipped_simulator_configuration_still_works() {
     assert_eq!(devices[0].adapter, "sim");
     assert_eq!(devices[0].connection.endpoint, "sim://device-1");
     // No MTConnect instances, so no agent is needed.
-    assert!(compile_mtconnect(&mut devices, &[], PublishDefaults::default(), &ChannelBudgets::default()).unwrap().is_empty());
+    assert!(compile_mtconnect(
+        &mut devices,
+        &[],
+        PublishDefaults::default(),
+        &ChannelBudgets::default()
+    )
+    .unwrap()
+    .is_empty());
 }
 
 #[test]
@@ -199,20 +219,36 @@ fn the_selection_block_is_additive_closed_and_validated() {
     });
     validate_instance(&minimal).expect("the minimal selection instance");
     // ... and it compiles through the semantic validator too.
-    let agents = parse_agents(&json!({ "agents": [{ "id": "line-a-agent", "url": "http://a:5000" }] }))
-        .unwrap();
+    let agents =
+        parse_agents(&json!({ "agents": [{ "id": "line-a-agent", "url": "http://a:5000" }] }))
+            .unwrap();
     let mut devices: Vec<DeviceConfig> = vec![serde_json::from_value(minimal).unwrap()];
     let compiled = compile_mtconnect(
         &mut devices,
         &agents,
-        PublishDefaults { batch_ms: 250, publish_mode: PublishMode::Interval },
+        PublishDefaults {
+            batch_ms: 250,
+            publish_mode: PublishMode::Interval,
+        },
         &ChannelBudgets::default(),
     )
     .expect("compiles");
-    let selection = compiled[0].selection.as_ref().expect("the selection rides the compile");
-    assert_eq!(selection.max_signals, 500, "the derived-set cap defaults to 500");
-    assert!(selection.auto_condition_binding, "auto conditionBinding defaults on");
-    assert_eq!(selection.default_batch_ms, 250, "defaults.batchMs is stamped in at compile");
+    let selection = compiled[0]
+        .selection
+        .as_ref()
+        .expect("the selection rides the compile");
+    assert_eq!(
+        selection.max_signals, 500,
+        "the derived-set cap defaults to 500"
+    );
+    assert!(
+        selection.auto_condition_binding,
+        "auto conditionBinding defaults on"
+    );
+    assert_eq!(
+        selection.default_batch_ms, 250,
+        "defaults.batchMs is stamped in at compile"
+    );
     assert_eq!(
         selection.default_publish_mode,
         PublishMode::Interval,
@@ -271,7 +307,13 @@ fn the_selection_block_is_additive_closed_and_validated() {
     }))
     .unwrap()];
     assert!(
-        compile_mtconnect(&mut bad, &agents, PublishDefaults::default(), &ChannelBudgets::default()).is_err(),
+        compile_mtconnect(
+            &mut bad,
+            &agents,
+            PublishDefaults::default(),
+            &ChannelBudgets::default()
+        )
+        .is_err(),
         "a bad pattern never commits"
     );
 
@@ -282,7 +324,13 @@ fn the_selection_block_is_additive_closed_and_validated() {
         "selection": { "mode": "all" }
     }))
     .unwrap()];
-    assert!(compile_mtconnect(&mut sim, &[], PublishDefaults::default(), &ChannelBudgets::default()).is_err());
+    assert!(compile_mtconnect(
+        &mut sim,
+        &[],
+        PublishDefaults::default(),
+        &ChannelBudgets::default()
+    )
+    .is_err());
 }
 
 #[test]
@@ -306,20 +354,29 @@ fn an_agent_declares_a_reachable_url_and_references_its_secrets() {
     assert!(validate_global(&json!({ "agents": [{ "id": "a", "url": "mqtt://agent" }] })).is_err());
     assert!(validate_global(&json!({ "agents": [{ "id": "a" }] })).is_err());
     // An id that is not a UNS token cannot be a metric dimension.
-    assert!(validate_global(&json!({ "agents": [{ "id": "Line_A", "url": "http://a:5000" }] })).is_err());
+    assert!(
+        validate_global(&json!({ "agents": [{ "id": "Line_A", "url": "http://a:5000" }] }))
+            .is_err()
+    );
     // A password INLINE instead of by reference.
-    assert!(validate_global(&json!({ "agents": [{
+    assert!(
+        validate_global(&json!({ "agents": [{
         "id": "a", "url": "http://a:5000",
         "auth": { "type": "basic", "username": "u", "password": "hunter2" }
     }] }))
-    .is_err(), "secrets are references, never values");
+        .is_err(),
+        "secrets are references, never values"
+    );
     // Half a client identity.
     assert!(validate_global(&json!({ "agents": [{
         "id": "a", "url": "http://a:5000", "tls": { "certSecretRef": "c" }
     }] }))
     .is_err());
     // An unknown global key is a mistake, not a no-op.
-    assert!(validate_global(&json!({ "agents": [{ "id": "a", "url": "http://a:5000" }], "nope": 1 })).is_err());
+    assert!(validate_global(
+        &json!({ "agents": [{ "id": "a", "url": "http://a:5000" }], "nope": 1 })
+    )
+    .is_err());
 }
 
 #[test]
@@ -341,5 +398,8 @@ fn the_schema_keeps_every_object_closed() {
     }
     let mut open = Vec::new();
     walk(&schema(), "", &mut open);
-    assert!(open.is_empty(), "these objects accept unknown keys: {open:?}");
+    assert!(
+        open.is_empty(),
+        "these objects accept unknown keys: {open:?}"
+    );
 }
