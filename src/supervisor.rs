@@ -25,8 +25,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::app::{
-    build_sample, compile_mtconnect, connectivity_of, set_paused, stamp_received, Backoff,
-    DeviceConfig, DeviceControl, Health, LinkState,
+    build_sample, compile_mtconnect, connectivity_of, set_paused, shutdown_within, stamp_received,
+    Backoff, DeviceConfig, DeviceControl, Health, LinkState, TaskTokens,
 };
 use crate::device::{
     resolve_agent_credentials, BrowseError, DeviceBackend, DeviceSession, MtcBackend, NoticeLevel,
@@ -194,12 +194,24 @@ impl App {
     }
 
     pub async fn run(&self, gg: &EdgeCommons) -> anyhow::Result<()> {
+        // The structured-lifecycle token tree (P1-7): one root, one child per family, one
+        // grandchild per task — so the device tasks can be stopped and drained BEFORE the agent
+        // runtimes they detach from. Every handle spawned below is retained and joined; nothing is
+        // left to be aborted mid-flush by the runtime's own teardown.
+        let tokens = TaskTokens::new();
+        let mut agent_tasks: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
+        let mut agent_metric_tasks: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
+        let mut device_tasks: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
+
         // The shared acquisition tasks start BEFORE any instance supervisor: an instance attaches
         // to a running agent runtime, it does not start one.
-        for agent in self.agents.values() {
-            // Each acquisition task carries its own cancellation token; the structured shutdown
-            // sequence that builds the token tree is the supervisor's next piece of work.
-            agent.spawn(CancellationToken::new());
+        for (agent_id, agent) in &self.agents {
+            // Each acquisition task carries its own token, a child of the agent family's: shutdown
+            // cancels the family, and every await point in the task — a hung request, a backoff
+            // wait, a blocked loss-intolerant send — gives way to it.
+            if let Some(task) = agent.spawn(tokens.agent()) {
+                agent_tasks.push((format!("agent `{agent_id}` acquisition"), task));
+            }
             // One emitter per AGENT for the acquisition families (HLD §9): the stream is shared by
             // every device on it, so it is measured once rather than once per attached instance.
             let am = Arc::new(AgentMetrics::new(
@@ -208,14 +220,18 @@ impl App {
                 Arc::clone(agent) as Arc<dyn AgentTelemetry>,
             ));
             am.define_all();
-            tokio::spawn(async move {
+            let ticker_cancel = tokens.agents();
+            let task = tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(METRICS_INTERVAL);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
-                    ticker.tick().await;
-                    am.emit_periodic().await;
+                    tokio::select! {
+                        () = ticker_cancel.cancelled() => return,
+                        _ = ticker.tick() => am.emit_periodic().await,
+                    }
                 }
             });
+            agent_metric_tasks.push((format!("agent `{agent_id}` metrics"), task));
         }
 
         // Each device's health, shared with its task and read by the connectivity provider.
@@ -262,7 +278,7 @@ impl App {
                 protocol: crate::commands::ProtocolView::of(device, &self.agents, &self.signals),
             });
 
-            tokio::spawn(run_device(
+            let task = tokio::spawn(run_device(
                 device.clone(),
                 backend,
                 instance.data(),
@@ -271,8 +287,9 @@ impl App {
                 health,
                 control_rx,
                 self.stale_signal_secs,
-                CancellationToken::new(),
+                tokens.device(),
             ));
+            device_tasks.push((format!("instance `{}`", device.id), task));
         }
 
         // ONE provider, TWO surfaces: the library pushes this sample into the `state` keepalive's
@@ -292,12 +309,40 @@ impl App {
             crate::commands::register_all(&commands, handles)?;
         }
 
+        // SIGTERM / Ctrl-C — a *process* signal, which is precisely the control input that still
+        // arrives when the broker is gone and every publish is stalled.
         gg.shutdown_signal().await;
         tracing::info!("shutdown signal received");
-        for agent in self.agents.values() {
-            agent.shutdown().await;
+
+        // The ordering and the budgets are `crate::app`'s, unit-tested there; this is only the
+        // wiring. Agent acquisition tasks and their metric tickers are joined together under the
+        // one agent budget.
+        let agents: Vec<Arc<AgentRuntime>> = self.agents.values().map(Arc::clone).collect();
+        let metrics = Arc::clone(&self.metrics);
+        agent_tasks.extend(agent_metric_tasks);
+        let report = shutdown_within(
+            &tokens,
+            device_tasks,
+            agent_tasks,
+            async move {
+                for agent in &agents {
+                    agent.shutdown().await;
+                }
+            },
+            async move {
+                metrics.flush_metrics().await.ok();
+            },
+        )
+        .await;
+
+        if report.is_clean() {
+            tracing::info!("shutdown complete: every task flushed and returned");
+        } else {
+            tracing::warn!(
+                devices = ?report.aborted_devices, agents = ?report.aborted_agents,
+                "shutdown aborted tasks that had not returned inside their budget"
+            );
         }
-        self.metrics.flush_metrics().await.ok();
         Ok(())
     }
 }
@@ -310,6 +355,12 @@ impl App {
 ///
 /// The connect loop and the poll loop are nested on purpose. A read failure that breaks the link
 /// drops out of the poll loop and back into connect — the only place that knows how to back off.
+///
+/// **Shutdown (P1-7):** `cancel` preempts every await point in both loops. Cancelled while polling,
+/// the task flushes its open batch windows, publishes them, and closes (detaches) the session before
+/// returning; cancelled while connecting or backing off there is nothing buffered, so it returns at
+/// once. Either way it returns *itself* — the supervisor joins it rather than letting the runtime's
+/// teardown abort it mid-flush.
 #[allow(clippy::too_many_arguments)]
 async fn run_device(
     cfg: DeviceConfig,
@@ -337,7 +388,17 @@ async fn run_device(
                 LinkState::Backoff
             });
             let now = Instant::now();
-            match backend.connect(&cfg.connection).await {
+            // Nothing is buffered before a session exists, so a cancelled connect has nothing to
+            // flush — it just stops, promptly, however long the connect itself would have taken.
+            let attempt_result = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    tracing::info!(instance = %cfg.id, "shutdown while connecting");
+                    return;
+                }
+                result = backend.connect(&cfg.connection) => result,
+            };
+            match attempt_result {
                 Ok(session) => {
                     attempt = 0;
                     dm.on_connected(now);
@@ -376,7 +437,7 @@ async fn run_device(
                         instance = %cfg.id, error = %e, permanent,
                         wait_ms = wait.as_millis() as u64, "connect failed"
                     );
-                    match serve_while_down(&mut control, &events, &health, wait).await {
+                    match serve_while_down(&mut control, &events, &health, wait, &cancel).await {
                         DownOutcome::Reconnect(reply) => {
                             pending_reconnect = Some(reply);
                             attempt = 0;
@@ -406,6 +467,14 @@ async fn run_device(
         )
         .await;
 
+        // A deliberate stop is not a link failure: the poll loop already flushed its windows and
+        // detached, so returning here keeps shutdown off the alarm surface. Raising
+        // `device-unreachable` on every clean stop would alarm the whole fleet at each deployment.
+        if matches!(exit, PollExit::Closed) {
+            tracing::info!(instance = %cfg.id, "device task stopped");
+            return;
+        }
+
         // The link is down (or a reconnect asked us to drop it).
         health.set_link(LinkState::Backoff);
         health.reconnects.fetch_add(1, Ordering::Relaxed);
@@ -425,6 +494,7 @@ async fn run_device(
             PollExit::Reconnect(reply) => {
                 pending_reconnect = Some(reply);
             }
+            // Handled above, before the alarm: a stop is not an outage.
             PollExit::Closed => return,
         }
     }
@@ -456,6 +526,11 @@ enum PollExit {
 /// signal reload or a model drift swaps the policies atomically with the signal-set swap and
 /// flushes the changed signals' windows with their old policy; every exit path — shutdown, link
 /// loss, reconnect — flushes the open windows so no buffered reading is lost.
+///
+/// **Shutdown (P1-7):** `cancel` is an arm of the same `select!` as the tick and the control
+/// channel, so a SIGTERM lands between two awaits rather than aborting one: the open windows are
+/// flushed and published, the session is closed (detaching it from the shared agent runtime), and
+/// the loop returns [`PollExit::Closed`] for the supervisor to join.
 #[allow(clippy::too_many_arguments)]
 async fn run_polling(
     cfg: &DeviceConfig,
@@ -470,9 +545,8 @@ async fn run_polling(
     cancel: CancellationToken,
 ) -> PollExit {
     // Landed with the final signature so later work changes bodies, not call sites:
-    // `stale_signal_secs` is the passive-quality expiry threshold and `cancel` is the structured
-    // shutdown token the select arms are preempted by.
-    let _ = (stale_signal_secs, &cancel);
+    // `stale_signal_secs` is the passive-quality expiry threshold, wired in phase 6.
+    let _ = stale_signal_secs;
     // The inventory ids back the resume-time snapshot (HLD §7: resume snapshots first).
     let inventory: Vec<String> = backend
         .inventory(&cfg.connection)
@@ -495,18 +569,32 @@ async fn run_polling(
     });
 
     loop {
+        // Checked here as well as in the `select!` below, because the branches of an unbiased
+        // `select!` are polled in random order: whatever the last iteration was doing, a cancelled
+        // task stops on THIS iteration rather than eventually.
+        if cancel.is_cancelled() {
+            tracing::info!(instance = %cfg.id, "shutdown: flushing the open windows");
+            return stop_cleanly(cfg, &mut shaper, &mut session, data, dm, health).await;
+        }
+
         // ONE deadline per instance task: the earliest open batch window.
         let batch_deadline = shaper.next_deadline();
         tokio::select! {
+            // Shutdown (P1-7). Buffered readings are data: they are flushed and published while the
+            // messaging facade is still alive, and the session is closed — detaching it from the
+            // shared agent runtime — before this task returns to be joined.
+            () = cancel.cancelled() => {
+                tracing::info!(instance = %cfg.id, "shutdown: flushing the open windows");
+                return stop_cleanly(cfg, &mut shaper, &mut session, data, dm, health).await;
+            }
+
             // Poll and control share this one task, so a write can never race a read on the same
             // connection — most device protocols are a single request/response channel.
             ctrl = control.recv() => {
                 let Some(ctrl) = ctrl else {
-                    // Component shutdown: flush the open batch windows — a SIGTERM must not lose
-                    // the readings a window was still coalescing.
-                    publish_shaped(cfg, shaper.flush_all(), data, dm, health).await;
-                    drain_shaping(dm, &mut shaper);
-                    return PollExit::Closed;
+                    // The command surface went away: flush the open batch windows — no exit may
+                    // lose the readings a window was still coalescing — and detach.
+                    return stop_cleanly(cfg, &mut shaper, &mut session, data, dm, health).await;
                 };
                 match ctrl {
                     DeviceControl::Write(req) => {
@@ -591,8 +679,7 @@ async fn run_polling(
                     }
                     DeviceControl::Reconnect { reply } => {
                         // Buffered readings are data: flush them before dropping the session.
-                        publish_shaped(cfg, shaper.flush_all(), data, dm, health).await;
-                        drain_shaping(dm, &mut shaper);
+                        flush_open_windows(cfg, &mut shaper, data, dm, health).await;
                         session.close().await;
                         return PollExit::Reconnect(reply);
                     }
@@ -617,8 +704,7 @@ async fn run_polling(
                                     tracing::warn!(instance = %cfg.id, error = %e, "repoll failed");
                                     health.read_errors.fetch_add(1, Ordering::Relaxed);
                                     let _ = reply.send(Err(e.to_string()));
-                                    publish_shaped(cfg, shaper.flush_all(), data, dm, health).await;
-                                    drain_shaping(dm, &mut shaper);
+                                    flush_open_windows(cfg, &mut shaper, data, dm, health).await;
                                     session.close().await;
                                     return PollExit::LinkLost;
                                 }
@@ -638,8 +724,7 @@ async fn run_polling(
                 match outcome {
                     Err(()) => {
                         // The link broke: flush the open windows so nothing buffered is lost.
-                        publish_shaped(cfg, shaper.flush_all(), data, dm, health).await;
-                        drain_shaping(dm, &mut shaper);
+                        flush_open_windows(cfg, &mut shaper, data, dm, health).await;
                         session.close().await;
                         return PollExit::LinkLost;
                     }
@@ -813,6 +898,36 @@ async fn publish_shaped(
     published
 }
 
+/// A deliberate stop's tail: flush and publish the open batch windows while the messaging facade is
+/// still alive, then close the session — which, for an MTConnect instance, detaches it from the
+/// shared agent runtime that is still running behind it (P1-7's ordering).
+async fn stop_cleanly(
+    cfg: &DeviceConfig,
+    shaper: &mut Shaper,
+    session: &mut Box<dyn crate::device::DeviceSession>,
+    data: &DataFacade,
+    dm: &Arc<DeviceMetrics>,
+    health: &Arc<Health>,
+) -> PollExit {
+    flush_open_windows(cfg, shaper, data, dm, health).await;
+    session.close().await;
+    PollExit::Closed
+}
+
+/// Flush every open batch window, publish what came out, and hand the shaper's counters to the
+/// metrics feed — the shared tail of **every** way out of the poll loop (shutdown, cancellation,
+/// link loss, reconnect, a failed repoll). Buffered readings are data: no exit may drop them.
+async fn flush_open_windows(
+    cfg: &DeviceConfig,
+    shaper: &mut Shaper,
+    data: &DataFacade,
+    dm: &Arc<DeviceMetrics>,
+    health: &Arc<Health>,
+) {
+    publish_shaped(cfg, shaper.flush_all(), data, dm, health).await;
+    drain_shaping(dm, shaper);
+}
+
 /// Move the shaper's counters into the `MtconnectAdapterShaping` family's feed.
 fn drain_shaping(dm: &Arc<DeviceMetrics>, shaper: &mut Shaper) {
     if let Some(counters) = shaper.take_counters() {
@@ -923,11 +1038,15 @@ enum DownOutcome {
 /// effect (they only need the shared flag + event); the I/O verbs answer "disconnected" (the command
 /// layer maps that to `DEVICE_UNAVAILABLE` / `BROWSE_FAILED`); a `reconnect` returns its reply so the
 /// caller connects now.
+///
+/// A backoff window can be minutes long, so shutdown is an arm of the same `select!`: cancellation
+/// ends the wait at once rather than after it (P1-7). There is nothing buffered while down.
 async fn serve_while_down(
     control: &mut mpsc::Receiver<DeviceControl>,
     events: &EventsFacade,
     health: &Arc<Health>,
     wait: Duration,
+    cancel: &CancellationToken,
 ) -> DownOutcome {
     let deadline = Instant::now() + wait;
     loop {
@@ -937,6 +1056,7 @@ async fn serve_while_down(
         }
         tokio::select! {
             biased;
+            () = cancel.cancelled() => return DownOutcome::Closed,
             ctrl = control.recv() => {
                 match ctrl {
                     None => return DownOutcome::Closed,

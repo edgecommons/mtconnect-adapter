@@ -1238,11 +1238,25 @@ impl AgentRuntime {
     }
 
     /// Stop the acquisition task (idempotent; a runtime with no task is already stopped): cancel
-    /// its token AND send it a `Shutdown`, belt and braces — the token preempts every await point,
+    /// its token AND offer it a `Shutdown`, belt and braces — the token preempts every await point,
     /// the message ends the loop that is between them.
+    ///
+    /// The message is offered with `try_send`, never awaited. The control channel is 32 deep, so
+    /// against a *blocked* task the send would either succeed into a buffer nobody will ever drain
+    /// or — once those 32 are spent — wait forever for room: exactly the stall this method exists to
+    /// end. The token is the guarantee; the message is only the courtesy that lets a healthy task
+    /// finish the iteration it is in.
     pub async fn shutdown(&self) {
         self.cancel_token().cancel();
-        let _ = self.ctl_tx.send(AgentCtl::Shutdown).await;
+        if self.ctl_tx.try_send(AgentCtl::Shutdown).is_err() {
+            tracing::debug!(
+                agent = %self.cfg.id,
+                "the shutdown message had nowhere to go; the cancellation token stops the task"
+            );
+        }
+        // Let a task that is already awake on the cancelled token run its exit path before the
+        // caller starts joining. Purely an optimization: `join_all_within` waits either way.
+        tokio::task::yield_now().await;
     }
 
     /// Start the acquisition task. Calling it twice is a no-op: the receiver is taken once.
@@ -1252,7 +1266,9 @@ impl AgentRuntime {
     /// only ever polls `/current`.
     ///
     /// `cancel` is the task's own token: it is installed on the runtime, so [`Self::shutdown`] can
-    /// cancel it and every loss-intolerant send is preempted by it.
+    /// cancel it, every loss-intolerant send is preempted by it, and every await point in the
+    /// acquisition state machine gives way to it. The returned [`JoinHandle`](tokio::task::JoinHandle)
+    /// is the caller's to keep — the structured shutdown joins it rather than abandoning it.
     pub fn spawn(
         self: &Arc<Self>,
         cancel: CancellationToken,
@@ -1264,21 +1280,42 @@ impl AgentRuntime {
         Some(tokio::spawn(async move { me.run(ctl).await }))
     }
 
+    /// The task body, under the cancellation token installed by [`Self::spawn`].
+    ///
+    /// The acquisition state machine has its own cancel arms at every `select!` it owns, so the
+    /// ordinary stop is a clean one — the loop exits between two awaits. This outer arm is the
+    /// guarantee for the awaits that are NOT selects: a `/current` fetch against an agent that
+    /// accepted the connection and then went silent holds the task for the whole
+    /// `requestTimeoutMs`, and a control channel full of queued snapshots would make the task work
+    /// through every one of them before noticing. Shutdown must not have to wait for either
+    /// (P1-7), so the whole body gives way to the token.
     async fn run(self: Arc<Self>, mut ctl: mpsc::Receiver<AgentCtl>) {
-        match self.cfg.streaming {
-            StreamPolicy::PollOnly => self.run_poll_only(&mut ctl).await,
-            StreamPolicy::Prefer => self.run_streaming(&mut ctl).await,
+        let cancel = self.cancel_token();
+        let acquisition = async {
+            match self.cfg.streaming {
+                StreamPolicy::PollOnly => self.run_poll_only(&mut ctl).await,
+                StreamPolicy::Prefer => self.run_streaming(&mut ctl).await,
+            }
+        };
+        tokio::select! {
+            () = acquisition => {}
+            () = cancel.cancelled() => {
+                tracing::info!(agent = %self.cfg.id, "acquisition cancelled; the task is exiting");
+            }
         }
         self.task_started.store(false, Ordering::Relaxed);
     }
 
-    /// The `poll-only` acquisition loop: `/current` on the configured cadence, forever.
+    /// The `poll-only` acquisition loop: `/current` on the configured cadence, until it is told to
+    /// stop — by a `Shutdown` message, a closed control channel, or the cancellation token.
     async fn run_poll_only(&self, ctl: &mut mpsc::Receiver<AgentCtl>) {
+        let cancel = self.cancel_token();
         let mut ticker =
             tokio::time::interval(Duration::from_millis(u64::from(self.cfg.poll_interval_ms)));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                () = cancel.cancelled() => return,
                 msg = ctl.recv() => match msg {
                     None | Some(AgentCtl::Shutdown) => return,
                     Some(AgentCtl::Snapshot { device_uuid, data_item_ids, reply }) => {
@@ -1309,6 +1346,7 @@ impl AgentRuntime {
     ///   N consecutive establish failures → degrade to polling, retry per backoff
     /// ```
     async fn run_streaming(&self, ctl: &mut mpsc::Receiver<AgentCtl>) {
+        let cancel = self.cancel_token();
         // Consecutive failures to *establish* the stream (the degradation counter, LLD §5).
         let mut establish_failures: u32 = 0;
         // Whether acquisition has degraded to `/current` polling between stream attempts.
@@ -1319,6 +1357,11 @@ impl AgentRuntime {
         let mut republish_next_snapshot = false;
 
         'connect: loop {
+            // A cancelled task starts no new probe/snapshot round: whatever the recovery ladder
+            // was about to re-establish, nobody is going to consume it.
+            if cancel.is_cancelled() {
+                return;
+            }
             // --- Connecting: probe (models for every attached device) + /current snapshot ------
             for uuid in self.attached() {
                 if let Err(e) = self.ensure_model(&uuid).await {
@@ -1346,6 +1389,9 @@ impl AgentRuntime {
 
             // --- Streaming (with ladder-1 re-establishment and the degradation floor) ----------
             'stream: loop {
+                if cancel.is_cancelled() {
+                    return;
+                }
                 let from = self.seq.lock().expect("sequence state").next;
                 let request = StreamRequest {
                     from: Some(from),
@@ -1357,16 +1403,19 @@ impl AgentRuntime {
                 // only the body is open-ended, and liveness there is the heartbeat's job.
                 let open_timeout = Duration::from_millis(u64::from(self.cfg.request_timeout_ms));
                 let open_started = Instant::now();
-                let opened = match tokio::time::timeout(
-                    open_timeout,
-                    self.client.open_sample_stream(&request),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(MtcError::Timeout {
-                        ms: open_timeout.as_millis() as u64,
-                    }),
+                let opened = tokio::select! {
+                    // Opening a stream against a silent agent costs the whole request timeout;
+                    // shutdown does not wait it out.
+                    () = cancel.cancelled() => return,
+                    outcome = tokio::time::timeout(
+                        open_timeout,
+                        self.client.open_sample_stream(&request),
+                    ) => match outcome {
+                        Ok(result) => result,
+                        Err(_) => Err(MtcError::Timeout {
+                            ms: open_timeout.as_millis() as u64,
+                        }),
+                    },
                 };
                 self.stats
                     .record_latency(elapsed_ms(open_started), opened.is_ok());
@@ -1526,12 +1575,17 @@ impl AgentRuntime {
     /// The [`StreamRun`] reports both how the stream ended and **how many liveness-proving parts it
     /// ingested** — the evidence the state machine needs to tell a stream that worked and then
     /// broke from one that never worked at all (D-R4).
+    ///
+    /// A stream is by design a long silence between parts, so shutdown is an arm of the same
+    /// `select!` (P1-7): cancelling the task's token ends the stream **now** with
+    /// [`StreamExit::Shutdown`], instead of after up to two heartbeat windows.
     pub async fn drive_stream(
         &self,
         source: &mut impl ChunkSource,
         reader: &mut MultipartReader,
         ctl: &mut mpsc::Receiver<AgentCtl>,
     ) -> StreamRun {
+        let cancel = self.cancel_token();
         let mut watch = HeartbeatWatch::new(
             self.cfg.heartbeat_ms,
             tokio::time::Instant::now().into_std(),
@@ -1541,6 +1595,7 @@ impl AgentRuntime {
         let exit = 'drive: loop {
             let now = tokio::time::Instant::now();
             tokio::select! {
+                () = cancel.cancelled() => break 'drive StreamExit::Shutdown,
                 msg = ctl.recv() => match msg {
                     None | Some(AgentCtl::Shutdown) => break 'drive StreamExit::Shutdown,
                     Some(AgentCtl::Snapshot { device_uuid, data_item_ids, reply }) => {
@@ -1725,18 +1780,23 @@ impl AgentRuntime {
 
     /// Wait out a backoff window while servicing the control channel — and, while degraded,
     /// keep `/current` polling so data still flows between stream retries.
+    ///
+    /// A backoff window runs to the agent's `reconnect.maxMs`, so shutdown is an arm of the same
+    /// `select!`: cancellation ends the wait at once rather than after it (P1-7).
     async fn wait_serving_ctl(
         &self,
         ctl: &mut mpsc::Receiver<AgentCtl>,
         wait: Duration,
         poll_while_waiting: bool,
     ) -> CtlFlow {
+        let cancel = self.cancel_token();
         let deadline = tokio::time::Instant::now() + wait;
         let mut ticker =
             tokio::time::interval(Duration::from_millis(u64::from(self.cfg.poll_interval_ms)));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                () = cancel.cancelled() => return CtlFlow::Shutdown,
                 msg = ctl.recv() => match msg {
                     None | Some(AgentCtl::Shutdown) => return CtlFlow::Shutdown,
                     Some(AgentCtl::Snapshot { device_uuid, data_item_ids, reply }) => {
@@ -3189,6 +3249,141 @@ mod tests {
         // dataItemIds are unique per device, not per agent: two devices may both have `avail`.
         assert_ne!(dedupe_key("A", "avail"), dedupe_key("B", "avail"));
         assert_eq!(dedupe_key("A", "avail"), dedupe_key("A", "avail"));
+    }
+
+    // =============================================================================================
+    // Structured lifecycle: cancellation reaches every await point (P1-7)
+    // =============================================================================================
+
+    /// An agent that accepts the connection and then **never answers**. Every request against it
+    /// costs the full `requestTimeoutMs` — the state a dead-but-listening agent, a wedged proxy, or
+    /// a paused container puts a client in.
+    async fn silent_agent() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // The accepted sockets are held, not dropped: dropping them would answer with a reset.
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn poll_only_runtime(url: &str, request_timeout_ms: u64) -> Arc<AgentRuntime> {
+        let cfg = config::parse_agents(&json!({ "agents": [{
+            "id": "line-a-agent", "url": url, "streaming": "poll-only",
+            "pollIntervalMs": 10, "requestTimeoutMs": request_timeout_ms
+        }] }))
+        .unwrap()
+        .remove(0);
+        AgentRuntime::new(cfg, &AgentCredentials::default(), clock()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_blocked_acquisition_task_stops_on_its_token_not_on_the_message_behind_the_queue() {
+        // THE P1-7 failure, exactly: the task is inside a request a silent agent will never answer,
+        // and the control channel it would read a `Shutdown` from is full of work it would have to
+        // do FIRST — each item another request to the same silent agent. A shutdown that depended
+        // on that message would wait out `requestTimeoutMs` times the queue depth; the task would
+        // still be mid-flight when the runtime tore it down.
+        let rt = poll_only_runtime(&silent_agent().await, 30_000);
+        let task = rt.spawn(CancellationToken::new()).expect("the task starts");
+
+        // Let it get inside the request that will never be answered.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for _ in 0..64 {
+            let (reply, _rx) = oneshot::channel();
+            let _ = rt.ctl_tx.try_send(AgentCtl::Snapshot {
+                device_uuid: "OKUMA.123456".to_string(),
+                data_item_ids: Vec::new(),
+                reply,
+            });
+        }
+        assert!(
+            rt.ctl_tx.try_send(AgentCtl::Shutdown).is_err(),
+            "the control channel is saturated: a shutdown MESSAGE has nowhere to go"
+        );
+
+        rt.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the token stopped the task; it did not wait out the request timeout")
+            .expect("and it returned rather than panicking");
+        assert!(
+            !rt.task_started.load(Ordering::Relaxed),
+            "the runtime knows its task is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_polling_task_stops_promptly_and_shutdown_is_idempotent() {
+        let rt = poll_only_runtime("http://127.0.0.1:9", 200);
+        let task = rt.spawn(CancellationToken::new()).expect("the task starts");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        rt.shutdown().await;
+        // A second stop is a no-op, and a runtime whose task already returned still accepts one.
+        rt.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the polling loop returned")
+            .expect("cleanly");
+        rt.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backoff_wait_gives_way_to_shutdown_instead_of_running_to_its_deadline() {
+        let rt = runtime();
+        let (_tx, mut ctl) = mpsc::channel::<AgentCtl>(4);
+        let stopper = Arc::clone(&rt);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            stopper.shutdown().await;
+        });
+        let started = tokio::time::Instant::now();
+        let flow = rt
+            .wait_serving_ctl(&mut ctl, Duration::from_secs(600), false)
+            .await;
+        assert!(matches!(flow, CtlFlow::Shutdown));
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(250),
+            "a ten-minute backoff window ends the moment the token is cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_streaming_state_machine_unwinds_from_wherever_the_cancellation_finds_it() {
+        // The stand-in answers `/probe` and `/current` but nothing it says is a multipart stream,
+        // so the machine loops: connect → snapshot → open → establish failure → backoff. Whichever
+        // of those the cancellation lands in, the loop returns.
+        let (rt, _docs) = agent_backed_runtime_with_docs().await;
+        let stopper = Arc::clone(&rt);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            stopper.shutdown().await;
+        });
+        let (_tx, mut ctl) = mpsc::channel::<AgentCtl>(4);
+        tokio::time::timeout(Duration::from_secs(5), rt.run_streaming(&mut ctl))
+            .await
+            .expect("the streaming state machine returned on cancellation");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_runtime_starts_no_further_acquisition_round() {
+        let rt = poll_only_runtime("http://127.0.0.1:9", 200);
+        rt.shutdown().await; // cancelled before the machine ever ran
+        let (_tx, mut ctl) = mpsc::channel::<AgentCtl>(4);
+        tokio::time::timeout(Duration::from_secs(2), rt.run_streaming(&mut ctl))
+            .await
+            .expect("it refuses to probe for a component that is going away");
+        assert!(
+            rt.attached().is_empty() && !rt.info().connected,
+            "nothing was probed or published"
+        );
     }
 
     #[tokio::test]

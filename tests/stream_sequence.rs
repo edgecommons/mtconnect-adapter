@@ -511,6 +511,32 @@ async fn every_readable_part_counts_toward_the_streams_liveness_including_heartb
 // =================================================================================================
 
 #[tokio::test(start_paused = true)]
+async fn a_cancelled_task_ends_its_stream_now_rather_than_after_the_heartbeat_window() {
+    // A stream is a long silence by design: between parts, the only things awake are the heartbeat
+    // deadline and the control channel. A shutdown that waited for either would sit here for up to
+    // 2 x heartbeatMs — 20 s with this agent — with the process already asked to stop (P1-7).
+    let rt = runtime();
+    let stopper = Arc::clone(&rt);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        stopper.shutdown().await;
+    });
+
+    let started = tokio::time::Instant::now();
+    let run = drive_run(&rt, vec![Step::Chunk(part(HEARTBEAT_2_7)), Step::Hang]).await;
+    assert!(matches!(run.exit, StreamExit::Shutdown), "{:?}", run.exit);
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_millis(500),
+        "the stream ended on the token, not on the heartbeat window"
+    );
+    assert_eq!(
+        run.liveness_parts, 1,
+        "a deliberate stop does not rewrite what the stream had already proved"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn shutdown_and_reconnect_control_requests_end_the_stream() {
     let rt = runtime();
     let (tx, mut ctl) = mpsc::channel::<AgentCtl>(4);

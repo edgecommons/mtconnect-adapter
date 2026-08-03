@@ -556,6 +556,215 @@ pub fn connectivity_of(cfg: &DeviceConfig, health: &Health) -> InstanceConnectiv
 }
 
 // =================================================================================================
+// Structured lifecycle: the token tree and the bounded, ordered teardown (P1-7)
+// =================================================================================================
+
+/// How long ALL device tasks together get to flush their open batch windows, publish them, and
+/// detach their sessions before the stragglers are aborted.
+///
+/// Generous, because this is the window in which buffered readings still reach the wire against a
+/// merely *slow* broker; bounded, because against a *dead* one they never will, and an orchestrator
+/// that is waiting to `SIGKILL` us would take the rest of the process with it.
+///
+/// Sized so the three budgets together total 12 s, leaving margin inside the tightest orchestrator
+/// stop window this component ships into (Greengrass, 15 s).
+pub const DEVICE_SHUTDOWN_BUDGET: Duration = Duration::from_secs(6);
+
+/// How long ALL agent acquisition tasks and their metric tickers together get to acknowledge the
+/// stop and unwind. Shorter than the device budget: by the time it starts, the data that was worth
+/// saving has already been published by the device tasks.
+pub const AGENT_SHUTDOWN_BUDGET: Duration = Duration::from_secs(4);
+
+/// How long the final metric flush gets. Bounded for the same reason as the other two: the flush
+/// rides the same messaging facade the acquisition path does, and a dead broker must not be able to
+/// hold the process open past the orchestrator's stop window.
+pub const METRICS_FLUSH_BUDGET: Duration = Duration::from_secs(2);
+
+/// The cancellation-token tree the structured shutdown drives.
+///
+/// ```text
+///   root
+///    ├── devices ── one child token per device task
+///    └── agents  ── one child token per acquisition task (+ the shared one every metric ticker
+///                   selects on)
+/// ```
+///
+/// Two families, not one flat token, because the **order** matters: the device tasks are cancelled
+/// and drained first (their flush needs the messaging facade alive, and their `close()` detaches
+/// cleanly from a still-running runtime), and only then are the agents that feed them stopped.
+/// Cancelling a parent cancels every token below it, so `root` remains the one lever that stops
+/// everything at once.
+#[derive(Debug, Clone)]
+pub struct TaskTokens {
+    root: tokio_util::sync::CancellationToken,
+    devices: tokio_util::sync::CancellationToken,
+    agents: tokio_util::sync::CancellationToken,
+}
+
+impl Default for TaskTokens {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TaskTokens {
+    #[must_use]
+    pub fn new() -> Self {
+        let root = tokio_util::sync::CancellationToken::new();
+        let devices = root.child_token();
+        let agents = root.child_token();
+        Self {
+            root,
+            devices,
+            agents,
+        }
+    }
+
+    /// A token for one device task.
+    #[must_use]
+    pub fn device(&self) -> tokio_util::sync::CancellationToken {
+        self.devices.child_token()
+    }
+
+    /// A token for one agent's acquisition task.
+    #[must_use]
+    pub fn agent(&self) -> tokio_util::sync::CancellationToken {
+        self.agents.child_token()
+    }
+
+    /// The shared agent-family token — what the per-agent metric tickers select on.
+    #[must_use]
+    pub fn agents(&self) -> tokio_util::sync::CancellationToken {
+        self.agents.clone()
+    }
+
+    /// Tell every device task to flush, detach, and return.
+    pub fn cancel_devices(&self) {
+        self.devices.cancel();
+    }
+
+    /// Tell every acquisition task and metric ticker to unwind.
+    pub fn cancel_agents(&self) {
+        self.agents.cancel();
+    }
+
+    /// Stop everything at once — the last-resort lever, and what a caller uses when it is
+    /// abandoning the whole component rather than shutting it down in order.
+    pub fn cancel_all(&self) {
+        self.root.cancel();
+    }
+}
+
+/// What the teardown could not stop in time: the tasks that were aborted, by name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShutdownReport {
+    pub aborted_devices: Vec<String>,
+    pub aborted_agents: Vec<String>,
+}
+
+impl ShutdownReport {
+    /// Whether every task returned on its own before its budget ran out.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.aborted_devices.is_empty() && self.aborted_agents.is_empty()
+    }
+}
+
+/// Join every task under ONE shared `budget`, aborting and naming whatever is still running when it
+/// runs out.
+///
+/// The budget is shared, not per task: ten device tasks flushing in parallel are one shutdown, and
+/// giving each its own window would multiply the worst case by the number of instances. Tasks are
+/// joined in order, each against the same absolute deadline, so once the deadline has passed the
+/// remaining stragglers are aborted immediately rather than each waiting again.
+pub async fn join_all_within(
+    tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
+    budget: Duration,
+) -> Vec<String> {
+    join_all_by(tasks, tokio::time::Instant::now() + budget).await
+}
+
+/// [`join_all_within`] against an absolute deadline — how a phase that has already spent part of
+/// its budget joins what is left.
+async fn join_all_by(
+    tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
+    deadline: tokio::time::Instant,
+) -> Vec<String> {
+    let mut aborted = Vec::new();
+    for (name, mut handle) in tasks {
+        match tokio::time::timeout_at(deadline, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(task = %name, error = %e, "task did not unwind cleanly");
+            }
+            Err(_) => {
+                handle.abort();
+                tracing::warn!(
+                    task = %name,
+                    "task did not stop within the shutdown budget; aborting it"
+                );
+                aborted.push(name);
+            }
+        }
+    }
+    aborted
+}
+
+/// The whole teardown, in the one order that is safe, and bounded at every step (P1-7).
+///
+/// 1. **Cancel the device tasks** — each flushes its open batch windows, publishes them, and closes
+///    (detaches) its session.
+/// 2. **Join them** under [`DEVICE_SHUTDOWN_BUDGET`]; abort and name whatever is still running.
+/// 3. **Cancel the agent family, then tell each agent to stop**, and join the acquisition tasks and
+///    metric tickers — the whole phase inside [`AGENT_SHUTDOWN_BUDGET`].
+/// 4. **Flush the metrics last**, inside [`METRICS_FLUSH_BUDGET`], so the final counters include the
+///    shutdown's own work.
+///
+/// Devices come first because their flush needs the messaging facade alive and their detach is only
+/// clean against a still-running runtime; the agents follow; the counters go out last. Every step is
+/// bounded because the failure that makes shutdown matter — a dead broker or a dead Greengrass IPC
+/// link — is exactly the one that makes an unbounded step never return, and an orchestrator that
+/// gets tired of waiting sends `SIGKILL`, which loses everything still buffered.
+///
+/// Worst case: [`DEVICE_SHUTDOWN_BUDGET`] + [`AGENT_SHUTDOWN_BUDGET`] + [`METRICS_FLUSH_BUDGET`].
+pub async fn shutdown_within(
+    tokens: &TaskTokens,
+    device_tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
+    agent_tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
+    stop_agents: impl std::future::Future<Output = ()>,
+    flush_metrics: impl std::future::Future<Output = ()>,
+) -> ShutdownReport {
+    // 1-2. The devices: buffered readings are data, so they get the first and largest window.
+    tokens.cancel_devices();
+    let aborted_devices = join_all_within(device_tasks, DEVICE_SHUTDOWN_BUDGET).await;
+
+    // 3. The agents: one shared window covering both the stop request and the join, so the phase
+    //    cannot outrun its budget by way of an agent that will not acknowledge.
+    let agents_by = tokio::time::Instant::now() + AGENT_SHUTDOWN_BUDGET;
+    tokens.cancel_agents();
+    if tokio::time::timeout_at(agents_by, stop_agents)
+        .await
+        .is_err()
+    {
+        tracing::warn!("agents did not acknowledge the stop within the budget");
+    }
+    let aborted_agents = join_all_by(agent_tasks, agents_by).await;
+
+    // 4. The counters, including everything the two phases above just did.
+    if tokio::time::timeout(METRICS_FLUSH_BUDGET, flush_metrics)
+        .await
+        .is_err()
+    {
+        tracing::warn!("the final metric flush did not complete within its budget");
+    }
+
+    ShutdownReport {
+        aborted_devices,
+        aborted_agents,
+    }
+}
+
+// =================================================================================================
 // The device control channel
 // =================================================================================================
 
@@ -1183,6 +1392,275 @@ mod tests {
             health.signals_subscribed(),
             0,
             "a broken link serves nothing"
+        );
+    }
+
+    // --- the structured lifecycle (P1-7) --------------------------------------------------------
+
+    /// A shared, ordered trace: what happened, in the order it happened.
+    #[derive(Clone, Default)]
+    struct Trace(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+    impl Trace {
+        fn record(&self, what: &'static str) {
+            self.0.lock().expect("trace").push(what);
+        }
+        fn steps(&self) -> Vec<&'static str> {
+            self.0.lock().expect("trace").clone()
+        }
+    }
+
+    /// A task that finishes on its own after `after`.
+    fn finishes_in(
+        after: Duration,
+        trace: Trace,
+        what: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            trace.record(what);
+        })
+    }
+
+    /// A task that can never finish — a device whose publish will never complete because the
+    /// transport under it is dead.
+    fn never_finishes(trace: Trace) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            trace.record("the stuck task somehow finished");
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joining_tasks_that_all_finish_in_time_aborts_nothing() {
+        let trace = Trace::default();
+        let tasks = vec![
+            (
+                "one".to_string(),
+                finishes_in(Duration::from_millis(100), trace.clone(), "one"),
+            ),
+            (
+                "two".to_string(),
+                finishes_in(Duration::from_millis(300), trace.clone(), "two"),
+            ),
+        ];
+        let started = tokio::time::Instant::now();
+        let aborted = join_all_within(tasks, DEVICE_SHUTDOWN_BUDGET).await;
+        assert!(aborted.is_empty(), "{aborted:?}");
+        assert_eq!(trace.steps(), vec!["one", "two"]);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(300),
+            "the join costs what the slowest task costs, not the whole budget"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_task_that_cannot_finish_is_aborted_at_the_budget_and_named() {
+        let trace = Trace::default();
+        let tasks = vec![
+            (
+                "instance `spindle`".to_string(),
+                finishes_in(Duration::from_millis(50), trace.clone(), "flushed"),
+            ),
+            (
+                "instance `stuck`".to_string(),
+                never_finishes(trace.clone()),
+            ),
+            // A second straggler behind the first one costs NO extra time: the deadline is shared.
+            (
+                "instance `also-stuck`".to_string(),
+                never_finishes(trace.clone()),
+            ),
+        ];
+        let started = tokio::time::Instant::now();
+        let aborted = join_all_within(tasks, DEVICE_SHUTDOWN_BUDGET).await;
+        assert_eq!(
+            aborted,
+            vec![
+                "instance `stuck`".to_string(),
+                "instance `also-stuck`".to_string()
+            ],
+            "the stragglers are named so an operator learns which instance hung"
+        );
+        assert_eq!(
+            started.elapsed(),
+            DEVICE_SHUTDOWN_BUDGET,
+            "one shared budget, however many stragglers"
+        );
+        assert_eq!(
+            trace.steps(),
+            vec!["flushed"],
+            "the healthy task flushed; the aborted ones never ran past their await"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joining_nothing_costs_nothing() {
+        let started = tokio::time::Instant::now();
+        assert!(join_all_within(Vec::new(), DEVICE_SHUTDOWN_BUDGET)
+            .await
+            .is_empty());
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_task_is_reported_but_not_counted_as_a_straggler() {
+        let task = tokio::spawn(async { panic!("the device task fell over") });
+        let aborted = join_all_within(vec![("instance `bad`".to_string(), task)], SECOND).await;
+        assert!(
+            aborted.is_empty(),
+            "it stopped; it just did not stop nicely"
+        );
+    }
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn the_token_tree_stops_the_devices_without_stopping_the_agents_that_feed_them() {
+        let tokens = TaskTokens::default();
+        let device = tokens.device();
+        let agent = tokens.agent();
+        let tickers = tokens.agents();
+
+        tokens.cancel_devices();
+        assert!(device.is_cancelled(), "the device task is told to unwind");
+        assert!(
+            !agent.is_cancelled() && !tickers.is_cancelled(),
+            "its agent keeps running: a device's last flush still needs the runtime it detaches from"
+        );
+
+        tokens.cancel_agents();
+        assert!(agent.is_cancelled());
+        assert!(tickers.is_cancelled(), "the metric tickers stop with them");
+
+        // Sibling tokens are independent, and the root stops every family at once.
+        let tokens = TaskTokens::new();
+        let (device, agent) = (tokens.device(), tokens.agent());
+        tokens.cancel_all();
+        assert!(device.is_cancelled() && agent.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_teardown_drains_the_devices_before_it_stops_the_agents_and_flushes_last() {
+        let tokens = TaskTokens::new();
+        let trace = Trace::default();
+
+        let device_token = tokens.device();
+        let device_trace = trace.clone();
+        let device = tokio::spawn(async move {
+            device_token.cancelled().await;
+            // Flushing an open batch window and detaching the session takes a moment.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            device_trace.record("device flushed and detached");
+        });
+
+        let agent_token = tokens.agent();
+        let agent_trace = trace.clone();
+        let agent = tokio::spawn(async move {
+            agent_token.cancelled().await;
+            agent_trace.record("acquisition unwound");
+        });
+
+        let stop_trace = trace.clone();
+        let flush_trace = trace.clone();
+        let report = shutdown_within(
+            &tokens,
+            vec![("instance `spindle`".to_string(), device)],
+            vec![("agent `line-a` acquisition".to_string(), agent)],
+            async move { stop_trace.record("agents told to stop") },
+            async move { flush_trace.record("metrics flushed") },
+        )
+        .await;
+
+        assert!(report.is_clean(), "{report:?}");
+        assert_eq!(
+            trace.steps(),
+            vec![
+                "device flushed and detached",
+                "agents told to stop",
+                "acquisition unwound",
+                "metrics flushed",
+            ],
+            "devices drain first, agents second, counters last"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_teardown_completes_inside_its_budget_when_nothing_can_drain() {
+        // The failure this whole sequence exists for: the broker (or the Greengrass IPC link) is
+        // gone, so the device task's publish never completes and the acquisition task is stuck
+        // behind it. Shutdown must still END — an orchestrator that gets tired of waiting sends
+        // SIGKILL, and then even the batches that COULD have been flushed are lost.
+        let tokens = TaskTokens::new();
+        let trace = Trace::default();
+        let flush_trace = trace.clone();
+        let started = tokio::time::Instant::now();
+
+        let report = shutdown_within(
+            &tokens,
+            vec![(
+                "instance `spindle`".to_string(),
+                never_finishes(trace.clone()),
+            )],
+            vec![(
+                "agent `line-a` acquisition".to_string(),
+                never_finishes(trace.clone()),
+            )],
+            // Even the stop request is bounded: an agent that never acknowledges cannot hold the
+            // process open.
+            std::future::pending::<()>(),
+            async move { flush_trace.record("metrics flushed") },
+        )
+        .await;
+
+        assert_eq!(
+            report.aborted_devices,
+            vec!["instance `spindle`".to_string()]
+        );
+        assert_eq!(
+            report.aborted_agents,
+            vec!["agent `line-a` acquisition".to_string()]
+        );
+        assert!(!report.is_clean());
+        assert_eq!(
+            started.elapsed(),
+            DEVICE_SHUTDOWN_BUDGET + AGENT_SHUTDOWN_BUDGET,
+            "the two phases' budgets, and not one millisecond more"
+        );
+        assert_eq!(
+            trace.steps(),
+            vec!["metrics flushed"],
+            "the counters still went out, and nothing stuck ever ran again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_metric_flush_that_never_returns_cannot_hold_the_process_open() {
+        let tokens = TaskTokens::new();
+        let started = tokio::time::Instant::now();
+        let report = shutdown_within(
+            &tokens,
+            Vec::new(),
+            Vec::new(),
+            std::future::ready(()),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(report.is_clean());
+        assert_eq!(started.elapsed(), METRICS_FLUSH_BUDGET);
+    }
+
+    #[test]
+    fn the_shutdown_budgets_are_the_documented_ones() {
+        assert_eq!(DEVICE_SHUTDOWN_BUDGET, Duration::from_secs(6));
+        assert_eq!(AGENT_SHUTDOWN_BUDGET, Duration::from_secs(4));
+        assert_eq!(METRICS_FLUSH_BUDGET, Duration::from_secs(2));
+        assert_eq!(
+            DEVICE_SHUTDOWN_BUDGET + AGENT_SHUTDOWN_BUDGET + METRICS_FLUSH_BUDGET,
+            Duration::from_secs(12),
+            "the whole teardown fits inside the tightest stop window this component ships into \
+             (Greengrass, 15 s) with margin to spare"
         );
     }
 }
