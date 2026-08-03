@@ -2357,6 +2357,37 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_error_document_reaches_the_caller_as_the_agents_own_code() {
+        // C-2 closed at the taxonomy seam: a `/current` that answers with an `MTConnectErrors`
+        // document becomes `MtcError::AgentError`, whose rendering is exactly what `sb/read` maps
+        // per entry — no mapping change, just an error that now reaches here instead of being
+        // flattened into a generic parse failure.
+        for (code, message) in [
+            ("UNAUTHORIZED", "not permitted"),
+            ("INVALID_REQUEST", "no such device"),
+            ("TOO_MANY", "too many requests"),
+        ] {
+            let rendered = crate::mtconnect::MtcError::AgentError {
+                code: code.to_string(),
+                message: message.to_string(),
+            }
+            .to_string();
+            assert_eq!(rendered, format!("agent error {code}: {message}"));
+            assert_eq!(
+                agent_failure_code(&rendered),
+                format!("MTC_AGENT_ERROR:{code}")
+            );
+        }
+
+        // A `/current` body that is neither Streams nor Errors stays a parse failure — the agent
+        // did not name a code, so this client must not invent one.
+        assert_eq!(
+            agent_failure_code("xml error: expected MTConnectStreams from /current, got `html`"),
+            "MTC_PARSE"
+        );
+    }
+
+    #[test]
     fn every_seam_failure_maps_to_a_stable_per_entry_code() {
         assert_eq!(
             agent_failure_code("agent error OUT_OF_RANGE: past the buffer"),

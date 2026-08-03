@@ -22,10 +22,11 @@
 //!
 //! ## Bounded
 //!
-//! Depth ([`MAX_DEPTH`]), attribute count ([`MAX_ATTRIBUTES`]) and attribute length
-//! ([`MAX_ATTR_VALUE_BYTES`]) are capped, so a hostile or broken document costs a bounded amount of
-//! memory before it is refused. The byte size of the document itself is capped upstream by
-//! `maxDocumentBytes` in [`super::client`].
+//! Depth ([`MAX_DEPTH`]), attribute count ([`MAX_ATTRIBUTES`]), attribute length
+//! ([`MAX_ATTR_VALUE_BYTES`]) and total element count ([`MAX_NODES`]) are capped, so a hostile or
+//! broken document costs a bounded amount of memory before it is refused. The byte size of the
+//! document itself is capped upstream by `maxDocumentBytes` in [`super::client`] — but bytes alone
+//! do not bound the tree, which is why [`MAX_NODES`] exists.
 
 use std::collections::BTreeMap;
 
@@ -41,6 +42,20 @@ pub const MAX_DEPTH: usize = 64;
 pub const MAX_ATTRIBUTES: usize = 64;
 /// Maximum length of one attribute value, in bytes.
 pub const MAX_ATTR_VALUE_BYTES: usize = 64 * 1024;
+/// Maximum number of elements in one document.
+///
+/// `maxDocumentBytes` bounds the *bytes* read off the socket; it does not bound the DOM those
+/// bytes expand into. One `<a/>` costs four bytes on the wire and an [`XmlElem`] — a `String`
+/// name, a `BTreeMap`, a `String` text and a `Vec` — in memory, a 25–50× amplification. A 16 MiB
+/// document of millions of empty elements therefore stays inside the byte cap while consuming
+/// hundreds of megabytes of heap. Real MTConnect content (an observation carries identity
+/// attributes and a value) stays orders of magnitude below this ceiling.
+pub const MAX_NODES: usize = 250_000;
+
+/// The namespace-URI prefix every MTConnect schema version shares. A declaration that does not
+/// start with it is some other vocabulary (`xmlns:xsi`, a vendor extension) and carries no
+/// MTConnect version.
+const MTCONNECT_NS_PREFIX: &str = "urn:mtconnect.org:";
 
 /// The lowest MTConnect schema version this client parses.
 pub const MIN_VERSION: NsVersion = NsVersion { major: 1, minor: 3 };
@@ -84,8 +99,9 @@ impl XmlElem {
     }
 }
 
-/// A parsed document: its root element, the default-namespace version it declared (when any), and
-/// the count of general references that were **not** expanded (the XXE-inertness signal).
+/// A parsed document: its root element, the MTConnect schema version it declared (when any —
+/// default or prefixed declaration alike), and the count of general references that were **not**
+/// expanded (the XXE-inertness signal).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XmlDoc {
     pub root: XmlElem,
@@ -93,7 +109,7 @@ pub struct XmlDoc {
     pub unresolved_entities: u64,
 }
 
-/// An MTConnect schema version, taken from the default namespace URI.
+/// An MTConnect schema version, taken from the document's MTConnect namespace declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NsVersion {
     pub major: u16,
@@ -116,9 +132,13 @@ impl std::fmt::Display for NsVersion {
 }
 
 /// Extract the version from an MTConnect namespace URI
-/// (`urn:mtconnect.org:MTConnectDevices:1.3` → `1.3`). Returns `None` for anything else.
+/// (`urn:mtconnect.org:MTConnectDevices:1.3` → `1.3`). Returns `None` for anything else — including
+/// a colon-bearing URI from another vocabulary, which must never be read as an MTConnect version.
 #[must_use]
 pub fn parse_ns_version(uri: &str) -> Option<NsVersion> {
+    if !uri.starts_with(MTCONNECT_NS_PREFIX) {
+        return None;
+    }
     let tail = uri.rsplit(':').next()?;
     let mut parts = tail.split('.');
     let major = parts.next()?.parse().ok()?;
@@ -528,7 +548,7 @@ fn expect_root(root: &XmlElem, want: &str) -> Result<(), MtcError> {
 /// version and counting unexpanded general references.
 ///
 /// # Errors
-/// [`MtcError::Xml`] for malformed XML, an empty document, or a depth/attribute cap breach;
+/// [`MtcError::Xml`] for malformed XML, an empty document, or a depth/attribute/node cap breach;
 /// [`MtcError::UnsupportedVersion`] when the declared namespace version is below the 1.3 floor.
 pub fn parse_document(xml: &str) -> Result<XmlDoc, MtcError> {
     let mut reader = Reader::from_str(xml);
@@ -543,6 +563,9 @@ pub fn parse_document(xml: &str) -> Result<XmlDoc, MtcError> {
     let mut root: Option<XmlElem> = None;
     let mut ns_uri: Option<String> = None;
     let mut unresolved_entities = 0u64;
+    // A running total across the whole document, not a per-level count: the amplification
+    // [`MAX_NODES`] guards against is flat, not deep, and the depth cap already bounds nesting.
+    let mut nodes = 0usize;
 
     loop {
         match reader.read_event() {
@@ -552,6 +575,7 @@ pub fn parse_document(xml: &str) -> Result<XmlDoc, MtcError> {
                 push_element(
                     &mut stack,
                     element_from_start(&s, &mut ns_uri, &mut unresolved_entities)?,
+                    &mut nodes,
                 )?;
             }
             Ok(Event::Empty(s)) => {
@@ -559,6 +583,7 @@ pub fn parse_document(xml: &str) -> Result<XmlDoc, MtcError> {
                 push_element(
                     &mut stack,
                     element_from_start(&s, &mut ns_uri, &mut unresolved_entities)?,
+                    &mut nodes,
                 )?;
                 close_element(&mut stack, &mut root);
             }
@@ -620,11 +645,19 @@ pub fn parse_document(xml: &str) -> Result<XmlDoc, MtcError> {
     })
 }
 
-fn push_element(stack: &mut Vec<XmlElem>, elem: XmlElem) -> Result<(), MtcError> {
+fn push_element(
+    stack: &mut Vec<XmlElem>,
+    elem: XmlElem,
+    nodes: &mut usize,
+) -> Result<(), MtcError> {
     if stack.len() + 1 > MAX_DEPTH {
         return Err(MtcError::Xml(format!(
             "element nesting exceeds {MAX_DEPTH}"
         )));
+    }
+    *nodes += 1;
+    if *nodes > MAX_NODES {
+        return Err(MtcError::Xml(format!("element count exceeds {MAX_NODES}")));
     }
     stack.push(elem);
     Ok(())
@@ -669,7 +702,16 @@ fn element_from_start(
         }
         let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
         let value = unescape_inert(&String::from_utf8_lossy(&attr.value), unresolved_entities);
-        if key == "xmlns" && ns_uri.is_none() {
+        // The version floor must not be bypassable by writing the same declaration with a prefix.
+        // A DEFAULT declaration (`xmlns=`) and a PREFIXED one (`xmlns:m=`) are equally binding, and
+        // an agent that qualifies its elements — `<m:MTConnectStreams xmlns:m="…:1.1">` — is
+        // declaring exactly the version the floor exists to refuse. Foreign declarations
+        // (`xmlns:xsi=`, a vendor extension) are skipped rather than latched, so the FIRST
+        // MTConnect declaration wins wherever it appears in the attribute list.
+        if ns_uri.is_none()
+            && (key == "xmlns" || key.starts_with("xmlns:"))
+            && value.starts_with(MTCONNECT_NS_PREFIX)
+        {
             *ns_uri = Some(value.clone());
         }
         attrs.insert(key, value);
@@ -795,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prefixed_document_parses_by_local_name() {
+    fn a_prefixed_document_parses_by_local_name_and_still_declares_its_version() {
         let xml = r#"<m:MTConnectDevices xmlns:m="urn:mtconnect.org:MTConnectDevices:2.7">
               <m:Header instanceId="7" version="2.7.0.12" sender="agent"/>
               <m:Devices><m:Device uuid="U" name="N" id="d"/></m:Devices>
@@ -803,8 +845,73 @@ mod tests {
         let doc = parse_devices(xml).unwrap();
         assert_eq!(doc.header.instance_id, 7);
         assert_eq!(doc.devices[0].attr("uuid"), Some("U"));
-        // No default xmlns: no version captured, and the document still parses.
-        assert_eq!(doc.ns_version, None);
+        // A PREFIXED declaration binds exactly as a default one does: the version is captured, so
+        // the 1.3 floor cannot be bypassed by qualifying the elements.
+        assert_eq!(doc.ns_version, Some(NsVersion { major: 2, minor: 7 }));
+    }
+
+    #[test]
+    fn a_prefixed_declaration_below_the_floor_is_refused_like_a_default_one() {
+        // The C-4 regression: `xmlns:m=` used to leave `ns_version` unset, and the floor check only
+        // fires on a version it has — so a 1.1 document walked straight through.
+        let old = r#"<m:MTConnectDevices xmlns:m="urn:mtconnect.org:MTConnectDevices:1.1">
+              <m:Header instanceId="1"/>
+              <m:Devices><m:Device uuid="U" name="N" id="d"/></m:Devices>
+            </m:MTConnectDevices>"#;
+        assert!(matches!(parse_devices(old), Err(MtcError::UnsupportedVersion(v)) if v == "1.1"));
+
+        // Streams and Errors documents go through the same tokenizer, so they inherit the fix.
+        let streams = r#"<m:MTConnectStreams xmlns:m="urn:mtconnect.org:MTConnectStreams:1.2">
+              <m:Header instanceId="1"/><m:Streams/>
+            </m:MTConnectStreams>"#;
+        assert!(matches!(
+            parse_streams(streams),
+            Err(MtcError::UnsupportedVersion(_))
+        ));
+    }
+
+    #[test]
+    fn the_first_mtconnect_declaration_wins_over_foreign_namespaces() {
+        // A real agent declares the schema-instance namespace first. Latching the first `xmlns:*`
+        // of ANY vocabulary would read `2001/XMLSchema-instance` as the MTConnect version.
+        let xml = r#"<MTConnectDevices xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                xmlns="urn:mtconnect.org:MTConnectDevices:2.7"
+                xsi:schemaLocation="urn:mtconnect.org:MTConnectDevices:2.7 MTConnectDevices_2.7.xsd">
+              <Header instanceId="1"/><Devices><Device uuid="U" name="N" id="d"/></Devices>
+            </MTConnectDevices>"#;
+        let doc = parse_devices(xml).unwrap();
+        assert_eq!(doc.ns_version, Some(NsVersion { major: 2, minor: 7 }));
+
+        // A document that declares NO MTConnect namespace still parses, with no version — agents in
+        // the wild do emit namespace-less documents.
+        let bare = r#"<MTConnectDevices xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+              <Header instanceId="1"/><Devices><Device uuid="U" name="N" id="d"/></Devices>
+            </MTConnectDevices>"#;
+        assert_eq!(parse_devices(bare).unwrap().ns_version, None);
+    }
+
+    #[test]
+    fn the_node_cap_bounds_the_tree_a_document_of_legal_size_can_build() {
+        // C-5: `maxDocumentBytes` bounds the wire, not the DOM. Four bytes per element on the wire
+        // becomes an XmlElem in memory, so the byte cap alone lets a document of empty elements
+        // amplify 25-50x. The node cap is what makes the tree bounded.
+        let flat = format!("<r>{}</r>", "<a/>".repeat(MAX_NODES));
+        let err = parse_document(&flat).expect_err("the node cap refuses it");
+        assert!(
+            matches!(&err, MtcError::Xml(m) if m.contains("element count exceeds")),
+            "got {err:?}"
+        );
+
+        // Exactly at the cap is fine: the refusal is for exceeding it, not reaching it.
+        let at_cap = format!("<r>{}</r>", "<a/>".repeat(MAX_NODES - 1));
+        assert_eq!(
+            parse_document(&at_cap).unwrap().root.children.len(),
+            MAX_NODES - 1
+        );
+
+        // A realistic document is orders of magnitude below the ceiling.
+        assert!(parse_devices(DEVICES_2_7).is_ok());
+        assert!(parse_streams(CURRENT_2_7).is_ok());
     }
 
     #[test]
@@ -1040,6 +1147,13 @@ mod tests {
         );
         assert_eq!(parse_ns_version("http://example.com/ns"), None);
         assert_eq!(parse_ns_version("urn:x:y:not-a-version"), None);
+        // Only an MTConnect URN carries an MTConnect version: an arbitrary colon-bearing URI whose
+        // tail happens to look numeric is not one.
+        assert_eq!(parse_ns_version("urn:example:thing:2.7"), None);
+        assert_eq!(
+            parse_ns_version("http://www.w3.org/2001/XMLSchema-instance"),
+            None
+        );
     }
 
     #[test]

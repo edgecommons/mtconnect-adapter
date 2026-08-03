@@ -111,14 +111,20 @@ impl MtcError {
 }
 
 /// A parse-side counter bag the runtime folds into the `MtconnectParse` metric family: how many
-/// documents parsed, how many failed, and how many elements the parser did not recognize (the
+/// documents parsed, how many failed, how many elements the parser did not recognize (the
 /// forward-compatibility signal — a 2.8 agent talking to a 2.7-aware parser shows up here rather
-/// than as silent data loss).
+/// than as silent data loss), and how many observation elements were refused because a required
+/// MTConnect field was missing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParseCounters {
     pub documents_parsed: u64,
     pub parse_errors: u64,
     pub unknown_elements: u64,
+    /// Observation elements refused for a missing required field (`dataItemId`, `sequence`,
+    /// `timestamp`) — data the agent sent and this client would not publish. Its own measure
+    /// (D-R11) because it is neither a parse failure (the document parsed) nor an unknown element
+    /// (the element was understood), and silently defaulting it is what C-3 was.
+    pub rejected_observations: u64,
 }
 
 impl ParseCounters {
@@ -130,14 +136,22 @@ impl ParseCounters {
     pub fn record_err(&mut self) {
         self.parse_errors += 1;
     }
+
+    /// One observation element refused (see [`super::observations::DecodeReject`]).
+    pub fn record_rejected(&mut self) {
+        self.rejected_observations += 1;
+    }
 }
 
 impl fmt::Display for ParseCounters {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "parsed={} errors={} unknown={}",
-            self.documents_parsed, self.parse_errors, self.unknown_elements
+            "parsed={} errors={} unknown={} rejected={}",
+            self.documents_parsed,
+            self.parse_errors,
+            self.unknown_elements,
+            self.rejected_observations
         )
     }
 }
@@ -211,19 +225,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_counters_accumulate_documents_errors_and_unknown_elements() {
+    fn parse_counters_accumulate_documents_errors_unknown_elements_and_rejects() {
         let mut c = ParseCounters::default();
         c.record_ok(2);
         c.record_ok(0);
         c.record_err();
+        c.record_rejected();
+        c.record_rejected();
+        c.record_rejected();
         assert_eq!(
             c,
             ParseCounters {
                 documents_parsed: 2,
                 parse_errors: 1,
-                unknown_elements: 2
+                unknown_elements: 2,
+                rejected_observations: 3,
             }
         );
-        assert_eq!(c.to_string(), "parsed=2 errors=1 unknown=2");
+        // A refused observation is its own count: the document still parsed.
+        assert_eq!(c.to_string(), "parsed=2 errors=1 unknown=2 rejected=3");
     }
 }

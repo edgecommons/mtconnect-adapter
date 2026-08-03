@@ -99,6 +99,8 @@ pub struct Observation {
     pub timestamp: String,
     pub value: ObsValue,
     /// Additive protocol fields, in a stable order: `resetTriggered`, `duration`, `nativeCode`, …
+    /// for an ordinary observation; `conditionId`, `nativeCode`, `nativeSeverity`, `qualifier`,
+    /// `conditionText` for a condition transition.
     pub extras: SmallVec<[(&'static str, Value); 4]>,
     /// The observation element's local name (`Position`, `Fault`, …).
     pub element: String,
@@ -135,23 +137,67 @@ impl Observation {
     }
 }
 
+/// Why an observation element could not be decoded.
+///
+/// MTConnect makes `dataItemId`, `sequence` and `timestamp` **required** on every observation, and
+/// the client refuses rather than invents: a defaulted `sequence: 0` publishes as a GOOD reading
+/// and is then suppressed forever by the per-data-item dedupe floor, and a defaulted empty
+/// timestamp publishes a value with no capture time. A reject is dropped and counted
+/// ([`super::ParseCounters::rejected_observations`]), never degraded (D-R10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeReject {
+    /// No `dataItemId`: nothing identifies what was observed.
+    MissingDataItemId,
+    /// `sequence` absent, unparsable, or zero — MTConnect sequence numbers start at 1.
+    MissingSequence,
+    /// `timestamp` absent or empty. Only PRESENCE is checked: the string rides verbatim, because
+    /// real agents vary in their RFC3339 spelling and refusing a variant would lose real data.
+    MissingTimestamp,
+}
+
+impl DecodeReject {
+    /// The stable, low-cardinality reason for a log line.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingDataItemId => "missing dataItemId",
+            Self::MissingSequence => "missing or invalid sequence",
+            Self::MissingTimestamp => "missing timestamp",
+        }
+    }
+}
+
 /// Decode one stream entry against the device model.
 ///
 /// `meta` is the data item's probe metadata when the model knows it; an observation for a data item
 /// the model does not carry still decodes (a stream may run ahead of a re-probe) — it is simply
 /// decoded conservatively, as text.
 ///
-/// Returns `None` only when the element carries no `dataItemId`, which is the one thing that makes
-/// an observation unusable.
-#[must_use]
-pub fn decode(entry: &StreamEntry, meta: Option<&DataItemMeta>) -> Option<Observation> {
+/// # Errors
+/// [`DecodeReject`] when a **required** MTConnect field is absent or unusable. Every other
+/// tolerance stays: an unmodelled data item, an unknown condition state and an empty value all
+/// decode.
+pub fn decode(
+    entry: &StreamEntry,
+    meta: Option<&DataItemMeta>,
+) -> Result<Observation, DecodeReject> {
     let elem = &entry.elem;
-    let data_item_id = elem.attr("dataItemId")?.to_string();
-    let sequence = elem
+    let data_item_id = elem
+        .attr("dataItemId")
+        .ok_or(DecodeReject::MissingDataItemId)?
+        .to_string();
+    let sequence = match elem
         .attr("sequence")
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    let timestamp = elem.attr("timestamp").unwrap_or_default().to_string();
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        Some(sequence) if sequence >= 1 => sequence,
+        _ => return Err(DecodeReject::MissingSequence),
+    };
+    // Presence only — the value is passed through exactly as the agent wrote it.
+    let timestamp = match elem.attr("timestamp") {
+        Some(ts) if !ts.trim().is_empty() => ts.to_string(),
+        _ => return Err(DecodeReject::MissingTimestamp),
+    };
     let repr = meta.map_or_else(
         || {
             elem.attr("representation")
@@ -166,6 +212,9 @@ pub fn decode(entry: &StreamEntry, meta: Option<&DataItemMeta>) -> Option<Observ
         Category::Condition => {
             let state = CondState::parse(&elem.name).unwrap_or(CondState::Unavailable);
             for (attr, key) in [
+                // `conditionId` FIRST: it is the activation identity that lets one data item carry
+                // several concurrent conditions, so it leads the condition extras.
+                ("conditionId", "conditionId"),
                 ("nativeCode", "nativeCode"),
                 ("nativeSeverity", "nativeSeverity"),
                 ("qualifier", "qualifier"),
@@ -195,7 +244,7 @@ pub fn decode(entry: &StreamEntry, meta: Option<&DataItemMeta>) -> Option<Observ
         }
     };
 
-    Some(Observation {
+    Ok(Observation {
         data_item_id,
         sequence,
         timestamp,
@@ -351,8 +400,35 @@ mod tests {
         cnc_stream()
             .entries
             .iter()
-            .filter_map(|e| decode(e, m.item(e.elem.attr("dataItemId").unwrap_or_default())))
+            .filter_map(|e| decode(e, m.item(e.elem.attr("dataItemId").unwrap_or_default())).ok())
             .collect()
+    }
+
+    /// One observation element with the required identity fields present, so a test can vary the
+    /// one thing it is about.
+    fn entry(name: &str, attrs: &[(&str, &str)], text: &str, category: Category) -> StreamEntry {
+        let mut elem = XmlElem {
+            name: name.into(),
+            text: text.into(),
+            ..XmlElem::default()
+        };
+        for (k, v) in attrs {
+            elem.attrs.insert((*k).into(), (*v).into());
+        }
+        StreamEntry {
+            category,
+            elem,
+            component: None,
+        }
+    }
+
+    /// The three required fields, present and valid.
+    fn required() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("dataItemId", "execution"),
+            ("sequence", "12"),
+            ("timestamp", "2026-07-27T10:00:00Z"),
+        ]
     }
 
     fn by_id(obs: &[Observation], id: &str) -> Observation {
@@ -536,38 +612,107 @@ mod tests {
     }
 
     #[test]
-    fn an_element_without_a_data_item_id_is_the_one_undecodable_case() {
-        let entry = StreamEntry {
-            category: Category::Event,
-            elem: XmlElem {
-                name: "Availability".into(),
-                ..XmlElem::default()
-            },
-            component: None,
-        };
-        assert!(decode(&entry, None).is_none());
+    fn an_element_without_a_data_item_id_is_refused() {
+        let e = entry("Availability", &[], "", Category::Event);
+        assert_eq!(decode(&e, None), Err(DecodeReject::MissingDataItemId));
     }
 
     #[test]
-    fn a_missing_sequence_or_timestamp_degrades_rather_than_dropping_the_value() {
-        let mut elem = XmlElem {
-            name: "Execution".into(),
-            ..XmlElem::default()
+    fn a_missing_required_field_rejects_the_observation_rather_than_defaulting_it() {
+        // C-3. `sequence` and `timestamp` are REQUIRED by MTConnect. Defaulting them (`0` / `""`)
+        // published a GOOD reading with no capture time whose sequence-0 floor then suppressed
+        // every genuine observation of that data item. A reject is dropped and counted instead.
+        let with = |attrs: &[(&str, &str)]| {
+            decode(&entry("Execution", attrs, "READY", Category::Event), None)
         };
-        elem.attrs.insert("dataItemId".into(), "execution".into());
-        elem.text = "READY".into();
+
+        // The healthy baseline: all three present, and the value survives.
+        let ok = with(&required()).expect("a complete observation decodes");
+        assert_eq!(ok.sequence, 12);
+        assert_eq!(ok.timestamp, "2026-07-27T10:00:00Z");
+        assert_eq!(ok.value, ObsValue::Scalar(json!("READY")));
+
+        // sequence: absent, unparsable, and zero are all the same refusal — MTConnect sequence
+        // numbers start at 1.
+        let no_seq: Vec<(&str, &str)> = required()
+            .into_iter()
+            .filter(|(k, _)| *k != "sequence")
+            .collect();
+        assert_eq!(with(&no_seq), Err(DecodeReject::MissingSequence));
+        for bad in ["0", "", "  ", "-1", "later", "3.5"] {
+            let mut attrs = no_seq.clone();
+            attrs.push(("sequence", bad));
+            assert_eq!(
+                with(&attrs),
+                Err(DecodeReject::MissingSequence),
+                "sequence `{bad}` is not a sequence"
+            );
+        }
+
+        // timestamp: absent or blank is a refusal; the FORMAT is not judged — a real agent's
+        // spelling variants ride through verbatim (D-R10).
+        let no_ts: Vec<(&str, &str)> = required()
+            .into_iter()
+            .filter(|(k, _)| *k != "timestamp")
+            .collect();
+        assert_eq!(with(&no_ts), Err(DecodeReject::MissingTimestamp));
+        for blank in ["", "   "] {
+            let mut attrs = no_ts.clone();
+            attrs.push(("timestamp", blank));
+            assert_eq!(with(&attrs), Err(DecodeReject::MissingTimestamp));
+        }
+        for odd in [
+            "2026-07-27T10:00:00.123456Z",
+            "2026-07-27T10:00:00+02:00",
+            "2026-07-27 10:00:00",
+        ] {
+            let mut attrs = no_ts.clone();
+            attrs.push(("timestamp", odd));
+            assert_eq!(
+                with(&attrs).expect("presence, not format").timestamp,
+                odd,
+                "the agent's stamp rides verbatim"
+            );
+        }
+
+        // The reasons are stable, low-cardinality strings for the debug log.
+        assert_eq!(
+            DecodeReject::MissingDataItemId.as_str(),
+            "missing dataItemId"
+        );
+        assert_eq!(
+            DecodeReject::MissingSequence.as_str(),
+            "missing or invalid sequence"
+        );
+        assert_eq!(DecodeReject::MissingTimestamp.as_str(), "missing timestamp");
+    }
+
+    #[test]
+    fn a_condition_carries_its_activation_identity_as_an_extra() {
+        // P1-3's wire half: `conditionId` is what identifies ONE activation across its transitions,
+        // so it must reach the sample's extras (D-R8).
+        let mut attrs = required();
+        attrs.push(("conditionId", "act-7"));
+        attrs.push(("nativeCode", "ALM-1041"));
         let o = decode(
-            &StreamEntry {
-                category: Category::Event,
-                elem,
-                component: None,
-            },
+            &entry("Fault", &attrs, "spindle overheat", Category::Condition),
             None,
         )
         .unwrap();
-        assert_eq!(o.sequence, 0);
-        assert_eq!(o.timestamp, "");
-        assert_eq!(o.value, ObsValue::Scalar(json!("READY")));
+        assert_eq!(o.extra("conditionId"), Some(&json!("act-7")));
+        assert_eq!(o.extra("nativeCode"), Some(&json!("ALM-1041")));
+        assert_eq!(o.extra("conditionText"), Some(&json!("spindle overheat")));
+        // The identity leads the condition extras, so their order stays stable.
+        let keys: Vec<&str> = o.extras.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec!["conditionId", "nativeCode", "conditionText"]);
+
+        // An agent that sends no conditionId carries none — the ledger falls back to nativeCode.
+        let o = decode(
+            &entry("Warning", &required(), "", Category::Condition),
+            None,
+        )
+        .unwrap();
+        assert_eq!(o.extra("conditionId"), None);
     }
 
     #[test]
@@ -590,20 +735,9 @@ mod tests {
 
         // An unrecognized condition element is treated as Unavailable, never as Normal: a state
         // this client cannot read must not look healthy.
-        let mut elem = XmlElem {
-            name: "Whatever".into(),
-            ..XmlElem::default()
-        };
-        elem.attrs.insert("dataItemId".into(), "c1".into());
-        let o = decode(
-            &StreamEntry {
-                category: Category::Condition,
-                elem,
-                component: None,
-            },
-            None,
-        )
-        .unwrap();
+        let mut attrs = required();
+        attrs[0] = ("dataItemId", "c1");
+        let o = decode(&entry("Whatever", &attrs, "", Category::Condition), None).unwrap();
         assert_eq!(o.value, ObsValue::Condition(CondState::Unavailable));
         assert!(o.is_unavailable());
     }

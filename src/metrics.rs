@@ -261,6 +261,8 @@ pub fn family_defs() -> Vec<FamilyDef> {
     let mut parse = Vec::new();
     parse.extend(pair_defs("documentsParsed"));
     parse.extend(pair_defs("parseErrors"));
+    // Observations the agent sent and this client refused for a missing required field (D-R11).
+    parse.extend(pair_defs("rejectedObservations"));
     out.push(FamilyDef {
         name: PARSE.to_string(),
         dimensions: dims(&["instance", "result"]),
@@ -529,6 +531,7 @@ pub fn parse_values(
             previous.documents_parsed,
         );
         pair_values(&mut v, "parseErrors", 0, 0);
+        pair_values(&mut v, "rejectedObservations", 0, 0);
     } else {
         pair_values(&mut v, "documentsParsed", 0, 0);
         pair_values(
@@ -536,6 +539,14 @@ pub fn parse_values(
             "parseErrors",
             total.parse_errors,
             previous.parse_errors,
+        );
+        // A refused observation is a decode FAILURE even though its document parsed, so it belongs
+        // in the failure cell beside the parse errors.
+        pair_values(
+            &mut v,
+            "rejectedObservations",
+            total.rejected_observations,
+            previous.rejected_observations,
         );
     }
     v
@@ -1450,7 +1461,8 @@ mod tests {
             ]
         );
 
-        // | MtconnectParse | instance, result | documentsParsed, parseErrors |
+        // | MtconnectParse | instance, result | documentsParsed, parseErrors,
+        //                                       rejectedObservations (D-R11) |
         let parse = by_name("MtconnectParse");
         assert_eq!(parse.dimensions, vec!["instance", "result"]);
         let names: Vec<&str> = parse.measures.iter().map(|m| m.name.as_str()).collect();
@@ -1460,7 +1472,9 @@ mod tests {
                 "documentsParsedTotal",
                 "documentsParsedInterval",
                 "parseErrorsTotal",
-                "parseErrorsInterval"
+                "parseErrorsInterval",
+                "rejectedObservationsTotal",
+                "rejectedObservationsInterval"
             ]
         );
 
@@ -1559,26 +1573,46 @@ mod tests {
             documents_parsed: 9,
             parse_errors: 2,
             unknown_elements: 4,
+            rejected_observations: 5,
         };
         let before = ParseCounters {
             documents_parsed: 9,
             parse_errors: 1,
             unknown_elements: 0,
+            rejected_observations: 2,
         };
         let ok = parse_values(&parsed, &before, RESULT_SUCCESS);
         assert_eq!(
             (ok["documentsParsedTotal"], ok["documentsParsedInterval"]),
             (9.0, 0.0)
         );
+        assert_eq!(
+            (
+                ok["rejectedObservationsTotal"],
+                ok["rejectedObservationsInterval"]
+            ),
+            (0.0, 0.0),
+            "a refused observation is not a success"
+        );
         let err = parse_values(&parsed, &before, RESULT_ERROR);
         assert_eq!(
             (err["parseErrorsTotal"], err["parseErrorsInterval"]),
             (2.0, 1.0)
         );
+        // D-R11: observations the agent sent and this client refused, in the failure cell — the
+        // document parsed, so `parseErrors` would have been the wrong home for them.
+        assert_eq!(
+            (
+                err["rejectedObservationsTotal"],
+                err["rejectedObservationsInterval"]
+            ),
+            (5.0, 3.0)
+        );
 
         // A source that somehow reports less than last time yields 0, never a negative interval.
         let backwards = parse_values(&before, &parsed, RESULT_ERROR);
         assert_eq!(backwards["parseErrorsInterval"], 0.0);
+        assert_eq!(backwards["rejectedObservationsInterval"], 0.0);
     }
 
     #[tokio::test]
@@ -1626,13 +1660,15 @@ mod tests {
         dm.define_all();
         agent.parse.lock().unwrap().record_ok(0);
         agent.parse.lock().unwrap().record_err();
+        agent.parse.lock().unwrap().record_rejected();
         dm.emit_periodic().await;
         assert_eq!(
             dm.inner.lock().unwrap().previous_parse,
             ParseCounters {
                 documents_parsed: 1,
                 parse_errors: 1,
-                unknown_elements: 0
+                unknown_elements: 0,
+                rejected_observations: 1,
             },
             "the emit advanced this instance's own baseline"
         );

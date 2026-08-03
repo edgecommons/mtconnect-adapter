@@ -58,7 +58,7 @@ pub mod stream;
 pub mod xml;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -76,7 +76,7 @@ pub use config::{
 };
 pub use error::{MtcError, ParseCounters};
 pub use model::{BrowseNode, Category, DataItemMeta, DeviceNode, NodeKind, ProbeModel, Repr};
-pub use observations::{CondState, ObsValue, Observation};
+pub use observations::{CondState, DecodeReject, ObsValue, Observation};
 pub use selection::{
     served_set, ChannelBudget, DerivedChannel, Matcher, Provenance, SelectionConfig, SelectionMode,
     ServedSet, ServedSignal,
@@ -101,6 +101,12 @@ pub const CRITICAL_SEND_BUDGET: Duration = Duration::from_secs(5);
 /// How often one instance's queue-drop warning may repeat. A lagging consumer loses events in
 /// bursts; the counters carry the volume, so the log only has to say *that* it is happening.
 pub const DROP_WARN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Consecutive `/current` cycles answered with an `MTConnectErrors` document before the agent is
+/// marked down (D-R9). An error document proves the agent is *reachable* and answering, so one is
+/// not a link failure — but an agent that keeps refusing is not delivering either, and the fleet
+/// must not see a signal held GOOD forever behind a persistent refusal.
+pub const CURRENT_ERROR_DOWN_STREAK: u32 = 3;
 
 /// The `interval=` a streaming request asks the agent for. The LLD (§14 Q2) floors the interval at
 /// 250 ms; per-signal publish cadences below that are shaped client-side by the publish policy.
@@ -530,6 +536,10 @@ pub struct AgentRuntime {
     /// Ladder 3: the agent restarted, so every attached device must be re-probed before its model
     /// is trusted again.
     resync_needed: AtomicBool,
+    /// Consecutive `/current` cycles that came back as an `MTConnectErrors` document; reset by any
+    /// cycle that yields a Streams document. At [`CURRENT_ERROR_DOWN_STREAK`] the agent is marked
+    /// down (D-R9).
+    consecutive_current_errors: AtomicU32,
     /// Whether a multipart stream is currently established — what `sb/status` reports as `mode`.
     streaming_active: AtomicBool,
     /// Devices attached since the last service pass. A live stream carries only *changes*, so a
@@ -597,6 +607,7 @@ impl AgentRuntime {
             epoch: Instant::now(),
             task_started: AtomicBool::new(false),
             resync_needed: AtomicBool::new(false),
+            consecutive_current_errors: AtomicU32::new(0),
             streaming_active: AtomicBool::new(false),
             attach_pending: Mutex::new(Vec::new()),
             attach_notify: Notify::new(),
@@ -937,8 +948,15 @@ impl AgentRuntime {
         republish_all: bool,
         re_baseline: bool,
     ) -> Result<PollReport, MtcError> {
-        let doc = match xml::parse_streams(text) {
+        let doc = match self.parse_current(text) {
             Ok(doc) => doc,
+            Err(error @ MtcError::AgentError { .. }) => {
+                // The agent ANSWERED — with a refusal. The document parsed, so this is not a parse
+                // failure and not, by itself, a dead link (D-R9).
+                self.parse.lock().expect("parse counters").record_ok(0);
+                self.note_current_error(&error).await;
+                return Err(error);
+            }
             Err(e) => {
                 self.parse.lock().expect("parse counters").record_err();
                 self.stats.record_document_failed();
@@ -953,6 +971,53 @@ impl AgentRuntime {
         Ok(self
             .ingest_streams_doc(&doc, republish_all, re_baseline)
             .await)
+    }
+
+    /// Read a `/current` body, which is **not** guaranteed to be a Streams document: an agent may
+    /// answer HTTP 200 with an `MTConnectErrors` document (`UNAUTHORIZED`, `INVALID_REQUEST`,
+    /// `TOO_MANY`, …). That is a protocol answer with a code an operator can act on — LLD §9's
+    /// `MTC_AGENT_ERROR:<code>` — not the generic "xml error" a wrong-root check produces.
+    ///
+    /// The streaming reader has always classified its parts this way (`stream::classify_part`);
+    /// this is the same rule for the request/response half.
+    ///
+    /// # Errors
+    /// [`MtcError::AgentError`] for an error document, [`MtcError::Xml`] for anything else that is
+    /// not a Streams document, plus any tokenizer error.
+    fn parse_current(&self, text: &str) -> Result<xml::StreamsDoc, MtcError> {
+        let doc = xml::parse_document(text)?;
+        match xml::document_kind(&doc.root.name) {
+            xml::DocKind::Streams => xml::streams_from_doc(doc),
+            xml::DocKind::Errors => {
+                let errs = xml::errors_from_doc(doc)?;
+                let first = errs.errors.first();
+                Err(MtcError::AgentError {
+                    code: first.map_or_else(|| "UNKNOWN".into(), |e| e.code.clone()),
+                    message: first.map_or_else(String::new, |e| e.message.clone()),
+                })
+            }
+            _ => Err(MtcError::Xml(format!(
+                "expected MTConnectStreams from /current, got `{}`",
+                doc.root.name
+            ))),
+        }
+    }
+
+    /// Count one `/current` cycle that came back as an error document, and mark the agent down once
+    /// the refusals are persistent (D-R9). Reachable-but-useless degrades through staleness first
+    /// and connectivity second, in that order — a single `INVALID_REQUEST` never flaps the link.
+    async fn note_current_error(&self, error: &MtcError) {
+        let streak = self
+            .consecutive_current_errors
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        tracing::warn!(
+            agent = %self.cfg.id, code = error.code(), streak,
+            "the agent answered /current with an error document"
+        );
+        if streak >= CURRENT_ERROR_DOWN_STREAK {
+            self.mark_down(error).await;
+        }
     }
 
     /// Fold one already-parsed Streams document into the runtime: sequence header, dedupe,
@@ -1014,8 +1079,12 @@ impl AgentRuntime {
                     .elem
                     .attr("dataItemId")
                     .and_then(|id| model.as_ref().and_then(|m| m.item(id).cloned()));
-                let Some(obs) = observations::decode(entry, meta.as_ref()) else {
-                    continue;
+                let obs = match observations::decode(entry, meta.as_ref()) {
+                    Ok(obs) => obs,
+                    Err(reject) => {
+                        self.record_rejected_observation(&ds.uuid, entry, reject);
+                        continue;
+                    }
                 };
                 report.observations += 1;
                 if deferred {
@@ -1089,6 +1158,9 @@ impl AgentRuntime {
     /// answers, a cached model, or a served command read are none of them proof of delivery.
     async fn mark_up(&self, facts: impl FnOnce(&mut AgentInfo)) {
         self.touch_liveness();
+        // The agent delivered a Streams document, so it is not persistently refusing: any run of
+        // `/current` error documents ends here (D-R9).
+        self.consecutive_current_errors.store(0, Ordering::Relaxed);
         let was_down = !self.info().connected;
         self.update_info(|info| {
             info.connected = true;
@@ -1121,8 +1193,15 @@ impl AgentRuntime {
                 return Err(e);
             }
         };
-        let doc = match xml::parse_streams(&text) {
+        let doc = match self.parse_current(&text) {
             Ok(doc) => doc,
+            Err(error @ MtcError::AgentError { .. }) => {
+                // The agent answered a served read with a refusal: parsed OK, vouches for no
+                // currency, and never writes `connected` — a command path is not the acquisition
+                // path (D-R5/D-R9). It surfaces to the caller as `MTC_AGENT_ERROR:<code>`.
+                self.parse.lock().expect("parse counters").record_ok(0);
+                return Err(error);
+            }
             Err(e) => {
                 self.parse.lock().expect("parse counters").record_err();
                 self.stats.record_document_failed();
@@ -1150,11 +1229,33 @@ impl AgentRuntime {
                 continue;
             }
             let meta = model.as_ref().and_then(|m| m.item(id).cloned());
-            if let Some(obs) = observations::decode(entry, meta.as_ref()) {
-                out.push(obs);
+            match observations::decode(entry, meta.as_ref()) {
+                Ok(obs) => out.push(obs),
+                Err(reject) => self.record_rejected_observation(device_uuid, entry, reject),
             }
         }
         Ok(out)
+    }
+
+    /// One observation element the agent sent and this client refused: counted into the
+    /// `MtconnectParse` family (D-R11) and logged at `debug!`. Never published, never defaulted —
+    /// a missing `sequence` or `timestamp` is missing, and inventing one would publish a GOOD
+    /// reading whose zero floor then suppressed every real observation of that data item (C-3).
+    fn record_rejected_observation(
+        &self,
+        device_uuid: &str,
+        entry: &xml::StreamEntry,
+        reject: observations::DecodeReject,
+    ) {
+        self.parse.lock().expect("parse counters").record_rejected();
+        tracing::debug!(
+            agent = %self.cfg.id,
+            device = %device_uuid,
+            element = %entry.elem.name,
+            data_item_id = entry.elem.attr("dataItemId").unwrap_or("<none>"),
+            reason = reject.as_str(),
+            "observation refused: a required MTConnect field is missing"
+        );
     }
 
     /// The control-channel form of [`Self::snapshot`] — how command verbs read, so a read
@@ -3249,6 +3350,219 @@ mod tests {
         // dataItemIds are unique per device, not per agent: two devices may both have `avail`.
         assert_ne!(dedupe_key("A", "avail"), dedupe_key("B", "avail"));
         assert_eq!(dedupe_key("A", "avail"), dedupe_key("A", "avail"));
+    }
+
+    // =============================================================================================
+    // MTConnect semantics: `/current` error documents (C-2) and required fields (C-3)
+    // =============================================================================================
+
+    /// An `MTConnectErrors` document, as an agent answers a request it will not serve — HTTP 200,
+    /// a well-formed document, and a code the operator can act on.
+    fn errors_doc(code: &str, message: &str) -> String {
+        format!(
+            r#"<MTConnectErrors xmlns="urn:mtconnect.org:MTConnectError:2.7">
+                 <Header instanceId="1749000000" sender="mtc-agent" version="2.7.0.12"/>
+                 <Errors><Error errorCode="{code}">{message}</Error></Errors>
+               </MTConnectErrors>"#
+        )
+    }
+
+    #[tokio::test]
+    async fn a_current_error_document_is_the_agents_own_code_not_a_parse_failure() {
+        // C-2. `/current` is not guaranteed to answer with a Streams document: an agent may serve
+        // an `MTConnectErrors` document with HTTP 200. Reading it as "xml error" threw away the
+        // code the operator needs and mislabelled a protocol answer as a broken agent.
+        let (rt, docs) = agent_backed_runtime_with_docs().await;
+        let _h = rt.attach("OKUMA.123456");
+        docs.set_current(&errors_doc("UNAUTHORIZED", "not permitted"));
+
+        let err = rt.poll_once().await.expect_err("the agent refused");
+        assert!(
+            matches!(&err, MtcError::AgentError { code, message }
+                     if code == "UNAUTHORIZED" && message == "not permitted"),
+            "{err:?}"
+        );
+        // LLD §9: this is what `sb/read` renders as `MTC_AGENT_ERROR:<code>`.
+        assert_eq!(err.code(), "UNAUTHORIZED");
+        assert_eq!(err.to_string(), "agent error UNAUTHORIZED: not permitted");
+
+        // The document PARSED — the agent answered. Counting it as a parse error would have
+        // blamed the parser for a decision the agent made.
+        let counters = rt.parse_counters();
+        assert_eq!(counters.parse_errors, 0);
+        assert_eq!(counters.documents_parsed, 1);
+
+        // A body that is neither Streams nor Errors is still a parse failure, with the root named.
+        docs.set_current(DEVICES_2_7);
+        let err = rt.poll_once().await.expect_err("wrong document type");
+        assert!(
+            matches!(&err, MtcError::Xml(m) if m.contains("MTConnectDevices")),
+            "{err:?}"
+        );
+        assert_eq!(rt.parse_counters().parse_errors, 1);
+    }
+
+    #[tokio::test]
+    async fn only_a_persistently_erroring_agent_is_marked_down() {
+        // D-R9: reachable-but-useless degrades through staleness first and connectivity second. One
+        // refusal proves the agent is alive and answering; a run of them proves it is not
+        // delivering.
+        let (rt, docs) = agent_backed_runtime_with_docs().await;
+        let _h = rt.attach("OKUMA.123456");
+        rt.poll_once().await.expect("a good cycle");
+        assert!(rt.info().connected);
+
+        docs.set_current(&errors_doc("TOO_MANY", "too many requests"));
+        for cycle in 1..CURRENT_ERROR_DOWN_STREAK {
+            rt.poll_once().await.expect_err("refused");
+            assert!(
+                rt.info().connected,
+                "refusal {cycle} of {CURRENT_ERROR_DOWN_STREAK} is not a dead link"
+            );
+        }
+        rt.poll_once().await.expect_err("refused");
+        assert!(
+            !rt.info().connected,
+            "the third consecutive refusal marks the agent down"
+        );
+        assert!(
+            rt.last_down_reason().contains("TOO_MANY"),
+            "{}",
+            rt.last_down_reason()
+        );
+
+        // A cycle that yields a Streams document ends the run — the next refusal starts over.
+        docs.set_current(CURRENT_2_7);
+        rt.poll_once().await.expect("the agent is serving again");
+        assert!(rt.info().connected);
+        docs.set_current(&errors_doc("TOO_MANY", "too many requests"));
+        rt.poll_once().await.expect_err("refused");
+        assert!(rt.info().connected, "the streak restarted from zero");
+    }
+
+    #[tokio::test]
+    async fn a_served_read_reports_the_agent_error_and_vouches_for_nothing() {
+        // The `sb/read` half of C-2. A command path never writes `connected` (D-R5), and an error
+        // document vouches for no data currency (D-R9), so neither moves.
+        let (rt, docs) = agent_backed_runtime_with_docs().await;
+        let _h = rt.attach("OKUMA.123456");
+        rt.poll_once().await.expect("a good cycle");
+        // A FIXED instant, so the comparison is about `last_liveness` moving, not the clock.
+        let at = Instant::now() + Duration::from_secs(10);
+        let liveness_before = rt.liveness_age(at);
+
+        docs.set_current(&errors_doc("INVALID_REQUEST", "no such device"));
+        let err = rt
+            .snapshot("OKUMA.123456", &[])
+            .await
+            .expect_err("the agent refused");
+        assert_eq!(err.code(), "INVALID_REQUEST");
+        assert!(
+            rt.info().connected,
+            "a served read is not the link authority"
+        );
+        assert_eq!(
+            rt.liveness_age(at),
+            liveness_before,
+            "an error document proves nothing about data currency"
+        );
+        assert_eq!(rt.parse_counters().parse_errors, 0, "it parsed");
+    }
+
+    /// A Streams document with one complete observation and two that omit a required field.
+    fn document_with_incomplete_observations() -> String {
+        r#"<MTConnectStreams xmlns="urn:mtconnect.org:MTConnectStreams:2.7">
+             <Header instanceId="1749000000" nextSequence="80" firstSequence="1" lastSequence="79"/>
+             <Streams><DeviceStream uuid="OKUMA.123456" name="OKUMA-CNC">
+               <ComponentStream component="Linear" name="X" componentId="x">
+                 <Samples>
+                   <Position dataItemId="Xabs" name="Xabs" subType="ACTUAL" sequence="77"
+                      timestamp="2026-07-27T10:00:09.000000Z">1.5</Position>
+                   <Load dataItemId="Xload" name="Xload"
+                      timestamp="2026-07-27T10:00:09.000000Z">9</Load>
+                   <Temperature dataItemId="Xtemp" name="Xtemp" sequence="79">41</Temperature>
+                 </Samples>
+               </ComponentStream>
+             </DeviceStream></Streams>
+           </MTConnectStreams>"#
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn an_observation_missing_a_required_field_is_counted_and_never_dispatched() {
+        // C-3. `sequence` and `timestamp` are required. Defaulting them published a GOOD reading
+        // with no capture time whose `sequence: 0` floor then suppressed every genuine observation
+        // of that data item for the life of the process.
+        let rt = runtime();
+        let mut handle = rt.attach("OKUMA.123456");
+
+        let report = rt
+            .ingest_streams(&document_with_incomplete_observations(), false)
+            .await
+            .expect("the document itself is well formed");
+        assert_eq!(report.observations, 1, "only the complete one decoded");
+        assert_eq!(report.published, 1);
+        assert_eq!(
+            rt.parse_counters().rejected_observations,
+            2,
+            "the incomplete ones are counted, not published"
+        );
+        assert_eq!(
+            rt.parse_counters().parse_errors,
+            0,
+            "the DOCUMENT parsed; the observations were refused"
+        );
+
+        let dispatched: Vec<String> = handle
+            .rx
+            .drain()
+            .iter()
+            .filter_map(|e| match e {
+                InstanceEvent::Obs(o) => Some(o.data_item_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dispatched,
+            vec!["Xabs".to_string()],
+            "a refused observation reaches no instance"
+        );
+
+        // The refusal touched no dedupe floor either: when the agent sends the same data items
+        // COMPLETE, they publish.
+        let complete = document_with_incomplete_observations()
+            .replace(
+                r#"dataItemId="Xload" name="Xload""#,
+                r#"dataItemId="Xload" name="Xload" sequence="78""#,
+            )
+            .replace(
+                r#"dataItemId="Xtemp" name="Xtemp" sequence="79""#,
+                r#"dataItemId="Xtemp" name="Xtemp" sequence="79" timestamp="2026-07-27T10:00:09Z""#,
+            );
+        let report = rt.ingest_streams(&complete, false).await.unwrap();
+        assert_eq!(report.observations, 3);
+        assert_eq!(report.published, 2, "the two that had been refused");
+        assert_eq!(
+            rt.parse_counters().rejected_observations,
+            2,
+            "no new rejects"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_served_read_also_refuses_incomplete_observations() {
+        let (rt, docs) = agent_backed_runtime_with_docs().await;
+        let _h = rt.attach("OKUMA.123456");
+        docs.set_current(&document_with_incomplete_observations());
+        let observations = rt.snapshot("OKUMA.123456", &[]).await.expect("served");
+        assert_eq!(
+            observations
+                .iter()
+                .map(|o| o.data_item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Xabs"]
+        );
+        assert_eq!(rt.parse_counters().rejected_observations, 2);
     }
 
     // =============================================================================================

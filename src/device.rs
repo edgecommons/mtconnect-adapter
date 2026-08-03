@@ -646,7 +646,7 @@ mod tests {
 // the `conditionBinding` degradation), the agent's capture timestamp, and the `sequence` extra
 // that gives a consumer exact once-only ordering across reconnects.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::mtconnect::config::{DeviceConfig as MtcDeviceConfig, PublishMode, SignalConfig};
 use crate::mtconnect::model::{Category, ProbeModel};
@@ -946,9 +946,10 @@ pub struct MtcSession {
     generation: String,
     model: Arc<ProbeModel>,
     rx: InstanceReceiver,
-    /// The latest state of every CONDITION data item this device published, with its native code —
-    /// what `conditionBinding` degrades against.
-    conditions: HashMap<String, (CondState, Option<String>)>,
+    /// The live condition ledger of every CONDITION data item this device published — the
+    /// concurrent activations MTConnect permits on one data item, keyed by activation identity.
+    /// This is what a condition signal publishes and what `conditionBinding` degrades against.
+    conditions: HashMap<String, ConditionLedger>,
     /// The served union (R1.1): the explicit signals merged with the selection-derived set against
     /// the current model. This is what publishes, answers `sb/read`, and scopes a repoll.
     served: Vec<ServedSignal>,
@@ -1282,54 +1283,74 @@ impl MtcSession {
             .map(|s| &s.signal)
     }
 
-    /// Fold a batch of observations into readings: condition states are recorded **first**, so a
-    /// value observed in the same batch as the fault that invalidates it is already degraded.
+    /// Fold a batch of observations into readings: condition activations are folded into their
+    /// ledgers **first**, so a value observed in the same batch as the fault that invalidates it is
+    /// already degraded.
     fn map_batch(&mut self, observations: &[Observation]) -> Vec<Reading> {
         self.map_batch_at(observations, Instant::now())
     }
 
     /// [`Self::map_batch`] with an explicit clock, so the condition-event rate limit is testable.
+    ///
+    /// Two passes, and the split is what makes the outcome order-independent (P1-3): the first
+    /// applies every condition transition to its data item's ledger, recording what that data item
+    /// aggregated to **at that observation**; the second maps every observation against the ledgers
+    /// as they stand at the end of the batch. A condition sample therefore publishes the concurrent
+    /// truth, and a bound value sees every condition the same batch carried, whatever order the
+    /// agent wrote them in.
     fn map_batch_at(&mut self, observations: &[Observation], now: Instant) -> Vec<Reading> {
-        for obs in observations {
-            if let Some(state) = obs.condition_state() {
-                let code = obs
-                    .extra("nativeCode")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                let previous = self
-                    .conditions
-                    .insert(obs.data_item_id.clone(), (state, code.clone()))
-                    .map(|(s, _)| s);
-                // A latching Fault is the event an operator wants; a Fault that is merely still
-                // asserted is not, so only the TRANSITION into Fault raises one (rate-limited).
-                if state == CondState::Fault
-                    && previous != Some(CondState::Fault)
-                    && self.allow_condition_event(&obs.data_item_id, now)
-                {
-                    self.notices.push(Notice {
-                        event_type: EVENT_CONDITION,
-                        level: NoticeLevel::Critical,
-                        message: format!("condition `{}` went to Fault", obs.data_item_id),
-                        context: json!({
-                            "instance": self.device.id,
-                            "dataItemId": obs.data_item_id,
-                            "state": "FAULT",
-                            "previousState": previous.map(condition_state_name),
-                            "nativeCode": code,
-                            "timestamp": obs.timestamp,
-                        }),
-                    });
-                }
+        // Pass 1, in document order: fold each transition in and snapshot its result.
+        let mut snapshots: Vec<Option<ConditionSnapshot>> = vec![None; observations.len()];
+        for (i, obs) in observations.iter().enumerate() {
+            if obs.condition_state().is_none() {
+                continue;
+            }
+            // Whether this data item was ever observed, so a first-ever Fault still reports a null
+            // `previousState` rather than claiming it used to be NORMAL.
+            let known = self.conditions.contains_key(&obs.data_item_id);
+            let ledger = self.conditions.entry(obs.data_item_id.clone()).or_default();
+            let previous = ledger.aggregate().0;
+            ledger.apply(obs);
+            let snapshot = ledger.snapshot();
+            let (state, active) = (snapshot.state, snapshot.active);
+            snapshots[i] = Some(snapshot);
+
+            // A latching Fault is the event an operator wants; a Fault that is merely still
+            // asserted is not, so only the TRANSITION into Fault raises one (rate-limited). The
+            // transition is of the AGGREGATE: a second concurrent Fault on an already-faulted data
+            // item is not a new alarm, and clearing one of two is not a recovery.
+            if state == CondState::Fault
+                && previous != CondState::Fault
+                && self.allow_condition_event(&obs.data_item_id, now)
+            {
+                self.notices.push(Notice {
+                    event_type: EVENT_CONDITION,
+                    level: NoticeLevel::Critical,
+                    message: format!("condition `{}` went to Fault", obs.data_item_id),
+                    context: json!({
+                        "instance": self.device.id,
+                        "dataItemId": obs.data_item_id,
+                        "state": "FAULT",
+                        "previousState": known.then(|| condition_state_name(previous)),
+                        "nativeCode": obs.extra("nativeCode"),
+                        "conditionId": obs.extra("conditionId"),
+                        "activeConditions": active,
+                        "timestamp": obs.timestamp,
+                    }),
+                });
             }
         }
+
+        // Pass 2: map everything against the ledgers.
         let mut out = Vec::new();
-        for obs in observations {
+        for (i, obs) in observations.iter().enumerate() {
             for sig in self.signals_for(&obs.data_item_id) {
                 out.push(reading_from_observation(
                     obs,
                     sig,
                     &self.model,
                     &self.conditions,
+                    snapshots[i].as_ref(),
                 ));
             }
         }
@@ -1601,6 +1622,160 @@ pub fn condition_state_name(state: CondState) -> &'static str {
     }
 }
 
+// =================================================================================================
+// The condition ledger (P1-3): one data item, many concurrent activations
+// =================================================================================================
+
+/// One active condition activation on a data item.
+///
+/// MTConnect's Condition model is **not** one state per data item. A single condition — say a
+/// controller's `system` condition — may be asserted several times concurrently, each activation
+/// identified across its own `Warning`/`Fault`/`Normal` transitions by `conditionId` (or, for
+/// agents that predate it, by `nativeCode`). Collapsing them to a single `(state, code)` slot makes
+/// clearing ONE activation promote the whole signal to GOOD while another Fault is still asserted,
+/// and makes the outcome of a mixed Fault/Warning batch depend on XML document order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Activation {
+    /// `Warning` or `Fault` — a cleared or unavailable activation is not stored, it is removed.
+    pub state: CondState,
+    pub native_code: Option<String>,
+    pub condition_id: Option<String>,
+}
+
+/// The concurrent activations of ONE condition data item.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConditionLedger {
+    /// Keyed by activation identity: `conditionId`, else `nativeCode`, else `""` — the documented
+    /// single-activation fallback for agents that send neither (D-R7). A `BTreeMap` so the
+    /// aggregate is a deterministic function of the SET of activations, never of arrival order.
+    active: BTreeMap<String, Activation>,
+    /// The data item reported `UNAVAILABLE` and nothing has superseded it.
+    unavailable: bool,
+}
+
+/// What one condition data item aggregated to right after one observation was folded into its
+/// ledger: the truth the signal publishes, and how many activations stand behind it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConditionSnapshot {
+    /// The worst state across the concurrent activations.
+    pub state: CondState,
+    /// The worst activation's native code — the alarm an operator is told about.
+    pub native_code: Option<String>,
+    /// How many activations are asserted (0 for a cleared or unavailable data item).
+    pub active: usize,
+}
+
+impl ConditionSnapshot {
+    /// The single-activation view of one observation: what a caller with no ledger can know, and
+    /// exactly the pre-2.x behavior for an agent that sends one condition at a time.
+    #[must_use]
+    pub fn of_observation(obs: &Observation) -> Self {
+        let state = obs.condition_state().unwrap_or(CondState::Unavailable);
+        Self {
+            state,
+            native_code: obs
+                .extra("nativeCode")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            active: usize::from(matches!(state, CondState::Warning | CondState::Fault)),
+        }
+    }
+}
+
+impl ConditionLedger {
+    /// The activation identity of one condition observation: `conditionId` ▷ `nativeCode` ▷ `""`
+    /// (D-R7). The empty key is a real key — it is the single slot an agent that identifies
+    /// nothing gets, which preserves the one-condition-per-data-item behavior exactly.
+    fn activation_key(obs: &Observation) -> String {
+        for key in ["conditionId", "nativeCode"] {
+            if let Some(v) = obs.extra(key).and_then(Value::as_str) {
+                if !v.is_empty() {
+                    return v.to_string();
+                }
+            }
+        }
+        String::new()
+    }
+
+    /// Fold one condition observation in.
+    ///
+    /// * `Warning`/`Fault` → upsert the activation under its identity; the data item is no longer
+    ///   unavailable.
+    /// * `Normal` with a real key → clear **that** activation only; the others stand.
+    /// * `Normal` with no key → the standard's normal sweep: clear ALL activations.
+    /// * `Unavailable` → clear all activations and mark the data item unavailable.
+    ///
+    /// A non-condition observation is ignored.
+    pub fn apply(&mut self, obs: &Observation) {
+        let Some(state) = obs.condition_state() else {
+            return;
+        };
+        let key = Self::activation_key(obs);
+        match state {
+            CondState::Warning | CondState::Fault => {
+                self.unavailable = false;
+                self.active.insert(
+                    key,
+                    Activation {
+                        state,
+                        native_code: obs
+                            .extra("nativeCode")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        condition_id: obs
+                            .extra("conditionId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    },
+                );
+            }
+            CondState::Normal => {
+                self.unavailable = false;
+                if key.is_empty() {
+                    self.active.clear();
+                } else {
+                    self.active.remove(&key);
+                }
+            }
+            CondState::Unavailable => {
+                self.active.clear();
+                self.unavailable = true;
+            }
+        }
+    }
+
+    /// The worst state across the concurrent activations, with that activation's native code.
+    /// `(Normal, None)` when nothing is asserted; `(Unavailable, None)` when the agent reported the
+    /// data item unavailable.
+    #[must_use]
+    pub fn aggregate(&self) -> (CondState, Option<String>) {
+        if let Some(worst) = self.active.values().max_by_key(|a| a.state.severity()) {
+            return (worst.state, worst.native_code.clone());
+        }
+        if self.unavailable {
+            return (CondState::Unavailable, None);
+        }
+        (CondState::Normal, None)
+    }
+
+    /// The aggregate plus the activation count — what one condition sample publishes.
+    #[must_use]
+    pub fn snapshot(&self) -> ConditionSnapshot {
+        let (state, native_code) = self.aggregate();
+        ConditionSnapshot {
+            state,
+            native_code,
+            active: self.active.len(),
+        }
+    }
+
+    /// How many activations are currently asserted.
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.active.len()
+    }
+}
+
 /// Map one observation onto one configured signal.
 ///
 /// * **Samples** publish numbers (or arrays for `TIME_SERIES`/`*_3D`), **Events** their string or
@@ -1613,24 +1788,49 @@ pub fn condition_state_name(state: CondState) -> &'static str {
 ///   absent (MTConnect does not distinguish a device-authored time), and the adapter's receive
 ///   moment is stamped by the worker.
 /// * The `sequence` always rides as an extra: exact once-only ordering across reconnects.
+///
+/// `condition` is the ledger snapshot taken right after this observation was folded in, and is what
+/// a CONDITION observation publishes: its **aggregate** value and quality, so clearing one of two
+/// concurrent activations cannot promote the signal to GOOD while the other is still asserted
+/// (D-R8). The observation's own transition survives in the extras (`conditionId`, `nativeCode`,
+/// `conditionText`, …) beside `activeConditions`. `None` means "this observation is the only
+/// activation" — what a caller with no ledger can know, and exactly the single-activation shape.
 #[must_use]
 pub fn reading_from_observation(
     obs: &Observation,
     sig: &SignalConfig,
     model: &ProbeModel,
-    conditions: &HashMap<String, (CondState, Option<String>)>,
+    conditions: &HashMap<String, ConditionLedger>,
+    condition: Option<&ConditionSnapshot>,
 ) -> Reading {
-    let (value, mut quality, mut quality_raw) = match &obs.value {
-        ObsValue::Unavailable => (None, Quality::Bad, QUALITY_UNAVAILABLE.to_string()),
-        ObsValue::Condition(CondState::Unavailable) => {
+    let own;
+    let aggregate = match (obs.condition_state(), condition) {
+        (None, _) => None,
+        (Some(_), Some(snapshot)) => Some(snapshot),
+        (Some(_), None) => {
+            own = ConditionSnapshot::of_observation(obs);
+            Some(&own)
+        }
+    };
+
+    let (value, mut quality, mut quality_raw) = match (&obs.value, aggregate) {
+        (ObsValue::Unavailable, _) => (None, Quality::Bad, QUALITY_UNAVAILABLE.to_string()),
+        // A condition data item the agent reports unavailable publishes an explicit null, exactly
+        // as an unavailable value does — "no state" is not the string "UNAVAILABLE".
+        (ObsValue::Condition(_), Some(agg)) if agg.state == CondState::Unavailable => {
             (None, Quality::Bad, QUALITY_UNAVAILABLE.to_string())
         }
-        ObsValue::Condition(state) => {
-            let native = obs.extra("nativeCode").and_then(Value::as_str);
-            let (q, raw) = condition_quality(*state, native);
+        (ObsValue::Condition(_), Some(agg)) => {
+            let (q, raw) = condition_quality(agg.state, agg.native_code.as_deref());
+            (Some(Value::String(agg.state.as_str().to_string())), q, raw)
+        }
+        (ObsValue::Condition(state), None) => {
+            // Unreachable in practice (a condition observation always has an aggregate above), kept
+            // total rather than panicking on a shape the compiler cannot rule out.
+            let (q, raw) = condition_quality(*state, None);
             (Some(Value::String(state.as_str().to_string())), q, raw)
         }
-        ObsValue::Scalar(v) => (Some(v.clone()), Quality::Good, QUALITY_OK.to_string()),
+        (ObsValue::Scalar(v), _) => (Some(v.clone()), Quality::Good, QUALITY_OK.to_string()),
     };
 
     // A bound condition can only make a reading worse, never better.
@@ -1648,6 +1848,14 @@ pub fn reading_from_observation(
     extra.insert("sequence".to_string(), Value::from(obs.sequence));
     for (key, value) in &obs.extras {
         extra.insert((*key).to_string(), value.clone());
+    }
+    if let Some(agg) = aggregate {
+        // How many activations stand behind the published state — the count that tells a consumer
+        // a still-asserted Fault is why a cleared Warning did not make the signal GOOD (D-R8).
+        extra.insert(
+            "activeConditions".to_string(),
+            Value::from(agg.active as u64),
+        );
     }
 
     Reading {
@@ -1692,16 +1900,20 @@ pub fn condition_quality(state: CondState, native_code: Option<&str>) -> (Qualit
 
 /// The worst state among the conditions a signal is bound to (D-MTC-8). `None` when the signal
 /// binds no conditions, or none of them has been observed yet.
+///
+/// Each bound data item contributes its ledger's **aggregate**, so a binding degrades by the whole
+/// concurrent truth: clearing one of two activations on a bound condition leaves the signal
+/// degraded by the other.
 #[must_use]
 pub fn worst_bound_condition(
     sig: &SignalConfig,
-    conditions: &HashMap<String, (CondState, Option<String>)>,
+    conditions: &HashMap<String, ConditionLedger>,
 ) -> Option<(CondState, Option<String>)> {
     sig.condition_bindings()
         .iter()
         .filter_map(|id| conditions.get(id))
+        .map(ConditionLedger::aggregate)
         .max_by_key(|(state, _)| state.severity())
-        .cloned()
 }
 
 fn severity_of(q: Quality) -> u8 {
@@ -1718,7 +1930,7 @@ mod mtconnect_seam_tests {
     use crate::app::ChannelBudgets;
     use crate::mtconnect::config::{parse_agents, AgentCredentials};
     use crate::mtconnect::model::Category;
-    use crate::mtconnect::xml::{parse_devices, parse_streams};
+    use crate::mtconnect::xml::{parse_devices, parse_streams, StreamEntry, XmlElem};
     use crate::mtconnect::{instance_queue, InstanceSender};
     use serde_json::json;
     use std::time::Duration;
@@ -1758,7 +1970,7 @@ mod mtconnect_seam_tests {
             .iter()
             .filter_map(|e| {
                 let id = e.elem.attr("dataItemId")?;
-                crate::mtconnect::observations::decode(e, m.item(id))
+                crate::mtconnect::observations::decode(e, m.item(id)).ok()
             })
             .collect()
     }
@@ -1768,6 +1980,58 @@ mod mtconnect_seam_tests {
             .into_iter()
             .find(|o| o.data_item_id == id)
             .expect("observation")
+    }
+
+    /// One condition transition, built through the real decoder so the activation identity travels
+    /// the way it does in production (element name = state, `conditionId`/`nativeCode` as extras).
+    fn cond(
+        data_item_id: &str,
+        element: &str,
+        condition_id: Option<&str>,
+        native_code: Option<&str>,
+    ) -> Observation {
+        let mut elem = XmlElem {
+            name: element.into(),
+            ..XmlElem::default()
+        };
+        elem.attrs.insert("dataItemId".into(), data_item_id.into());
+        elem.attrs.insert("sequence".into(), "9".into());
+        elem.attrs
+            .insert("timestamp".into(), "2026-07-27T10:00:00Z".into());
+        if let Some(id) = condition_id {
+            elem.attrs.insert("conditionId".into(), id.into());
+        }
+        if let Some(code) = native_code {
+            elem.attrs.insert("nativeCode".into(), code.into());
+        }
+        crate::mtconnect::observations::decode(
+            &StreamEntry {
+                category: Category::Condition,
+                elem,
+                component: None,
+            },
+            None,
+        )
+        .expect("a complete condition observation")
+    }
+
+    /// The ledger a sequence of condition transitions leaves behind.
+    fn ledger_of(transitions: &[Observation]) -> ConditionLedger {
+        let mut ledger = ConditionLedger::default();
+        for obs in transitions {
+            ledger.apply(obs);
+        }
+        ledger
+    }
+
+    /// The ledger map one data item's transitions produce — what a binding degrades against.
+    fn ledgers(
+        data_item_id: &str,
+        transitions: &[Observation],
+    ) -> HashMap<String, ConditionLedger> {
+        let mut map = HashMap::new();
+        map.insert(data_item_id.to_string(), ledger_of(transitions));
+        map
     }
 
     fn signal(id: &str, data_item_id: &str) -> SignalConfig {
@@ -1825,6 +2089,7 @@ mod mtconnect_seam_tests {
             &signal("x-position", "Xabs"),
             &model(),
             &HashMap::new(),
+            None,
         );
         assert_eq!(r.signal_id, "x-position");
         assert_eq!(r.value, Some(json!(123.456)));
@@ -1857,6 +2122,7 @@ mod mtconnect_seam_tests {
             &signal("x-load", "Xload"),
             &model(),
             &HashMap::new(),
+            None,
         );
         assert_eq!(r.value, None, "no value - not a zero, not an empty string");
         assert_eq!(r.quality, Quality::Bad);
@@ -1868,11 +2134,14 @@ mod mtconnect_seam_tests {
 
     #[test]
     fn a_condition_publishes_its_state_as_the_value() {
+        let fault = obs("Xtravel");
+        let snapshot = ledger_of(std::slice::from_ref(&fault)).snapshot();
         let r = reading_from_observation(
-            &obs("Xtravel"),
+            &fault,
             &signal("x-travel", "Xtravel"),
             &model(),
             &HashMap::new(),
+            Some(&snapshot),
         );
         assert_eq!(r.value, Some(json!("FAULT")));
         assert_eq!(r.quality, Quality::Bad);
@@ -1886,35 +2155,40 @@ mod mtconnect_seam_tests {
             extra["conditionText"],
             json!("X axis travel limit exceeded")
         );
+        assert_eq!(extra["activeConditions"], json!(1));
 
         // A Normal condition is GOOD, and says which state it is.
+        let normal = obs("logic");
+        let snapshot = ledger_of(std::slice::from_ref(&normal)).snapshot();
         let r = reading_from_observation(
-            &obs("logic"),
+            &normal,
             &signal("logic", "logic"),
             &model(),
             &HashMap::new(),
+            Some(&snapshot),
         );
         assert_eq!(r.value, Some(json!("NORMAL")));
         assert_eq!(r.quality, Quality::Good);
         assert_eq!(r.quality_raw.as_deref(), Some("MTC_OK:NORMAL"));
+        assert_eq!(r.extra.unwrap()["activeConditions"], json!(0));
     }
 
     #[test]
     fn a_bound_condition_degrades_the_signal_it_guards() {
         let mut sig = signal("x-position", "Xabs");
         sig.condition_binding = Some(vec!["Xtravel".into()]);
-        let mut conditions = HashMap::new();
 
         // Nothing observed yet: the value stands on its own.
-        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &conditions);
+        let none = HashMap::new();
+        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &none, None);
         assert_eq!(r.quality, Quality::Good);
 
         // A warning makes the value UNCERTAIN — it is still a value, and the alarm says why.
-        conditions.insert(
-            "Xtravel".to_string(),
-            (CondState::Warning, Some("ALM-7".into())),
+        let warned = ledgers(
+            "Xtravel",
+            &[cond("Xtravel", "Warning", None, Some("ALM-7"))],
         );
-        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &conditions);
+        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &warned, None);
         assert_eq!(r.quality, Quality::Uncertain);
         assert_eq!(
             r.quality_raw.as_deref(),
@@ -1927,11 +2201,11 @@ mod mtconnect_seam_tests {
         );
 
         // A fault makes it BAD.
-        conditions.insert(
-            "Xtravel".to_string(),
-            (CondState::Fault, Some("ALM-1041".into())),
+        let faulted = ledgers(
+            "Xtravel",
+            &[cond("Xtravel", "Fault", None, Some("ALM-1041"))],
         );
-        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &conditions);
+        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &faulted, None);
         assert_eq!(r.quality, Quality::Bad);
         assert_eq!(
             r.quality_raw.as_deref(),
@@ -1947,7 +2221,8 @@ mod mtconnect_seam_tests {
                 s
             },
             &model(),
-            &conditions,
+            &faulted,
+            None,
         );
         assert_eq!(r.quality_raw.as_deref(), Some("UNAVAILABLE"));
 
@@ -1956,7 +2231,8 @@ mod mtconnect_seam_tests {
             &obs("Xabs"),
             &signal("x-position", "Xabs"),
             &model(),
-            &conditions,
+            &faulted,
+            None,
         );
         assert_eq!(r.quality, Quality::Good);
     }
@@ -1965,25 +2241,52 @@ mod mtconnect_seam_tests {
     fn the_worst_bound_condition_wins() {
         let mut sig = signal("s", "Xabs");
         sig.condition_binding = Some(vec!["c1".into(), "c2".into(), "c3".into()]);
-        let mut conditions = HashMap::new();
+        let mut conditions: HashMap<String, ConditionLedger> = HashMap::new();
         assert!(worst_bound_condition(&sig, &conditions).is_none());
 
-        conditions.insert("c1".to_string(), (CondState::Normal, None));
-        conditions.insert("c2".to_string(), (CondState::Warning, Some("W".into())));
+        conditions.insert("c1".into(), ledger_of(&[cond("c1", "Normal", None, None)]));
+        conditions.insert(
+            "c2".into(),
+            ledger_of(&[cond("c2", "Warning", None, Some("W"))]),
+        );
         assert_eq!(
             worst_bound_condition(&sig, &conditions),
             Some((CondState::Warning, Some("W".into())))
         );
-        conditions.insert("c3".to_string(), (CondState::Fault, Some("F".into())));
+        conditions.insert(
+            "c3".into(),
+            ledger_of(&[cond("c3", "Fault", None, Some("F"))]),
+        );
         assert_eq!(
             worst_bound_condition(&sig, &conditions),
             Some((CondState::Fault, Some("F".into())))
         );
         // A condition nobody bound is invisible here.
-        conditions.insert("other".to_string(), (CondState::Fault, Some("X".into())));
+        conditions.insert(
+            "other".into(),
+            ledger_of(&[cond("other", "Fault", None, Some("X"))]),
+        );
         assert_eq!(
             worst_bound_condition(&signal("s", "Xabs"), &conditions),
             None
+        );
+
+        // A binding degrades by the bound item's whole CONCURRENT truth, not by its last
+        // transition: clearing one of two activations leaves the other one degrading the signal.
+        conditions.insert(
+            "c2".into(),
+            ledger_of(&[
+                cond("c2", "Fault", Some("a"), Some("F1")),
+                cond("c2", "Warning", Some("b"), Some("W1")),
+                cond("c2", "Normal", Some("a"), None),
+            ]),
+        );
+        let mut one = signal("s", "Xabs");
+        one.condition_binding = Some(vec!["c2".into()]);
+        assert_eq!(
+            worst_bound_condition(&one, &conditions),
+            Some((CondState::Warning, Some("W1".into()))),
+            "the Warning activation is still asserted"
         );
     }
 
@@ -2027,7 +2330,7 @@ mod mtconnect_seam_tests {
     fn a_configured_channel_overrides_the_published_signal_path() {
         let mut sig = signal("x-position", "Xabs");
         sig.channel = Some("axes/x".into());
-        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &HashMap::new());
+        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &HashMap::new(), None);
         assert_eq!(r.channel.as_deref(), Some("axes/x"));
     }
 
@@ -2077,6 +2380,7 @@ mod mtconnect_seam_tests {
                 &signal(signal_id, data_item_id),
                 &m,
                 &HashMap::new(),
+                None,
             );
             let served = m
                 .address_of("line-a-agent", data_item_id)
@@ -2097,6 +2401,7 @@ mod mtconnect_seam_tests {
             &signal("availability", "avail"),
             &model(),
             &HashMap::new(),
+            None,
         );
         assert_eq!(
             r.component_path.as_deref(),
@@ -2908,6 +3213,330 @@ mod mtconnect_seam_tests {
         session.map_batch_at(&[cond(CondState::Normal, 6)], t0 + Duration::from_secs(61));
         session.map_batch_at(&[cond(CondState::Fault, 7)], t0 + Duration::from_secs(62));
         assert_eq!(session.take_notices().len(), 1);
+    }
+
+    // --- concurrent condition activations (P1-3) -------------------------------------------------
+
+    /// A session over the CNC model with the given signals — enough to drive `map_batch_at`.
+    fn condition_session(signals: Vec<SignalConfig>) -> (MtcSession, InstanceSender) {
+        let agent = runtime("http://127.0.0.1:9");
+        let (tx, rx) = instance_queue();
+        (MtcSession::new(agent, device(signals), model(), rx), tx)
+    }
+
+    /// The `activeConditions` extra of one reading.
+    fn active_of(r: &Reading) -> Value {
+        r.extra
+            .as_ref()
+            .expect("every reading carries extras")
+            .get("activeConditions")
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    #[test]
+    fn clearing_one_of_two_concurrent_activations_does_not_promote_the_signal_to_good() {
+        // P1-3, the headline case. MTConnect permits several conditions to be asserted on ONE data
+        // item concurrently, each identified across its transitions by `conditionId`. Keying the
+        // session's state by `dataItemId` alone made the LAST transition the whole truth, so
+        // clearing one activation published GOOD while another Fault was still asserted.
+        let (mut session, _tx) = condition_session(vec![signal("x-travel", "Xtravel")]);
+        let t0 = Instant::now();
+
+        let r = session.map_batch_at(&[cond("Xtravel", "Fault", Some("c1"), Some("ALM-1"))], t0);
+        assert_eq!(r[0].value, Some(json!("FAULT")));
+        assert_eq!(r[0].quality, Quality::Bad);
+        assert_eq!(active_of(&r[0]), json!(1));
+
+        // A second, DIFFERENT activation: two conditions now stand on one data item.
+        let r = session.map_batch_at(&[cond("Xtravel", "Warning", Some("c2"), Some("ALM-2"))], t0);
+        assert_eq!(
+            r[0].value,
+            Some(json!("FAULT")),
+            "the aggregate is the worst activation, not this transition"
+        );
+        assert_eq!(r[0].quality, Quality::Bad);
+        assert_eq!(
+            r[0].quality_raw.as_deref(),
+            Some("MTC_CONDITION:FAULT:ALM-1"),
+            "the alarm an operator must act on"
+        );
+        assert_eq!(active_of(&r[0]), json!(2));
+        // The sample still carries its OWN transition, so nothing is lost (D-R8).
+        let extra = r[0].extra.as_ref().unwrap();
+        assert_eq!(extra["conditionId"], json!("c2"));
+        assert_eq!(extra["nativeCode"], json!("ALM-2"));
+
+        // Clear the FAULT. The Warning is still asserted, so the signal is UNCERTAIN — never GOOD.
+        let r = session.map_batch_at(&[cond("Xtravel", "Normal", Some("c1"), None)], t0);
+        assert_eq!(r[0].value, Some(json!("WARNING")));
+        assert_eq!(r[0].quality, Quality::Uncertain);
+        assert_eq!(
+            r[0].quality_raw.as_deref(),
+            Some("MTC_CONDITION:WARNING:ALM-2")
+        );
+        assert_eq!(active_of(&r[0]), json!(1));
+
+        // Clearing the last activation is the recovery.
+        let r = session.map_batch_at(&[cond("Xtravel", "Normal", Some("c2"), None)], t0);
+        assert_eq!(r[0].value, Some(json!("NORMAL")));
+        assert_eq!(r[0].quality, Quality::Good);
+        assert_eq!(r[0].quality_raw.as_deref(), Some("MTC_OK:NORMAL"));
+        assert_eq!(active_of(&r[0]), json!(0));
+    }
+
+    #[test]
+    fn activation_identity_falls_back_to_the_native_code_and_then_to_one_slot() {
+        // D-R7: `conditionId` ▷ `nativeCode` ▷ `""`. An agent that predates `conditionId` still
+        // gets concurrent activations, keyed by the alarm code it does send.
+        let (mut session, _tx) = condition_session(vec![signal("x-travel", "Xtravel")]);
+        let t0 = Instant::now();
+        session.map_batch_at(&[cond("Xtravel", "Fault", None, Some("ALM-1"))], t0);
+        let r = session.map_batch_at(&[cond("Xtravel", "Warning", None, Some("ALM-2"))], t0);
+        assert_eq!(r[0].value, Some(json!("FAULT")));
+        assert_eq!(active_of(&r[0]), json!(2));
+
+        let r = session.map_batch_at(&[cond("Xtravel", "Normal", None, Some("ALM-1"))], t0);
+        assert_eq!(r[0].value, Some(json!("WARNING")), "ALM-2 still stands");
+        let r = session.map_batch_at(&[cond("Xtravel", "Normal", None, Some("ALM-2"))], t0);
+        assert_eq!(r[0].value, Some(json!("NORMAL")));
+
+        // An agent that identifies NOTHING gets exactly one slot — the pre-2.x behavior, preserved
+        // exactly: the newest transition IS the state.
+        let (mut session, _tx) = condition_session(vec![signal("x-travel", "Xtravel")]);
+        session.map_batch_at(&[cond("Xtravel", "Fault", None, None)], t0);
+        let r = session.map_batch_at(&[cond("Xtravel", "Warning", None, None)], t0);
+        assert_eq!(r[0].value, Some(json!("WARNING")));
+        assert_eq!(active_of(&r[0]), json!(1), "one slot, replaced in place");
+    }
+
+    #[test]
+    fn a_mixed_batch_settles_the_same_way_in_either_document_order() {
+        // The order-dependence half of P1-3: with one slot per data item, `[Fault, Warning]` ended
+        // WARNING and `[Warning, Fault]` ended FAULT — the same facts, two answers.
+        let fault = cond("Xtravel", "Fault", Some("c1"), Some("ALM-1"));
+        let warning = cond("Xtravel", "Warning", Some("c2"), Some("ALM-2"));
+        for batch in [
+            vec![fault.clone(), warning.clone()],
+            vec![warning.clone(), fault.clone()],
+        ] {
+            let (mut session, _tx) = condition_session(vec![signal("x-travel", "Xtravel")]);
+            let readings = session.map_batch_at(&batch, Instant::now());
+            assert_eq!(readings.len(), 2, "one reading per observation");
+
+            // The state the data item settles on does not depend on the order they arrived in.
+            assert_eq!(
+                session.conditions["Xtravel"].aggregate(),
+                (CondState::Fault, Some("ALM-1".to_string()))
+            );
+            assert_eq!(session.conditions["Xtravel"].active_count(), 2);
+            let last = readings.last().unwrap();
+            assert_eq!(last.value, Some(json!("FAULT")));
+            assert_eq!(last.quality, Quality::Bad);
+            assert_eq!(active_of(last), json!(2));
+        }
+    }
+
+    #[test]
+    fn a_keyless_normal_is_the_standards_normal_sweep() {
+        // D-R7: a `Normal` that names no activation clears the data item entirely — that is what
+        // the standard's normal sweep means, and a keyed `Normal` must NOT do it.
+        let (mut session, _tx) = condition_session(vec![signal("x-travel", "Xtravel")]);
+        let t0 = Instant::now();
+        session.map_batch_at(
+            &[
+                cond("Xtravel", "Fault", Some("c1"), Some("ALM-1")),
+                cond("Xtravel", "Warning", Some("c2"), Some("ALM-2")),
+            ],
+            t0,
+        );
+        assert_eq!(session.conditions["Xtravel"].active_count(), 2);
+
+        let r = session.map_batch_at(&[cond("Xtravel", "Normal", None, None)], t0);
+        assert_eq!(r[0].value, Some(json!("NORMAL")));
+        assert_eq!(r[0].quality, Quality::Good);
+        assert_eq!(active_of(&r[0]), json!(0), "every activation swept");
+    }
+
+    #[test]
+    fn an_unavailable_condition_clears_every_activation_and_publishes_an_explicit_null() {
+        let (mut session, _tx) = condition_session(vec![signal("x-travel", "Xtravel")]);
+        let t0 = Instant::now();
+        session.map_batch_at(
+            &[
+                cond("Xtravel", "Fault", Some("c1"), Some("ALM-1")),
+                cond("Xtravel", "Warning", Some("c2"), Some("ALM-2")),
+            ],
+            t0,
+        );
+
+        let r = session.map_batch_at(&[cond("Xtravel", "Unavailable", None, None)], t0);
+        assert_eq!(r[0].value, None, "no state is not the string UNAVAILABLE");
+        assert_eq!(r[0].quality, Quality::Bad);
+        assert_eq!(r[0].quality_raw.as_deref(), Some("UNAVAILABLE"));
+        assert_eq!(active_of(&r[0]), json!(0));
+        assert_eq!(
+            session.conditions["Xtravel"].aggregate(),
+            (CondState::Unavailable, None)
+        );
+
+        // A new activation supersedes the unavailability.
+        let r = session.map_batch_at(&[cond("Xtravel", "Warning", Some("c3"), Some("W"))], t0);
+        assert_eq!(r[0].value, Some(json!("WARNING")));
+        assert_eq!(r[0].quality, Quality::Uncertain);
+    }
+
+    #[test]
+    fn a_bound_signal_degrades_by_the_whole_concurrent_truth() {
+        // The `conditionBinding` half of P1-3: a guarded value must see every activation on the
+        // condition it is bound to, so clearing one of two does not un-degrade it.
+        let mut guarded = signal("x-position", "Xabs");
+        guarded.condition_binding = Some(vec!["Xtravel".into()]);
+        let (mut session, _tx) = condition_session(vec![guarded, signal("x-travel", "Xtravel")]);
+        let t0 = Instant::now();
+
+        let readings = session.map_batch_at(
+            &[
+                cond("Xtravel", "Fault", Some("c1"), Some("ALM-1")),
+                cond("Xtravel", "Warning", Some("c2"), Some("ALM-2")),
+                obs("Xabs"),
+            ],
+            t0,
+        );
+        let guarded_reading = readings
+            .iter()
+            .find(|r| r.signal_id == "x-position")
+            .expect("the guarded signal");
+        assert_eq!(guarded_reading.quality, Quality::Bad);
+        assert_eq!(
+            guarded_reading.quality_raw.as_deref(),
+            Some("MTC_CONDITION:FAULT:ALM-1")
+        );
+        assert_eq!(
+            guarded_reading.value,
+            Some(json!(123.456)),
+            "a degraded value is still published"
+        );
+
+        // Clear the Fault only: the Warning still degrades the bound signal to UNCERTAIN.
+        let readings = session.map_batch_at(
+            &[cond("Xtravel", "Normal", Some("c1"), None), obs("Xabs")],
+            t0,
+        );
+        let guarded_reading = readings
+            .iter()
+            .find(|r| r.signal_id == "x-position")
+            .expect("the guarded signal");
+        assert_eq!(
+            guarded_reading.quality,
+            Quality::Uncertain,
+            "one activation cleared, one still asserted"
+        );
+        assert_eq!(
+            guarded_reading.quality_raw.as_deref(),
+            Some("MTC_CONDITION:WARNING:ALM-2")
+        );
+
+        // Clear the last one and the guard is lifted.
+        let readings = session.map_batch_at(
+            &[cond("Xtravel", "Normal", Some("c2"), None), obs("Xabs")],
+            t0,
+        );
+        let guarded_reading = readings
+            .iter()
+            .find(|r| r.signal_id == "x-position")
+            .expect("the guarded signal");
+        assert_eq!(guarded_reading.quality, Quality::Good);
+        assert_eq!(guarded_reading.quality_raw.as_deref(), Some("MTC_OK"));
+    }
+
+    #[test]
+    fn the_condition_event_follows_the_aggregate_and_names_the_activation() {
+        // The event is about the DATA ITEM going into Fault, not about each activation: a second
+        // concurrent Fault is not a new alarm, and clearing one of two is not a recovery.
+        let (mut session, _tx) = condition_session(vec![signal("x-travel", "Xtravel")]);
+        let t0 = Instant::now();
+
+        session.map_batch_at(&[cond("Xtravel", "Fault", Some("c1"), Some("ALM-1"))], t0);
+        let raised = session.take_notices();
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].event_type, EVENT_CONDITION);
+        assert_eq!(raised[0].context["conditionId"], json!("c1"));
+        assert_eq!(raised[0].context["nativeCode"], json!("ALM-1"));
+        assert_eq!(raised[0].context["activeConditions"], json!(1));
+        assert_eq!(
+            raised[0].context["previousState"],
+            json!(null),
+            "never observed before"
+        );
+
+        // A second concurrent Fault, well past the rate-limit window: still not a new alarm,
+        // because the data item was already faulted.
+        session.map_batch_at(
+            &[cond("Xtravel", "Fault", Some("c2"), Some("ALM-2"))],
+            t0 + Duration::from_secs(300),
+        );
+        assert!(
+            session.take_notices().is_empty(),
+            "the aggregate never left Fault"
+        );
+
+        // Clearing one of two is not a recovery either — and re-faulting from a WARNING aggregate
+        // is a genuine new transition into Fault.
+        session.map_batch_at(
+            &[
+                cond("Xtravel", "Normal", Some("c1"), None),
+                cond("Xtravel", "Normal", Some("c2"), None),
+                cond("Xtravel", "Warning", Some("c3"), Some("W")),
+            ],
+            t0 + Duration::from_secs(600),
+        );
+        assert!(session.take_notices().is_empty(), "no fault was entered");
+        session.map_batch_at(
+            &[cond("Xtravel", "Fault", Some("c4"), Some("ALM-9"))],
+            t0 + Duration::from_secs(900),
+        );
+        let raised = session.take_notices();
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].context["previousState"], json!("WARNING"));
+        assert_eq!(raised[0].context["activeConditions"], json!(2));
+    }
+
+    #[test]
+    fn the_ledger_is_a_pure_fold_over_activations() {
+        // The unit-level contract, independent of any session.
+        let mut ledger = ConditionLedger::default();
+        assert_eq!(ledger.aggregate(), (CondState::Normal, None));
+        assert_eq!(ledger.active_count(), 0);
+
+        ledger.apply(&cond("c", "Warning", Some("a"), Some("W1")));
+        ledger.apply(&cond("c", "Fault", Some("b"), Some("F1")));
+        assert_eq!(
+            ledger.aggregate(),
+            (CondState::Fault, Some("F1".to_string()))
+        );
+        assert_eq!(ledger.snapshot().active, 2);
+
+        // An upsert on the SAME identity replaces that activation rather than adding one.
+        ledger.apply(&cond("c", "Warning", Some("b"), Some("W2")));
+        assert_eq!(ledger.active_count(), 2);
+        assert_eq!(
+            ledger.aggregate(),
+            (CondState::Warning, Some("W2".to_string())),
+            "the worst is now a Warning"
+        );
+
+        // A non-condition observation is not the ledger's business.
+        ledger.apply(&obs("Xabs"));
+        assert_eq!(ledger.active_count(), 2);
+
+        // The single-activation view a caller with no ledger falls back to.
+        let single = ConditionSnapshot::of_observation(&cond("c", "Fault", None, Some("F")));
+        assert_eq!(single.state, CondState::Fault);
+        assert_eq!(single.native_code.as_deref(), Some("F"));
+        assert_eq!(single.active, 1);
+        let cleared = ConditionSnapshot::of_observation(&cond("c", "Normal", None, None));
+        assert_eq!(cleared.active, 0);
     }
 
     #[tokio::test]
