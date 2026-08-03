@@ -37,6 +37,7 @@ use crate::mtconnect::config::parse_agents;
 use crate::mtconnect::AgentRuntime;
 use crate::reload::SignalRegistry;
 use crate::shaping::{policies_from_signals, Shaper};
+use crate::staleness::{PassiveLink, QualityWatchdog};
 
 /// How often the periodic metrics emit runs, in the poll loop.
 const METRICS_INTERVAL: Duration = Duration::from_secs(30);
@@ -544,9 +545,11 @@ async fn run_polling(
     stale_signal_secs: u64,
     cancel: CancellationToken,
 ) -> PollExit {
-    // Landed with the final signature so later work changes bodies, not call sites:
-    // `stale_signal_secs` is the passive-quality expiry threshold, wired in phase 6.
-    let _ = stale_signal_secs;
+    // Passive quality (P1-5, HLD §6 rows 2-3): how long a held value may stand in before it is
+    // BAD. The watchdog is rebuilt with the session, like the shaper — the readings it holds are
+    // this session's, and a reconnect re-baselines them from the attach snapshot.
+    let stale_after = Duration::from_secs(stale_signal_secs);
+    let mut watchdog = QualityWatchdog::default();
     // The inventory ids back the resume-time snapshot (HLD §7: resume snapshots first).
     let inventory: Vec<String> = backend
         .inventory(&cfg.connection)
@@ -574,7 +577,16 @@ async fn run_polling(
         // task stops on THIS iteration rather than eventually.
         if cancel.is_cancelled() {
             tracing::info!(instance = %cfg.id, "shutdown: flushing the open windows");
-            return stop_cleanly(cfg, &mut shaper, &mut session, data, dm, health).await;
+            return stop_cleanly(
+                cfg,
+                &mut shaper,
+                &mut session,
+                data,
+                dm,
+                health,
+                &mut watchdog,
+            )
+            .await;
         }
 
         // ONE deadline per instance task: the earliest open batch window.
@@ -585,7 +597,7 @@ async fn run_polling(
             // shared agent runtime — before this task returns to be joined.
             () = cancel.cancelled() => {
                 tracing::info!(instance = %cfg.id, "shutdown: flushing the open windows");
-                return stop_cleanly(cfg, &mut shaper, &mut session, data, dm, health).await;
+                return stop_cleanly(cfg, &mut shaper, &mut session, data, dm, health, &mut watchdog).await;
             }
 
             // Poll and control share this one task, so a write can never race a read on the same
@@ -594,7 +606,7 @@ async fn run_polling(
                 let Some(ctrl) = ctrl else {
                     // The command surface went away: flush the open batch windows — no exit may
                     // lose the readings a window was still coalescing — and detach.
-                    return stop_cleanly(cfg, &mut shaper, &mut session, data, dm, health).await;
+                    return stop_cleanly(cfg, &mut shaper, &mut session, data, dm, health, &mut watchdog).await;
                 };
                 match ctrl {
                     DeviceControl::Write(req) => {
@@ -658,12 +670,16 @@ async fn run_polling(
                         // is a fresh full publish, not on-change flow), which is then re-armed:
                         // the first shaped reading after a resume always passes the deadband.
                         if changed && !inventory.is_empty() {
+                            // The snapshot below IS the re-baseline: forget what was held before
+                            // the pause (and any passive degradation applied to it) so the fresh
+                            // readings rebuild it.
+                            watchdog.on_rebaseline();
                             let outcome = session.read_named(inventory).await;
                             emit_notices(cfg, &mut session, events).await;
                             match outcome {
                                 Ok(mut readings) => {
                                     stamp_received(&mut readings, &now_iso());
-                                    publish_readings(cfg, &readings, data, dm, health).await;
+                                    publish_readings(cfg, &readings, data, dm, health, &mut watchdog).await;
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -679,7 +695,7 @@ async fn run_polling(
                     }
                     DeviceControl::Reconnect { reply } => {
                         // Buffered readings are data: flush them before dropping the session.
-                        flush_open_windows(cfg, &mut shaper, data, dm, health).await;
+                        flush_open_windows(cfg, &mut shaper, data, dm, health, &mut watchdog).await;
                         session.close().await;
                         return PollExit::Reconnect(reply);
                     }
@@ -697,14 +713,18 @@ async fn run_polling(
                                 Ok(mut readings) => {
                                     stamp_received(&mut readings, &now_iso());
                                     let n =
-                                        publish_readings(cfg, &readings, data, dm, health).await;
+                                        publish_readings(cfg, &readings, data, dm, health, &mut watchdog).await;
                                     let _ = reply.send(Ok(n));
                                 }
                                 Err(e) => {
                                     tracing::warn!(instance = %cfg.id, error = %e, "repoll failed");
                                     health.read_errors.fetch_add(1, Ordering::Relaxed);
                                     let _ = reply.send(Err(e.to_string()));
-                                    flush_open_windows(cfg, &mut shaper, data, dm, health).await;
+                                    flush_open_windows(cfg, &mut shaper, data, dm, health, &mut watchdog).await;
+                                    publish_passive(
+                                        cfg, lost_link(session.passive_input()), &mut watchdog,
+                                        stale_after, data, dm, health,
+                                    ).await;
                                     session.close().await;
                                     return PollExit::LinkLost;
                                 }
@@ -723,17 +743,28 @@ async fn run_polling(
                 sync_served_signals(session.as_ref(), health);
                 match outcome {
                     Err(()) => {
-                        // The link broke: flush the open windows so nothing buffered is lost.
-                        flush_open_windows(cfg, &mut shaper, data, dm, health).await;
+                        // The link broke: flush the open windows so nothing buffered is lost...
+                        flush_open_windows(cfg, &mut shaper, data, dm, health, &mut watchdog).await;
+                        // ...and say so about every value this session was holding, BEFORE it dies
+                        // (§7.2.3): the fleet must see BAD, not a GOOD value frozen at the moment
+                        // the link went. The next session re-baselines from its attach snapshot.
+                        publish_passive(
+                            cfg, lost_link(session.passive_input()), &mut watchdog,
+                            stale_after, data, dm, health,
+                        ).await;
                         session.close().await;
                         return PollExit::LinkLost;
                     }
-                    Ok(None) => {} // paused: drained, nothing to publish
+                    // Paused: the drain kept the caches current, and publication — synthetic
+                    // quality transitions included — stays gated (HLD §7).
+                    Ok(None) => {}
                     Ok(Some(readings)) => {
                         // A drained snapshot re-baselined the view (attach, resync ladder): the
-                        // next reading of every signal must pass the deadband as fresh.
+                        // next reading of every signal must pass the deadband as fresh, and what
+                        // the watchdog was holding is superseded by the snapshot itself.
                         if session.take_resync() {
                             shaper.reset_deadband();
+                            watchdog.on_rebaseline();
                         }
                         // A reload or model drift recompiled the served set inside the read: swap
                         // the policy table with it, flushing changed windows on the OLD policy.
@@ -741,7 +772,7 @@ async fn run_polling(
                             if shaping_gen.as_deref() != Some(next.as_str()) {
                                 shaping_gen = Some(next);
                                 let flushed = shaper.set_policies(session.shaping_policies());
-                                publish_shaped(cfg, flushed, data, dm, health).await;
+                                publish_shaped(cfg, flushed, data, dm, health, &mut watchdog).await;
                             }
                         }
                         let now = Instant::now();
@@ -749,8 +780,16 @@ async fn run_polling(
                         for reading in readings {
                             updates.extend(shaper.offer(reading, now));
                         }
-                        publish_shaped(cfg, updates, data, dm, health).await;
+                        publish_shaped(cfg, updates, data, dm, health, &mut watchdog).await;
                         drain_shaping(dm, &mut shaper);
+                        // Passive quality (P1-5): what this tick published is held; what it did NOT
+                        // publish is judged against the link. An agent that has stopped vouching
+                        // for currency degrades every held value — MTConnect is on-change, so
+                        // silence alone proves nothing, but a missed heartbeat does (D-R12).
+                        publish_passive(
+                            cfg, session.passive_input(), &mut watchdog,
+                            stale_after, data, dm, health,
+                        ).await;
                     }
                 }
             }
@@ -759,7 +798,7 @@ async fn run_polling(
             // readings in arrival order. One deadline serves every window (no per-signal timers).
             () = sleep_until_deadline(batch_deadline), if batch_deadline.is_some() => {
                 let due = shaper.due(Instant::now());
-                publish_shaped(cfg, due, data, dm, health).await;
+                publish_shaped(cfg, due, data, dm, health, &mut watchdog).await;
                 drain_shaping(dm, &mut shaper);
             }
         }
@@ -856,6 +895,7 @@ async fn publish_shaped(
     data: &DataFacade,
     dm: &Arc<DeviceMetrics>,
     health: &Arc<Health>,
+    watchdog: &mut QualityWatchdog,
 ) -> u64 {
     if updates.is_empty() {
         return 0;
@@ -888,7 +928,13 @@ async fn publish_shaped(
             tracing::warn!(instance = %cfg.id, signal = %first.signal_id, error = %e, "publish failed");
         } else {
             published += 1;
-            dm.on_signal_update(&first.signal_id, Instant::now());
+            let at = Instant::now();
+            dm.on_signal_update(&first.signal_id, at);
+            // Every reading of the window reached the wire; the last one is what the fleet is now
+            // holding, and is what a passive transition would republish.
+            for reading in readings {
+                watchdog.on_published(reading, at);
+            }
         }
     }
     let publish_latency = u64::try_from(publish_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -908,8 +954,9 @@ async fn stop_cleanly(
     data: &DataFacade,
     dm: &Arc<DeviceMetrics>,
     health: &Arc<Health>,
+    watchdog: &mut QualityWatchdog,
 ) -> PollExit {
-    flush_open_windows(cfg, shaper, data, dm, health).await;
+    flush_open_windows(cfg, shaper, data, dm, health, watchdog).await;
     session.close().await;
     PollExit::Closed
 }
@@ -923,8 +970,9 @@ async fn flush_open_windows(
     data: &DataFacade,
     dm: &Arc<DeviceMetrics>,
     health: &Arc<Health>,
+    watchdog: &mut QualityWatchdog,
 ) {
-    publish_shaped(cfg, shaper.flush_all(), data, dm, health).await;
+    publish_shaped(cfg, shaper.flush_all(), data, dm, health, watchdog).await;
     drain_shaping(dm, shaper);
 }
 
@@ -936,13 +984,15 @@ fn drain_shaping(dm: &Arc<DeviceMetrics>, shaper: &mut Shaper) {
 }
 
 /// Publish a batch of readings through the `data()` facade, recording publish latency and feeding
-/// the staleness tracker. Shared by the poll tick, `repoll`, and the resume-time snapshot.
+/// the staleness tracker. Shared by `repoll`, the resume-time snapshot, and the passive-quality
+/// transitions (which bypass the shaper — a quality change never sits in a batch window).
 async fn publish_readings(
     cfg: &DeviceConfig,
     readings: &[crate::device::Reading],
     data: &DataFacade,
     dm: &Arc<DeviceMetrics>,
     health: &Arc<Health>,
+    watchdog: &mut QualityWatchdog,
 ) -> u64 {
     let publish_started = Instant::now();
     let mut published = 0u64;
@@ -970,8 +1020,15 @@ async fn publish_readings(
             tracing::warn!(instance = %cfg.id, signal = %r.signal_id, error = %e, "publish failed");
         } else {
             published += 1;
-            // Feed the staleness tracker — a signal that keeps updating is not stale.
-            dm.on_signal_update(&r.signal_id, Instant::now());
+            // A synthetic quality transition is the watchdog's own output: it says nothing about
+            // value silence, so it feeds NEITHER tracker (D-R13) — it must not reset the
+            // `staleSignals` metric's age, and it must not overwrite the hold it is reporting on.
+            if !crate::staleness::is_synthetic(r) {
+                let at = Instant::now();
+                // Feed the staleness tracker — a signal that keeps updating is not stale.
+                dm.on_signal_update(&r.signal_id, at);
+                watchdog.on_published(r, at);
+            }
         }
     }
     let publish_latency = u64::try_from(publish_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -979,6 +1036,51 @@ async fn publish_readings(
         .publish_latency_ms
         .store(publish_latency, Ordering::Relaxed);
     published
+}
+
+/// Evaluate the link against everything this instance is holding and publish the quality
+/// transitions it produced (HLD §6 rows 2-3, P1-5).
+///
+/// The readings are synthetic: the **held** value with a degraded verdict and the `passive` marker
+/// (D-R14). They BYPASS the shaper — a quality transition is news, not a value in a batch window —
+/// and they feed neither the `staleSignals` tracker nor the watchdog itself (D-R13, enforced in
+/// [`publish_readings`]). A backend with no mediated liveness (`link` is `None` — the simulator,
+/// whose read IS its liveness) has nothing to evaluate.
+///
+/// A steady state returns nothing, so this costs one comparison per tick until something changes.
+async fn publish_passive(
+    cfg: &DeviceConfig,
+    link: Option<PassiveLink>,
+    watchdog: &mut QualityWatchdog,
+    stale_after: Duration,
+    data: &DataFacade,
+    dm: &Arc<DeviceMetrics>,
+    health: &Arc<Health>,
+) {
+    let Some(link) = link else {
+        return;
+    };
+    let mut synthetic = watchdog.evaluate(link, stale_after, Instant::now());
+    if synthetic.is_empty() {
+        return;
+    }
+    tracing::info!(
+        instance = %cfg.id, phase = ?watchdog.phase(), signals = synthetic.len(),
+        "passive quality transition: republishing held values with a new verdict"
+    );
+    // The emission moment is the adapter's receive moment for these samples; the value's own
+    // capture stamp rides on untouched as `serverTs`.
+    stamp_received(&mut synthetic, &now_iso());
+    publish_readings(cfg, &synthetic, data, dm, health, watchdog).await;
+}
+
+/// The link facts a **lost** link presents, whatever the authority's flag reads at this instant:
+/// the read that just failed is itself the evidence, and this session is about to be dropped.
+fn lost_link(link: Option<PassiveLink>) -> Option<PassiveLink> {
+    link.map(|link| PassiveLink {
+        unreachable: true,
+        ..link
+    })
 }
 
 /// Drain the session's protocol notices and publish each as a UNS event through the `events()`

@@ -3048,6 +3048,112 @@ mod mtconnect_seam_tests {
         assert!(sim.passive_input().is_none());
     }
 
+    #[tokio::test]
+    async fn a_delivered_value_stops_reading_good_once_the_agent_stops_vouching_for_it() {
+        // The P1-5 scenario, end to end at the seam: real runtime, real session, real liveness
+        // clock. MTConnect is on-change, so nothing about the DATA changes here — what changes is
+        // whether the agent is still saying the data is current. Without the watchdog, the fleet's
+        // last word on `x-position` would remain the GOOD sample below, forever.
+        let agent = runtime("http://127.0.0.1:9");
+        let handle = agent.attach("OKUMA.123456");
+        let mut session = MtcSession::new(
+            Arc::clone(&agent),
+            device(vec![
+                signal("x-position", "Xabs"),
+                signal("x-load", "Xload"),
+            ]),
+            model(),
+            handle.rx,
+        );
+        deliver(&agent).await;
+
+        // What the tick published, and therefore what the instance is holding.
+        let published = session
+            .read_signals()
+            .await
+            .expect("the agent is delivering");
+        assert_eq!(published.len(), 2);
+        let held = published
+            .iter()
+            .find(|r| r.signal_id == "x-position")
+            .expect("the good one");
+        assert_eq!(held.quality, Quality::Good);
+        assert_eq!(held.value, Some(json!(123.456)));
+
+        let t0 = Instant::now();
+        let mut watchdog = crate::staleness::QualityWatchdog::default();
+        for reading in &published {
+            watchdog.on_published(reading, t0);
+        }
+
+        // The link facts a poll tick reads, but on an instant the test chooses — the authority's
+        // own liveness clock takes `now` as an argument precisely so this needs no sleeping.
+        let link_at = |now: Instant| crate::staleness::PassiveLink {
+            unreachable: !agent.info().connected,
+            liveness_age: agent.liveness_age(now),
+            liveness_window: agent.liveness_window(),
+        };
+        let stale_after = Duration::from_secs(30);
+
+        // Inside the window (two missed polls = 2 s here) nothing moves: an unchanged value under a
+        // live agent is CURRENT, not silent.
+        assert!(watchdog.evaluate(link_at(t0), stale_after, t0).is_empty());
+
+        // One missed poll later the agent has stopped vouching: the held value republishes as
+        // UNCERTAIN, and the UNAVAILABLE one — already BAD with the agent's own reason — does not.
+        let quiet = t0 + Duration::from_secs(5);
+        let stale = watchdog.evaluate(link_at(quiet), stale_after, quiet);
+        assert_eq!(stale.len(), 1, "only the signal that had something to lose");
+        assert_eq!(stale[0].signal_id, "x-position");
+        assert_eq!(stale[0].value, Some(json!(123.456)), "the value is HELD");
+        assert_eq!(stale[0].quality, Quality::Uncertain);
+        let raw = stale[0].quality_raw.clone().expect("a stale marker");
+        let age_ms: u64 = raw
+            .strip_prefix("MTC_STALE:")
+            .expect("MTC_STALE:<ageMs>")
+            .parse()
+            .expect("whole milliseconds");
+        assert!(
+            (5_000..5_500).contains(&age_ms),
+            "the age is the LIVENESS age, from the runtime's own clock: {raw}"
+        );
+        assert_eq!(
+            stale[0].extra.as_ref().unwrap()["sequence"],
+            json!(37),
+            "the synthetic sample still names the observation it describes (D-MTC-6)"
+        );
+        assert_eq!(
+            stale[0].extra.as_ref().unwrap()[crate::staleness::PASSIVE_EXTRA_KEY],
+            json!("stale")
+        );
+
+        // Past `staleSignalSecs` a held value may not stand in at all.
+        let expired = t0 + Duration::from_secs(31);
+        let bad = watchdog.evaluate(link_at(expired), stale_after, expired);
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].quality, Quality::Bad);
+        assert!(bad[0]
+            .quality_raw
+            .as_deref()
+            .is_some_and(|raw| raw.starts_with("MTC_STALE:")));
+
+        // And when the authority loses the agent outright, the reason names the link. (This is the
+        // verdict the device task publishes on its way out of the poll loop.)
+        assert!(agent.poll_once().await.is_err(), "nothing is listening");
+        assert!(!agent.info().connected);
+        let lost = watchdog.evaluate(link_at(expired), stale_after, expired);
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].quality, Quality::Bad);
+        assert_eq!(
+            lost[0].quality_raw.as_deref(),
+            Some(crate::staleness::QUALITY_AGENT_UNREACHABLE)
+        );
+        assert_eq!(
+            lost[0].extra.as_ref().unwrap()[crate::staleness::PASSIVE_EXTRA_KEY],
+            json!("unreachable")
+        );
+    }
+
     // --- protocol notices -> UNS events (HLD §9) ------------------------------------------------
 
     /// A session fed from a queue the test owns, so every runtime event can be delivered
