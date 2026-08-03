@@ -242,6 +242,13 @@ async fn an_out_of_range_error_document_exits_ladder_two_with_the_agents_floor()
 
 #[tokio::test(start_paused = true)]
 async fn an_instance_change_in_a_streams_part_exits_ladder_three() {
+    // P1-4: the part that reveals the restart was decoded against the model of the incarnation
+    // that just died, and ladder 3 is re-probe → recompile → THEN snapshot. So the exit is the
+    // ONLY thing this part produces: its observations wait for the recovery snapshot, which
+    // `run_streaming`'s `continue 'connect` reaches through the resync-first `snapshot_cycle`.
+    // (That the recovery really does publish them, as a re-baseline built with the re-probed
+    // model, is proven end to end in `tests/stream_acquisition.rs` and at the cycle level in
+    // `src/mtconnect/mod.rs`'s ladder-3 tests.)
     let rt = runtime();
     let mut handle = rt.attach("OKUMA.123456");
     rt.ingest_streams(CURRENT_2_7, false).await.unwrap(); // instance 1749000000
@@ -251,15 +258,20 @@ async fn an_instance_change_in_a_streams_part_exits_ladder_three() {
     let exit = drive(&rt, vec![Step::Chunk(part(&restarted)), Step::Hang]).await;
     assert!(matches!(exit, StreamExit::InstanceChanged), "{exit:?}");
     assert!(rt.needs_resync(), "the model is suspect until re-probed");
-    // The restarted agent's low sequence was NOT discarded as stale: the state reset first.
+
     let events: Vec<InstanceEvent> = handle.rx.drain();
     assert!(
-        events
+        !events
             .iter()
-            .any(|e| matches!(e, InstanceEvent::Snapshot(obs)
-            if obs.iter().any(|o| o.sequence == 3))),
-        "fresh post-restart observations are published, not deduped: {events:?}"
+            .any(|e| matches!(e, InstanceEvent::Obs(_) | InstanceEvent::Snapshot(_))),
+        "nothing from the restarted incarnation may be published before the re-probe: {events:?}"
     );
+
+    // The part still counted as liveness and still told the runtime which incarnation is alive —
+    // deferring the observations is not ignoring the document.
+    let info = rt.info();
+    assert!(info.connected, "the restarted agent IS delivering");
+    assert_eq!(info.instance_id, Some(1_749_999_999));
 }
 
 #[tokio::test(start_paused = true)]

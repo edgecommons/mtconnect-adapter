@@ -82,7 +82,8 @@ impl PublishPolicy {
 /// are kept: an absent entry IS the immediate-publish default.
 ///
 /// Without a model there is no category to gate on, so a configured `deadband` applies to any
-/// numeric value the signal produces.
+/// numeric value the signal produces — and no component path either, so the route is the
+/// configured `channel`/`name` alone.
 #[must_use]
 pub fn policies_from_signals(signals: &[SignalConfig]) -> HashMap<String, PublishPolicy> {
     let mut out = HashMap::new();
@@ -92,7 +93,11 @@ pub fn policies_from_signals(signals: &[SignalConfig]) -> HashMap<String, Publis
             batch_ms: p.batch_ms,
             latest_only: p.mode == PublishMode::Interval,
             deadband: p.deadband,
-            route: SignalRoute::default(),
+            route: SignalRoute {
+                channel: s.channel.clone(),
+                component_path: None,
+                name: s.name.clone(),
+            },
         };
         if !policy.is_trivial() {
             out.insert(s.id.clone(), policy);
@@ -867,6 +872,168 @@ mod tests {
         assert_eq!(s.offer(good("b", 9.0), ms(start, 10)).len(), 1);
     }
 
+    /// A reading as the publish path really sees it: routed, because `publish_shaped` mints the
+    /// topic from the FIRST reading of the flushed window.
+    fn routed(id: &str, value: f64, channel: &str) -> Reading {
+        Reading {
+            channel: Some(channel.to_string()),
+            ..good(id, value)
+        }
+    }
+
+    #[test]
+    fn a_route_change_flushes_the_open_window_so_one_update_never_mixes_routes() {
+        // D-R16 / P1-8. A reload that moves a signal's channel while leaving its batching alone
+        // used to leave the window open: the post-reload readings joined the pre-reload ones and
+        // the whole update published on the route of whichever reading happened to be first — one
+        // update, two routing generations. Routing is part of the policy identity, so the swap
+        // flushes the old window with the readings its old route collected.
+        let mut s = Shaper::new();
+        let old = PublishPolicy {
+            batch_ms: 500,
+            latest_only: false,
+            deadband: None,
+            route: SignalRoute {
+                channel: Some("line-a/spindle/speed".into()),
+                component_path: Some("/Device/Rotary".into()),
+                name: Some("Spindle speed".into()),
+            },
+        };
+        let new = PublishPolicy {
+            route: SignalRoute {
+                channel: Some("line-b/spindle/speed".into()),
+                ..old.route.clone()
+            },
+            ..old.clone()
+        };
+        let start = t0();
+        s.set_policies(table(&[("a", old)]));
+        s.offer(routed("a", 1.0, "line-a/spindle/speed"), start);
+        s.offer(routed("a", 2.0, "line-a/spindle/speed"), ms(start, 100));
+
+        // Identical batching, a new route: the window flushes NOW, on the OLD route.
+        let flushed = s.set_policies(table(&[("a", new)]));
+        assert_eq!(flushed.len(), 1, "the route change is a policy change");
+        assert_eq!(
+            flushed[0]
+                .iter()
+                .map(|r| r.value.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec![json!(1.0), json!(2.0)],
+            "with exactly the readings the old route collected"
+        );
+        assert!(
+            flushed[0]
+                .iter()
+                .all(|r| r.channel.as_deref() == Some("line-a/spindle/speed")),
+            "and they publish on the route they were captured under"
+        );
+        assert_eq!(s.next_deadline(), None, "the old window closed with them");
+
+        // The next reading opens a FRESH window on the new route, and flushes separately.
+        s.offer(routed("a", 3.0, "line-b/spindle/speed"), ms(start, 200));
+        assert_eq!(
+            s.next_deadline(),
+            Some(ms(start, 700)),
+            "a new window, opened at arrival"
+        );
+        let due = s.due(ms(start, 700));
+        assert_eq!(due.len(), 1);
+        assert_eq!(
+            due[0].len(),
+            1,
+            "nothing from the old generation rode along"
+        );
+        assert_eq!(
+            due[0][0].channel.as_deref(),
+            Some("line-b/spindle/speed"),
+            "the new route publishes alone"
+        );
+    }
+
+    #[test]
+    fn a_component_path_or_name_change_flushes_the_window_too() {
+        // The route is all three: `publish_shaped` takes the update's componentPath and name from
+        // the first reading as well, so either moving alone would mix generations.
+        let base = PublishPolicy {
+            batch_ms: 500,
+            latest_only: false,
+            deadband: None,
+            route: SignalRoute {
+                channel: Some("spindle/speed".into()),
+                component_path: Some("/Device/Rotary".into()),
+                name: Some("Spindle speed".into()),
+            },
+        };
+        for moved in [
+            PublishPolicy {
+                route: SignalRoute {
+                    component_path: Some("/Device/Rotary/Spindle".into()),
+                    ..base.route.clone()
+                },
+                ..base.clone()
+            },
+            PublishPolicy {
+                route: SignalRoute {
+                    name: Some("Spindle rotary velocity".into()),
+                    ..base.route.clone()
+                },
+                ..base.clone()
+            },
+        ] {
+            let mut s = Shaper::new();
+            s.set_policies(table(&[("a", base.clone())]));
+            s.offer(good("a", 1.0), t0());
+            assert_eq!(
+                s.set_policies(table(&[("a", moved.clone())])).len(),
+                1,
+                "a moved {moved:?} flushes its open window"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unchanged_route_keeps_its_window_running_so_l11_is_not_widened() {
+        // The flush-only-what-changed rule is preserved, not replaced: a reload that leaves a
+        // signal's policy AND route alone must not disturb its window mid-flight.
+        let mut s = Shaper::new();
+        let policy = PublishPolicy {
+            batch_ms: 500,
+            latest_only: false,
+            deadband: None,
+            route: SignalRoute {
+                channel: Some("spindle/speed".into()),
+                component_path: Some("/Device/Rotary".into()),
+                name: Some("Spindle speed".into()),
+            },
+        };
+        let start = t0();
+        s.set_policies(table(&[("a", policy.clone())]));
+        s.offer(good("a", 1.0), start);
+        assert!(
+            s.set_policies(table(&[("a", policy)])).is_empty(),
+            "same policy, same route: the window keeps running"
+        );
+        assert_eq!(s.next_deadline(), Some(ms(start, 500)));
+    }
+
+    #[test]
+    fn a_route_alone_never_forces_a_table_entry() {
+        // A trivial policy never buffers, so it cannot mix generations — routing it would only cost
+        // the unshaped fast path an entry it does not need.
+        assert!(PublishPolicy {
+            batch_ms: 0,
+            latest_only: false,
+            deadband: None,
+            route: SignalRoute {
+                channel: Some("spindle/speed".into()),
+                component_path: Some("/Device/Rotary".into()),
+                name: Some("Spindle speed".into()),
+            },
+        }
+        .is_trivial());
+    }
+
     #[test]
     fn an_identical_policy_table_flushes_nothing() {
         let mut s = Shaper::new();
@@ -897,7 +1064,9 @@ mod tests {
             { "id": "batched", "dataItemId": "d2", "publish": { "batchMs": 250 } },
             { "id": "banded", "dataItemId": "d3", "publish": { "deadband": 0.5 } },
             { "id": "latest", "dataItemId": "d4",
-              "publish": { "mode": "interval", "batchMs": 100 } }
+              "publish": { "mode": "interval", "batchMs": 100 } },
+            { "id": "routed", "dataItemId": "d5", "name": "Spindle speed",
+              "channel": "spindle/speed", "publish": { "batchMs": 250 } }
         ]))
         .unwrap();
         let policies = policies_from_signals(&signals);
@@ -922,6 +1091,16 @@ mod tests {
                 latest_only: true,
                 deadband: None,
                 route: SignalRoute::default()
+            }
+        );
+        // Without a model there is no component path, but the configured channel and name are the
+        // route this backend publishes on — and a reload that moves either flushes the window.
+        assert_eq!(
+            policies["routed"].route,
+            SignalRoute {
+                channel: Some("spindle/speed".into()),
+                component_path: None,
+                name: Some("Spindle speed".into()),
             }
         );
     }

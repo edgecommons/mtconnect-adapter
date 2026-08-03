@@ -1494,6 +1494,12 @@ impl DeviceSession for MtcSession {
     /// only to a **SAMPLE**-category data item (the documented contract); on any other category —
     /// or a data item the model does not have — it is dropped from the policy, so an EVENT's
     /// state strings and a CONDITION's transitions are never numerically gated.
+    ///
+    /// Each policy also carries where the signal publishes — its effective channel and name, and
+    /// the model's canonical component path — because routing is part of the policy's **identity**
+    /// (D-R16). A reload or a model drift that moves a signal to a new channel/path/name therefore
+    /// flushes its open window with the readings the old route collected, instead of letting one
+    /// update mix two routing generations.
     fn shaping_policies(&self) -> HashMap<String, crate::shaping::PublishPolicy> {
         let mut out = HashMap::new();
         for served in &self.served {
@@ -1507,7 +1513,14 @@ impl DeviceSession for MtcSession {
                 batch_ms: p.batch_ms,
                 latest_only: p.mode == PublishMode::Interval,
                 deadband: if is_sample { p.deadband } else { None },
-                route: crate::shaping::SignalRoute::default(),
+                route: crate::shaping::SignalRoute {
+                    channel: sig.channel.clone(),
+                    component_path: self
+                        .model
+                        .component_path_of(&sig.data_item_id)
+                        .map(str::to_string),
+                    name: sig.name.clone(),
+                },
             };
             if !policy.is_trivial() {
                 out.insert(sig.id.clone(), policy);
@@ -2232,6 +2245,85 @@ mod mtconnect_seam_tests {
             !policies.contains_key("execution"),
             "derived EVENT: immediate, no entry"
         );
+    }
+
+    #[test]
+    fn a_compiled_policy_carries_where_the_signal_publishes() {
+        // D-R16: the session knows the route — the served signal's effective channel and name, and
+        // the model's canonical component path — so the policy can carry it and a move can be seen
+        // as the policy change it is.
+        let agent = runtime("http://127.0.0.1:9");
+        let (_tx, rx) = instance_queue();
+        let mut explicit = signal("x-position", "Xabs");
+        explicit.channel = Some("line-a/x-position".into());
+        explicit.name = Some("X position".into());
+        explicit.publish = Some(serde_json::from_value(json!({ "batchMs": 500 })).unwrap());
+        let session = MtcSession::new(agent, device(vec![explicit]), model(), rx);
+
+        assert_eq!(
+            session.shaping_policies()["x-position"].route,
+            crate::shaping::SignalRoute {
+                channel: Some("line-a/x-position".into()),
+                component_path: model().component_path_of("Xabs").map(str::to_string),
+                name: Some("X position".into()),
+            },
+            "the compiled route is the one `publish_shaped` will mint the topic from"
+        );
+    }
+
+    #[test]
+    fn a_route_only_reload_is_a_policy_change_so_the_open_window_flushes() {
+        // P1-8 at the seam. A reload that moves a signal's channel and leaves its batching alone
+        // used to leave the window open, so the readings the old route collected published
+        // together with post-reload ones - one update, two routing generations. The route is part
+        // of the policy identity now, so the swap flushes the old window first.
+        let agent = runtime("http://127.0.0.1:9");
+        let (_tx, rx) = instance_queue();
+        let batched = |channel: &str| {
+            let mut sig = signal("x-position", "Xabs");
+            sig.channel = Some(channel.to_string());
+            sig.publish = Some(serde_json::from_value(json!({ "batchMs": 500 })).unwrap());
+            sig
+        };
+        let mut session = MtcSession::new(
+            Arc::clone(&agent),
+            device(vec![batched("line-a/x-position")]),
+            model(),
+            rx,
+        );
+
+        let mut shaper = crate::shaping::Shaper::new();
+        shaper.set_policies(session.shaping_policies());
+        let start = Instant::now();
+        assert!(
+            shaper
+                .offer(
+                    Reading {
+                        channel: Some("line-a/x-position".into()),
+                        ..Reading::good("x-position", json!(1.0))
+                    },
+                    start
+                )
+                .is_empty(),
+            "buffered under the old route"
+        );
+
+        // The reload: the same window, a new channel.
+        session.device.signals = vec![batched("line-b/x-position")];
+        session.generation = crate::reload::generation_of(
+            &session.device.signals,
+            session.device.selection.as_ref(),
+        );
+        session.recompile();
+
+        let flushed = shaper.set_policies(session.shaping_policies());
+        assert_eq!(flushed.len(), 1, "the moved signal's window flushed");
+        assert_eq!(
+            flushed[0][0].channel.as_deref(),
+            Some("line-a/x-position"),
+            "with its readings, on the route they were captured under"
+        );
+        assert_eq!(shaper.next_deadline(), None, "and the old window is closed");
     }
 
     #[test]

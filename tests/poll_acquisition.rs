@@ -657,6 +657,74 @@ async fn reconnecting_re_probes_and_republishes_everything_as_fresh() {
 }
 
 #[tokio::test]
+async fn a_restarted_agent_reaches_the_session_only_after_the_model_is_re_probed() {
+    // P1-4 at the seam an operator can see. The `/current` of a restarted agent was decoded
+    // against the model of the incarnation that just died: publishing it and re-probing afterwards
+    // hands the fleet readings from one model generation routed by the next. LLD §5 ladder 3 is
+    // re-probe → recompile → THEN snapshot, so the restart cycle publishes nothing at all and the
+    // cycle after it delivers the whole fresh view.
+    let agent = FakeAgent::start().await;
+    let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
+    let mut session = backend.connect(&connection()).await.expect("connect");
+    runtime.poll_once().await.unwrap();
+    assert_eq!(session.read_signals().await.unwrap().len(), 1);
+    let _ = session.take_resync();
+
+    // The agent restarts, and comes back describing a machine that was refitted while it was down.
+    agent.set(
+        "current",
+        CURRENT
+            .replace("instanceId=\"1749000000\"", "instanceId=\"1753000000\"")
+            .replace("nextSequence=\"42\"", "nextSequence=\"6\"")
+            .replace(
+                r#"sequence="37" timestamp="2026-07-27T10:00:04.250000Z">123.456"#,
+                r#"sequence="5" timestamp="2026-07-27T10:00:19.500000Z">200.5"#,
+            ),
+    );
+    agent.set(
+        "probe",
+        PROBE.replace("name=\"OKUMA-CNC\"", "name=\"CNC-REFITTED\""),
+    );
+    let probes_before = agent.request_count("/probe");
+
+    let report = runtime.poll_once().await.unwrap();
+    assert_eq!(report.published, 0, "the restart cycle publishes nothing");
+    assert!(report.deferred, "and says why");
+    assert!(
+        session.read_signals().await.unwrap().is_empty(),
+        "no reading decoded against the dead incarnation's model reached the instance"
+    );
+    assert!(
+        !session.take_resync(),
+        "and nothing claimed to re-baseline the session's view either"
+    );
+    assert_eq!(
+        agent.request_count("/probe"),
+        probes_before,
+        "the re-probe belongs to the NEXT cycle, which takes it before it fetches anything"
+    );
+
+    // The next cycle: re-probe (drift surfaced), then the whole fresh view.
+    let report = runtime.poll_once().await.unwrap();
+    assert!(!report.deferred);
+    assert!(report.published > 0, "everything republishes as fresh");
+    assert_eq!(
+        agent.request_count("/probe"),
+        probes_before + 1,
+        "the model was re-verified before this cycle's document was routed by it"
+    );
+    let readings = session.read_signals().await.unwrap();
+    assert_eq!(readings.len(), 1);
+    assert_eq!(readings[0].value, Some(json!(200.5)));
+    assert_eq!(readings[0].extra.as_ref().unwrap()["sequence"], json!(5));
+    assert!(
+        session.take_resync(),
+        "the recovery is a re-baseline: the session re-arms its deadband"
+    );
+}
+
+#[tokio::test]
 async fn a_reconnect_through_the_running_task_reports_a_probe_failure() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);

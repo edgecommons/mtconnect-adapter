@@ -849,16 +849,37 @@ impl AgentRuntime {
     /// recovery snapshot are all this, differing only in whether the dedupe floors are bypassed
     /// (`republish_all`: a recovery snapshot deliberately says everything again, as fresh).
     ///
+    /// It is also where **ladder 3 completes**, in the order LLD §5 mandates: re-probe → recompile
+    /// → THEN snapshot. Poll-only and streaming share this one path, so resync-first holds for both.
+    ///
     /// # Errors
     /// Any client or parse error; the runtime marks itself down and tells every attached instance
-    /// before returning.
+    /// before returning. A failed re-probe returns the probe's error with the resync still pending.
     pub async fn snapshot_cycle(&self, republish_all: bool) -> Result<PollReport, MtcError> {
-        // Read BEFORE the cycle touches anything: a pending resync means this `/current` IS the
-        // ladder-3 re-baseline, even though the floors were already cleared for it by
-        // `reset_for_new_instance` and no `republish_all` is needed to make it republish. The
-        // `Snapshot` event is the MARKER a session needs (it re-arms the deadband), not the
-        // mechanism that refills it.
+        // Read BEFORE the cycle touches anything — and, above all, before the resync below clears
+        // the flag: a pending resync means this `/current` IS the ladder-3 re-baseline, even though
+        // the floors were already cleared for it by `reset_for_new_instance` and no `republish_all`
+        // is needed to make it republish. The `Snapshot` event is the MARKER a session needs (it
+        // re-arms the deadband), not the mechanism that refills it.
         let re_baseline = republish_all || self.needs_resync();
+        // Ladder 3 FIRST: a restarted agent may have come back with a different device model, so
+        // the model is re-verified (drift surfaced, never remapped) before this cycle fetches
+        // anything. Publishing observations decoded against the dead incarnation's model is what
+        // P1-4 forbids, and doing the re-probe after the dispatch is how it used to happen.
+        if self.needs_resync() {
+            for uuid in self.attached() {
+                if let Err(e) = self.refresh_model(&uuid).await {
+                    // The flag STAYS set: the next cycle re-enters resync-first, and until a probe
+                    // answers, nothing is published against a model that may already be void.
+                    tracing::warn!(
+                        agent = %self.cfg.id, device = %uuid, error = %e,
+                        "re-probe failed; the resync stays pending and nothing is published"
+                    );
+                    return Err(e);
+                }
+            }
+            self.resync_needed.store(false, Ordering::Relaxed);
+        }
         let started = Instant::now();
         let fetched = self.client.current(None).await;
         self.stats
@@ -873,14 +894,11 @@ impl AgentRuntime {
         let report = self
             .ingest_streams_as(&text, republish_all, re_baseline)
             .await?;
-        // Ladder 3 completes here, where a re-probe can actually be awaited: a restarted agent may
-        // have come back with a different device model, and drift is surfaced, never remapped.
-        if self.resync_needed.swap(false, Ordering::Relaxed) {
-            for uuid in self.attached() {
-                if let Err(e) = self.refresh_model(&uuid).await {
-                    tracing::warn!(agent = %self.cfg.id, device = %uuid, error = %e, "re-probe failed");
-                }
-            }
+        if report.deferred {
+            // The agent restarted AGAIN mid-recovery: this document was decoded against a model
+            // that is void once more, so nothing was dispatched. The next cycle re-enters
+            // resync-first against the newer incarnation, and the attach debts stay owed.
+            return Ok(report);
         }
         // A `/current` document covers every attached device, so any snapshots owed to freshly
         // attached instances were just served (their dedupe floors were unset).
@@ -939,6 +957,12 @@ impl AgentRuntime {
 
     /// Fold one already-parsed Streams document into the runtime: sequence header, dedupe,
     /// dispatch, published state. Infallible — parsing (and its failure policy) is the caller's.
+    ///
+    /// A document that reveals — or arrives under — a pending `instanceId` resync is **deferred**:
+    /// it updates liveness, the header facts and the counters, but dispatches nothing and touches
+    /// no dedupe floor, because the model generation it was decoded against is void
+    /// ([`PollReport::deferred`]). [`Self::snapshot_cycle`] re-probes and then covers those
+    /// observations with the post-resync snapshot.
     async fn ingest_streams_doc(
         &self,
         doc: &xml::StreamsDoc,
@@ -954,20 +978,28 @@ impl AgentRuntime {
             }
             seq.observe_header(&doc.header)
         };
-        let mut re_baseline = re_baseline;
+        let instance_changed = matches!(outcome, HeaderOutcome::InstanceChanged { .. });
         if let HeaderOutcome::InstanceChanged { old, new } = outcome {
             // Ladder 3: the numbers are already void (the state reset itself). The MODEL is now
-            // suspect too, so a re-probe is scheduled rather than assumed unnecessary. Every floor
-            // just went with the old incarnation, so whatever this document carries is a fresh
-            // view of the device, not on-change flow.
+            // suspect too, so a re-probe is scheduled rather than assumed unnecessary. What this
+            // document carries is a fresh view of a device whose model has yet to be verified —
+            // the gate below is what stops it from being published as one.
             tracing::warn!(agent = %self.cfg.id, old, new, "agent restarted; resequencing");
             self.resync_needed.store(true, Ordering::Relaxed);
-            re_baseline = true;
         }
+        // The generation gate (P1-4). This document was decoded against a model generation the
+        // runtime now knows is void — either because this very header revealed the restart, or
+        // because an earlier document did and the re-probe has not run yet. LLD §5 ladder 3 is
+        // re-probe → recompile → THEN snapshot, so nothing here may be dispatched: an update
+        // decoded against the old model and routed by the new one mixes generations. The document
+        // still proves the NEW incarnation is alive and still feeds the counters; its observations
+        // are covered by the post-resync `/current`, whose floors this document must not touch.
+        let deferred = instance_changed || self.needs_resync();
 
         let mut report = PollReport {
             device_streams: doc.device_streams.len(),
             unknown_elements: doc.unknown_elements,
+            deferred,
             ..PollReport::default()
         };
 
@@ -986,6 +1018,13 @@ impl AgentRuntime {
                     continue;
                 };
                 report.observations += 1;
+                if deferred {
+                    // Counted, never dispatched — and deliberately never measured against a dedupe
+                    // floor: a floor recorded here would claim the instance already has an
+                    // observation it was never sent, and would suppress the post-resync snapshot's
+                    // own copy of it forever.
+                    continue;
+                }
                 let is_new = {
                     let mut seq = self.seq.lock().expect("sequence state");
                     seq.should_publish(&dedupe_key(&ds.uuid, &obs.data_item_id), obs.sequence)
@@ -1911,19 +1950,47 @@ mod tests {
     const HEARTBEAT_2_7: &str = include_str!("../../tests/fixtures/heartbeat_2.7.xml");
     const DEVICES_2_7: &str = include_str!("../../tests/fixtures/devices_2.7.xml");
 
+    /// The documents the stand-in agent is currently serving. A test restages an agent restart by
+    /// installing a new `/current` (and, when the machine was reconfigured too, a new `/probe`).
+    #[derive(Clone)]
+    struct AgentDocs {
+        probe: Arc<Mutex<String>>,
+        current: Arc<Mutex<String>>,
+    }
+
+    impl AgentDocs {
+        fn set_probe(&self, doc: &str) {
+            *self.probe.lock().expect("probe doc") = doc.to_string();
+        }
+        fn set_current(&self, doc: &str) {
+            *self.current.lock().expect("current doc") = doc.to_string();
+        }
+    }
+
     /// A runtime backed by a minimal HTTP agent stand-in: `/probe` answers the devices fixture,
     /// every other path the `/current` one. Enough to drive the cycles that do real I/O
     /// (`snapshot_cycle`, `service_attach_snapshots`) rather than only the pure ingest path.
     async fn agent_backed_runtime() -> Arc<AgentRuntime> {
+        agent_backed_runtime_with_docs().await.0
+    }
+
+    /// [`agent_backed_runtime`] plus the handle that restages what it serves.
+    async fn agent_backed_runtime_with_docs() -> (Arc<AgentRuntime>, AgentDocs) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+        let docs = AgentDocs {
+            probe: Arc::new(Mutex::new(DEVICES_2_7.to_string())),
+            current: Arc::new(Mutex::new(CURRENT_2_7.to_string())),
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let served = docs.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
+                let served = served.clone();
                 tokio::spawn(async move {
                     let mut head = Vec::new();
                     let mut byte = [0u8; 1];
@@ -1934,9 +2001,9 @@ mod tests {
                         }
                     }
                     let body = if String::from_utf8_lossy(&head).contains("/probe") {
-                        DEVICES_2_7
+                        served.probe.lock().expect("probe doc").clone()
                     } else {
-                        CURRENT_2_7
+                        served.current.lock().expect("current doc").clone()
                     };
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1947,12 +2014,28 @@ mod tests {
                 });
             }
         });
-        AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             agent_cfg(&format!("http://{addr}")),
             &AgentCredentials::default(),
             clock(),
         )
-        .unwrap()
+        .unwrap();
+        (runtime, docs)
+    }
+
+    /// The `/current` fixture as a restarted agent would serve it: a new incarnation, and sequence
+    /// numbering that restarted with it.
+    fn restarted_current(instance_id: u64, sequence: u64) -> String {
+        CURRENT_2_7
+            .replace(
+                "instanceId=\"1749000000\"",
+                &format!("instanceId=\"{instance_id}\""),
+            )
+            .replace(
+                "nextSequence=\"42\"",
+                &format!("nextSequence=\"{}\"", sequence + 1),
+            )
+            .replace("sequence=\"37\"", &format!("sequence=\"{sequence}\""))
     }
 
     /// One observation, shaped for the queue tests.
@@ -2121,25 +2204,85 @@ mod tests {
 
     #[tokio::test]
     async fn an_agent_restart_resequences_before_anything_is_published() {
+        // P1-4: the name is the rule. A document from a new incarnation was decoded against the
+        // model of the dead one, so LLD §5 ladder 3 — re-probe, recompile, THEN snapshot — must
+        // complete before ANY of it reaches an instance. It used to be published on the spot and
+        // re-probed afterwards, which is one update decoded by one model generation and routed by
+        // the next.
         let rt = runtime();
         let mut handle = rt.attach("OKUMA.123456");
         rt.ingest_streams(CURRENT_2_7, false).await.unwrap();
         handle.rx.drain();
 
-        // Same observations, new incarnation, sequences restarted from 1.
-        let restarted = CURRENT_2_7
-            .replace("instanceId=\"1749000000\"", "instanceId=\"1749999999\"")
-            .replace("sequence=\"37\"", "sequence=\"3\"");
+        // Same observations, new incarnation, sequences restarted from 3.
+        let restarted = restarted_current(1_749_999_999, 3);
         let report = rt.ingest_streams(&restarted, false).await.unwrap();
+        assert_eq!(
+            report.published, 0,
+            "nothing may be published against a model generation that just went void"
+        );
+        assert!(report.deferred, "and the report says why");
         assert!(
-            report.published > 0,
-            "a restarted agent's low sequences are not stale"
+            report.observations > 0,
+            "the document was still decoded and counted"
+        );
+        assert!(
+            handle.rx.drain().is_empty(),
+            "no observation, and no re-baseline either, reached the instance"
         );
         assert!(
             rt.needs_resync(),
             "a restarted agent's model is re-probed before it is trusted"
         );
+
+        // Nothing claimed a floor: the post-resync snapshot must be free to say all of it again.
+        assert_eq!(
+            rt.seq
+                .lock()
+                .expect("sequence state")
+                .floor(&dedupe_key("OKUMA.123456", "Xabs")),
+            None,
+            "the restart cleared every floor, and the deferred document set none"
+        );
+
+        // The document still proved the NEW incarnation alive: liveness and the header facts are
+        // exactly what a `/current` in the next cycle needs.
         assert_eq!(rt.info().instance_id, Some(1_749_999_999));
+        assert!(rt.info().connected, "the restarted agent IS delivering");
+    }
+
+    #[tokio::test]
+    async fn every_document_under_a_pending_resync_is_deferred_not_only_the_one_that_revealed_it() {
+        // The gate is the pending resync, not the header transition: a stream that keeps delivering
+        // from the new incarnation while the re-probe is still owed is still decoding against a
+        // void model, so its parts wait for the recovery snapshot too.
+        let rt = runtime();
+        let mut handle = rt.attach("OKUMA.123456");
+        rt.ingest_streams(CURRENT_2_7, false).await.unwrap();
+        handle.rx.drain();
+
+        rt.ingest_streams(&restarted_current(1_749_999_999, 3), false)
+            .await
+            .unwrap();
+        handle.rx.drain();
+        assert!(rt.needs_resync());
+
+        // A later document from the SAME new incarnation: the header says nothing changed.
+        let report = rt
+            .ingest_streams(&restarted_current(1_749_999_999, 9), false)
+            .await
+            .unwrap();
+        assert_eq!(report.published, 0, "still no verified model to route by");
+        assert!(report.deferred);
+        assert!(handle.rx.drain().is_empty());
+        assert_eq!(
+            rt.seq
+                .lock()
+                .expect("sequence state")
+                .floor(&dedupe_key("OKUMA.123456", "Xabs")),
+            None,
+            "and it claimed no floor either"
+        );
     }
 
     #[tokio::test]
@@ -2740,24 +2883,172 @@ mod tests {
         );
     }
 
+    // =============================================================================================
+    // Generation safety (P1-4): re-probe → recompile → THEN snapshot
+    // =============================================================================================
+
     #[tokio::test]
-    async fn a_restart_document_is_a_re_baseline_because_every_floor_went_with_it() {
-        let rt = runtime();
+    async fn the_recovery_cycle_re_probes_before_it_publishes_the_restarted_agents_view() {
+        // The whole ladder-3 order in one place. Cycle N meets a restarted agent and publishes
+        // NOTHING; cycle N+1 re-probes first — surfacing the drift the restart brought with it —
+        // and only then hands the instance a re-baseline built with the model it just verified.
+        let (rt, docs) = agent_backed_runtime_with_docs().await;
         let mut handle = rt.attach("OKUMA.123456");
-        rt.ingest_streams(CURRENT_2_7, false).await.unwrap();
         handle.rx.drain();
 
-        let restarted = CURRENT_2_7
-            .replace("instanceId=\"1749000000\"", "instanceId=\"1749999999\"")
-            .replace("sequence=\"37\"", "sequence=\"3\"");
-        rt.ingest_streams(&restarted, false).await.unwrap();
+        // The connect phase probes, then a cold cycle: ordinary flow against the model as probed.
+        rt.ensure_model("OKUMA.123456").await.unwrap();
+        let digest_before = rt.model("OKUMA.123456").unwrap().digest_hex();
+        rt.snapshot_cycle(false).await.unwrap();
+        assert!(handle
+            .rx
+            .drain()
+            .iter()
+            .any(|e| matches!(e, InstanceEvent::Obs(_))));
+
+        // The agent restarts, and comes back describing a machine that was reconfigured while it
+        // was down — the exact case a silent remap would corrupt.
+        docs.set_current(&restarted_current(1_753_000_000, 3));
+        docs.set_probe(&DEVICES_2_7.replace("name=\"OKUMA-CNC\"", "name=\"OKUMA-CNC-REFITTED\""));
+
+        let report = rt.snapshot_cycle(false).await.unwrap();
+        assert_eq!(report.published, 0, "cycle N publishes nothing");
+        assert!(report.deferred);
+        assert!(handle.rx.drain().is_empty(), "and dispatches nothing");
+        assert!(rt.needs_resync(), "the re-probe is still owed");
+        assert_eq!(
+            rt.model("OKUMA.123456").unwrap().digest_hex(),
+            digest_before,
+            "the model is still the old one: the deferral is what protects the readings"
+        );
+
+        // Cycle N+1: re-probe, drift, then the fresh view.
+        let report = rt.snapshot_cycle(false).await.unwrap();
+        assert!(!report.deferred);
+        assert!(report.published > 0, "everything republishes as fresh");
+        assert!(!rt.needs_resync(), "the re-probe completed");
+        assert_ne!(
+            rt.model("OKUMA.123456").unwrap().digest_hex(),
+            digest_before,
+            "the model was re-verified before anything was routed by it"
+        );
+
+        let events = handle.rx.drain();
+        let drift_at = events
+            .iter()
+            .position(|e| matches!(e, InstanceEvent::ModelDrift { .. }))
+            .expect("a changed digest is drift, never a silent remap");
+        let baseline_at = events
+            .iter()
+            .position(|e| {
+                matches!(e, InstanceEvent::Snapshot(batch)
+                                   if batch.iter().any(|o| o.sequence == 3))
+            })
+            .unwrap_or_else(|| {
+                panic!("the post-restart view arrives as a re-baseline: {events:?}")
+            });
+        assert!(
+            drift_at < baseline_at,
+            "the recompile reaches the session BEFORE the readings it governs: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_restart_during_recovery_defers_again_and_publishes_neither_document() {
+        // The agent restart-loops. Each recovery cycle re-probes, meets a document from a NEWER
+        // incarnation, and defers again — so no observation from any interim document is ever
+        // dispatched, and the floors stay clear for whichever incarnation finally settles.
+        let (rt, docs) = agent_backed_runtime_with_docs().await;
+        let mut handle = rt.attach("OKUMA.123456");
+        handle.rx.drain();
+        rt.snapshot_cycle(false).await.unwrap();
+        handle.rx.drain();
+
+        docs.set_current(&restarted_current(1_753_000_000, 3));
+        let first = rt.snapshot_cycle(false).await.unwrap();
+        assert!(first.deferred && first.published == 0);
+
+        // It restarted AGAIN before the recovery snapshot could be taken.
+        docs.set_current(&restarted_current(1_755_000_000, 5));
+        let second = rt.snapshot_cycle(false).await.unwrap();
+        assert!(
+            second.deferred && second.published == 0,
+            "the recovery snapshot itself revealed a newer incarnation: {second:?}"
+        );
+        assert!(
+            rt.needs_resync(),
+            "so the next cycle re-enters resync-first"
+        );
+        assert!(
+            handle.rx.drain().is_empty(),
+            "neither interim document reached the instance"
+        );
+
+        // It settles: the next cycle re-probes and publishes the surviving incarnation's view.
+        let third = rt.snapshot_cycle(false).await.unwrap();
+        assert!(!third.deferred);
+        assert!(third.published > 0);
         let events = handle.rx.drain();
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, InstanceEvent::Snapshot(_))),
-            "the old incarnation's floors are void: this is a fresh view, not on-change: {events:?}"
+                .any(|e| matches!(e, InstanceEvent::Snapshot(batch)
+                                           if batch.iter().any(|o| o.sequence == 5))),
+            "only the incarnation that survived is published: {events:?}"
         );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, InstanceEvent::Obs(o) if o.sequence == 3))
+                && !events
+                    .iter()
+                    .any(|e| matches!(e, InstanceEvent::Snapshot(batch)
+                                                   if batch.iter().any(|o| o.sequence == 3))),
+            "nothing from the incarnation that came and went: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_re_probe_keeps_the_resync_pending_and_publishes_nothing() {
+        // The re-probe is the gate, not a formality afterwards. When it cannot be taken, the cycle
+        // fails there — it does not fall through to a `/current` it would have to decode against
+        // the model of the incarnation that died.
+        let (rt, docs) = agent_backed_runtime_with_docs().await;
+        let mut handle = rt.attach("OKUMA.123456");
+        rt.ensure_model("OKUMA.123456").await.unwrap();
+        rt.snapshot_cycle(false).await.unwrap();
+        handle.rx.drain();
+
+        // The agent restarts, and its probe stops answering with anything usable.
+        docs.set_current(&restarted_current(1_753_000_000, 3));
+        rt.snapshot_cycle(false).await.unwrap();
+        handle.rx.drain();
+        assert!(rt.needs_resync());
+        docs.set_probe("<not-a-devices-document/>");
+
+        let err = rt
+            .snapshot_cycle(false)
+            .await
+            .expect_err("the model cannot be re-verified, so the cycle cannot complete");
+        assert!(
+            matches!(err, MtcError::Xml(_) | MtcError::NoSuchDevice(_)),
+            "{err:?}"
+        );
+        assert!(rt.needs_resync(), "the resync is still owed");
+        assert!(
+            !handle
+                .rx
+                .drain()
+                .iter()
+                .any(|e| matches!(e, InstanceEvent::Obs(_) | InstanceEvent::Snapshot(_))),
+            "and nothing was published behind the failed re-probe"
+        );
+
+        // The probe recovers: the same cycle, taken again, completes the ladder.
+        docs.set_probe(DEVICES_2_7);
+        let report = rt.snapshot_cycle(false).await.unwrap();
+        assert!(report.published > 0 && !report.deferred);
+        assert!(!rt.needs_resync());
     }
 
     #[tokio::test]

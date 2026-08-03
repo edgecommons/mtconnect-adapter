@@ -300,6 +300,26 @@ async fn wait_for(
     .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
 
+/// [`wait_for`] that also answers with everything which arrived BEFORE the match, in order — what
+/// an ordering assertion needs ("the re-probe reached the instance ahead of the readings it
+/// governs"). The stepped-over events are still put back, so a later wait can find them too.
+async fn wait_preceded_by(
+    events: &mut Events,
+    what: &str,
+    mut pred: impl FnMut(&InstanceEvent) -> bool,
+) -> (InstanceEvent, Vec<InstanceEvent>) {
+    let mut before = Vec::new();
+    let matched = wait_for(events, what, |e| {
+        if pred(e) {
+            return true;
+        }
+        before.push(e.clone());
+        false
+    })
+    .await;
+    (matched, before)
+}
+
 /// Whether an event is ORDINARY on-change delivery of this observation. Ordinary flow is dispatched
 /// per observation, each onto the lane its class earns; only a genuine re-baseline is a `Snapshot`.
 fn on_change(event: &InstanceEvent, sequence: u64) -> bool {
@@ -501,19 +521,29 @@ async fn an_agent_restart_reprobes_surfaces_drift_and_resumes() {
     let mut handle = Events::of(rt.attach(DEVICE));
     rt.spawn(CancellationToken::new()).unwrap();
 
-    // The restart's own observation is published fresh (sequence numbering restarted at 3) — as a
-    // RE-BASELINE, because every dedupe floor went with the dead incarnation and what the instance
-    // is being handed is a whole fresh view, not one more on-change reading.
-    wait_for(&mut handle, "the post-restart observation", |e| {
-        re_baseline(e, 3)
+    // Ladder 3 in the order LLD §5 mandates: re-probe → recompile → THEN snapshot. The streamed
+    // part that revealed the restart publishes NOTHING — it was decoded against the model of the
+    // incarnation that just died — and the recovery `/current` hands the instance its whole fresh
+    // view (sequence numbering restarted at 3) as a RE-BASELINE, built with the model the re-probe
+    // just verified. Every dedupe floor went with the dead incarnation, so all of it is fresh.
+    let (view, before) = wait_preceded_by(&mut handle, "the post-restart view", |e| {
+        on_change(e, 3) || re_baseline(e, 3)
     })
     .await;
+    assert!(
+        re_baseline(&view, 3),
+        "the post-restart view arrives as a re-baseline, not as on-change flow: {view:?}"
+    );
 
-    // Ladder 3: the model was re-verified and its digest CHANGED — surfaced, never remapped.
-    let drift = wait_for(&mut handle, "the model-drift event", |e| {
-        matches!(e, InstanceEvent::ModelDrift { .. })
-    })
-    .await;
+    // The model-drift event is what says the recompile happened, and it is IN the prefix: the
+    // FIRST thing carrying a post-restart observation was preceded by the re-probe, so nothing was
+    // ever routed by a model generation the runtime had not re-verified (P1-4).
+    let drift = before
+        .iter()
+        .find(|e| matches!(e, InstanceEvent::ModelDrift { .. }))
+        .unwrap_or_else(|| {
+            panic!("the re-probe must precede any post-restart observation: {before:?}")
+        });
     let InstanceEvent::ModelDrift { old, new } = drift else {
         unreachable!()
     };
