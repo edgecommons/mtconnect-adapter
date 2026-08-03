@@ -15,11 +15,11 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use mtconnect_adapter::mtconnect::config::{parse_agents, AgentCredentials};
+use mtconnect_adapter::mtconnect::config::{AgentCredentials, parse_agents};
 use mtconnect_adapter::mtconnect::multipart::MultipartReader;
 use mtconnect_adapter::mtconnect::{
-    AgentCtl, AgentRuntime, ChunkSource, InstanceEvent, MtcError, StreamExit, StreamRun,
-    MAX_CONSECUTIVE_UNDECODABLE,
+    AgentCtl, AgentRuntime, ChunkSource, InstanceEvent, MAX_CONSECUTIVE_UNDECODABLE, MtcError,
+    StreamExit, StreamRun,
 };
 use serde_json::json;
 use std::sync::Arc;

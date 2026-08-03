@@ -63,11 +63,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use multipart::MultipartReader;
-use stream::{classify_part, PartDoc};
+use stream::{PartDoc, classify_part};
 
 pub use client::{MtcClient, StreamRequest, StreamResponse};
 pub use config::{
@@ -78,8 +78,8 @@ pub use error::{MtcError, ParseCounters};
 pub use model::{BrowseNode, Category, DataItemMeta, DeviceNode, NodeKind, ProbeModel, Repr};
 pub use observations::{CondState, DecodeReject, ObsValue, Observation};
 pub use selection::{
-    served_set, ChannelBudget, DerivedChannel, Matcher, Provenance, SelectionConfig, SelectionMode,
-    ServedSet, ServedSignal,
+    ChannelBudget, DerivedChannel, Matcher, Provenance, SelectionConfig, SelectionMode, ServedSet,
+    ServedSignal, served_set,
 };
 pub use sequence::{AcqState, HeaderOutcome, SequenceState};
 pub use stats::{AgentStats, AgentStatsSnapshot};
@@ -1068,6 +1068,13 @@ impl AgentRuntime {
             ..PollReport::default()
         };
 
+        // The arrival moment (C-6): ONE document is ONE arrival, so the whole payload is stamped
+        // with the clock read here — before the queue, before any session drains it. A reading's
+        // `receivedTs` therefore measures when the agent's payload reached this adapter, not when
+        // a device task happened to get round to it; the drain-time stamp it replaced folded the
+        // queue backlog and the instance's poll cadence into the number.
+        let arrival = self.now();
+
         for ds in &doc.device_streams {
             if !self.is_attached(&ds.uuid) {
                 continue;
@@ -1079,13 +1086,14 @@ impl AgentRuntime {
                     .elem
                     .attr("dataItemId")
                     .and_then(|id| model.as_ref().and_then(|m| m.item(id).cloned()));
-                let obs = match observations::decode(entry, meta.as_ref()) {
+                let mut obs = match observations::decode(entry, meta.as_ref()) {
                     Ok(obs) => obs,
                     Err(reject) => {
                         self.record_rejected_observation(&ds.uuid, entry, reject);
                         continue;
                     }
                 };
+                obs.received = Some(arrival.clone());
                 report.observations += 1;
                 if deferred {
                     // Counted, never dispatched — and deliberately never measured against a dedupe
@@ -1220,6 +1228,10 @@ impl AgentRuntime {
             return Err(MtcError::NoSuchDevice(device_uuid.to_string()));
         };
         let model = self.model(device_uuid);
+        // One `/current` answer is one arrival, stamped once for every observation it carries
+        // (C-6) — a served read reaches the wire through the same `received_ts` slot as streamed
+        // flow, and must mean the same thing there.
+        let arrival = self.now();
         let mut out = Vec::new();
         for entry in &ds.entries {
             let Some(id) = entry.elem.attr("dataItemId") else {
@@ -1230,7 +1242,10 @@ impl AgentRuntime {
             }
             let meta = model.as_ref().and_then(|m| m.item(id).cloned());
             match observations::decode(entry, meta.as_ref()) {
-                Ok(obs) => out.push(obs),
+                Ok(mut obs) => {
+                    obs.received = Some(arrival.clone());
+                    out.push(obs);
+                }
                 Err(reject) => self.record_rejected_observation(device_uuid, entry, reject),
             }
         }
@@ -2205,6 +2220,7 @@ mod tests {
             data_item_id: data_item_id.to_string(),
             sequence,
             timestamp: "2026-07-27T10:00:00Z".into(),
+            received: None,
             name: None,
             value: ObsValue::Scalar(json!(sequence)),
             extras: smallvec::smallvec![],
@@ -2483,19 +2499,21 @@ mod tests {
         // Two consecutive failures: only the TRANSITION is broadcast...
         let mut early = rt.attach("OKUMA.123456");
         early.rx.drain();
-        assert!(rt
-            .ingest_streams("<MTConnectStreams>", false)
-            .await
-            .is_err());
+        assert!(
+            rt.ingest_streams("<MTConnectStreams>", false)
+                .await
+                .is_err()
+        );
 
         // ...and a session attaching BETWEEN them - after the one broadcast it will never see -
         // still learns, from the seed.
         let mut late = rt.attach("MAZAK.999");
 
-        assert!(rt
-            .ingest_streams("<MTConnectStreams>", false)
-            .await
-            .is_err());
+        assert!(
+            rt.ingest_streams("<MTConnectStreams>", false)
+                .await
+                .is_err()
+        );
 
         let events = early.rx.drain();
         assert_eq!(
@@ -2576,6 +2594,101 @@ mod tests {
             rt.now(),
             "2031-02-03T04:05:06Z",
             "no wall clock is read below the seam"
+        );
+    }
+
+    /// A clock that answers a different, strictly increasing instant on every read — so a stamp
+    /// taken at ingest and a stamp taken at drain can never be confused for one another.
+    fn ticking_clock() -> ClockFn {
+        let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        Arc::new(move || {
+            let n = reads.fetch_add(1, Ordering::Relaxed);
+            format!("2026-01-01T00:00:{n:02}Z")
+        })
+    }
+
+    #[tokio::test]
+    async fn an_observation_is_stamped_when_the_document_arrives_not_when_it_is_drained() {
+        // C-6. The whole point of `receivedTs` is to expose adapter-side delay; stamping it at the
+        // drain would hide exactly that, because the drain happens after the backlog it measures.
+        let rt = AgentRuntime::new(
+            agent_cfg("http://agent:5000"),
+            &AgentCredentials::default(),
+            ticking_clock(),
+        )
+        .unwrap();
+        let mut handle = rt.attach("OKUMA.123456");
+        rt.ingest_streams(CURRENT_2_7, false).await.unwrap();
+
+        // Time passes — several more clock reads — before this instance gets round to its queue.
+        for _ in 0..5 {
+            let _ = rt.now();
+        }
+
+        let observations: Vec<Observation> = handle
+            .rx
+            .drain()
+            .into_iter()
+            .filter_map(|e| match e {
+                InstanceEvent::Obs(obs) => Some(*obs),
+                _ => None,
+            })
+            .collect();
+        assert!(!observations.is_empty(), "the fixture publishes something");
+        for obs in &observations {
+            assert_eq!(
+                obs.received.as_deref(),
+                Some("2026-01-01T00:00:00Z"),
+                "the FIRST clock read — the document's own arrival — for every observation in it"
+            );
+        }
+
+        // A second document is a second arrival, and says so.
+        rt.ingest_streams(&restarted_current(1_749_000_000, 900), false)
+            .await
+            .unwrap();
+        let second: Vec<Observation> = handle
+            .rx
+            .drain()
+            .into_iter()
+            .filter_map(|e| match e {
+                InstanceEvent::Obs(obs) => Some(*obs),
+                _ => None,
+            })
+            .collect();
+        assert!(!second.is_empty());
+        assert!(
+            second
+                .iter()
+                .all(|o| o.received.as_deref() == Some("2026-01-01T00:00:06Z")),
+            "one document, one arrival moment: {:?}",
+            second.iter().map(|o| &o.received).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_served_read_stamps_its_own_arrival_too() {
+        // `/current` answers a command verb through the same `received` slot, so `sb/read` and
+        // streamed flow report the same kind of moment (C-6).
+        let (rt, _docs) = agent_backed_runtime_with_docs().await;
+        let rt = AgentRuntime::new(
+            rt.cfg.clone(),
+            &AgentCredentials::default(),
+            ticking_clock(),
+        )
+        .unwrap();
+        let _handle = rt.attach("OKUMA.123456");
+        rt.ensure_model("OKUMA.123456").await.unwrap();
+        let observations = rt.snapshot("OKUMA.123456", &[]).await.unwrap();
+        assert!(!observations.is_empty());
+        let stamps: std::collections::BTreeSet<&str> = observations
+            .iter()
+            .filter_map(|o| o.received.as_deref())
+            .collect();
+        assert_eq!(
+            stamps.len(),
+            1,
+            "one answer, one arrival moment: {stamps:?}"
         );
     }
 
@@ -3061,11 +3174,13 @@ mod tests {
         rt.ensure_model("OKUMA.123456").await.unwrap();
         let digest_before = rt.model("OKUMA.123456").unwrap().digest_hex();
         rt.snapshot_cycle(false).await.unwrap();
-        assert!(handle
-            .rx
-            .drain()
-            .iter()
-            .any(|e| matches!(e, InstanceEvent::Obs(_))));
+        assert!(
+            handle
+                .rx
+                .drain()
+                .iter()
+                .any(|e| matches!(e, InstanceEvent::Obs(_)))
+        );
 
         // The agent restarts, and comes back describing a machine that was reconfigured while it
         // was down — the exact case a silent remap would corrupt.
@@ -3225,9 +3340,11 @@ mod tests {
         rt.snapshot_cycle(false).await.unwrap();
         let events = handle.rx.drain();
         assert!(events.iter().any(|e| matches!(e, InstanceEvent::Obs(_))));
-        assert!(!events
-            .iter()
-            .any(|e| matches!(e, InstanceEvent::Snapshot(_))));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, InstanceEvent::Snapshot(_)))
+        );
 
         // The stream saw the agent restart: every floor went with the old incarnation and a
         // re-probe is pending. What follows is a re-baseline, and it says so.

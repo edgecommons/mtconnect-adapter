@@ -361,9 +361,11 @@ mod tests {
             liveness_window: Duration::from_secs(10),
         };
         assert_eq!(fresh, fresh);
-        assert!(fresh
-            .liveness_age
-            .is_some_and(|age| age < fresh.liveness_window));
+        assert!(
+            fresh
+                .liveness_age
+                .is_some_and(|age| age < fresh.liveness_window)
+        );
 
         // Before first contact there is no age to judge — and that is not the same as "old".
         let cold = PassiveLink {
@@ -384,9 +386,11 @@ mod tests {
         let t0 = Instant::now();
         let mut watchdog = holding_one(t0);
 
-        assert!(watchdog
-            .evaluate(link(false, 0), STALE_AFTER, t0)
-            .is_empty());
+        assert!(
+            watchdog
+                .evaluate(link(false, 0), STALE_AFTER, t0)
+                .is_empty()
+        );
         assert!(
             watchdog
                 .evaluate(link(false, 10_000), STALE_AFTER, t0 + WINDOW)
@@ -637,9 +641,11 @@ mod tests {
             );
         }
         assert!(watchdog.evaluate(link(true, 0), STALE_AFTER, t0).is_empty());
-        assert!(watchdog
-            .evaluate(link(false, 0), STALE_AFTER, t0)
-            .is_empty());
+        assert!(
+            watchdog
+                .evaluate(link(false, 0), STALE_AFTER, t0)
+                .is_empty()
+        );
         assert_eq!(
             watchdog.phase(),
             PassivePhase::Fresh,
@@ -684,9 +690,11 @@ mod tests {
         // link, or the first transition after data arrives would be missed.
         let t0 = Instant::now();
         let mut watchdog = QualityWatchdog::default();
-        assert!(watchdog
-            .evaluate(link(false, 10_001), STALE_AFTER, t0)
-            .is_empty());
+        assert!(
+            watchdog
+                .evaluate(link(false, 10_001), STALE_AFTER, t0)
+                .is_empty()
+        );
         assert_eq!(watchdog.phase(), PassivePhase::Stale);
 
         watchdog.on_published(&delivered("x-position", 1.0), t0);

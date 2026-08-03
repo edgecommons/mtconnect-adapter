@@ -1,7 +1,7 @@
 [package]
 name = "mtconnect-adapter"
 version = "1.0.0"
-edition = "2021"
+edition = "2024"
 # Matches the edgecommons library's MSRV (edition-2024 crate).
 rust-version = "1.85"
 license = "BUSL-1.1"

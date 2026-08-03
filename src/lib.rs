@@ -12,6 +12,7 @@
 pub mod app;
 pub mod commands;
 pub mod device;
+pub mod driver;
 pub mod metrics;
 pub mod mtconnect;
 pub mod reload;

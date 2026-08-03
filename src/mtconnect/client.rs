@@ -536,9 +536,11 @@ mod tests {
         };
         let c = MtcClient::new(&agents[0], &creds).unwrap();
         c.current(None).await.unwrap();
-        assert!(agent
-            .last_request()
-            .contains("authorization: Bearer tok-123"));
+        assert!(
+            agent
+                .last_request()
+                .contains("authorization: Bearer tok-123")
+        );
     }
 
     #[tokio::test]
@@ -552,9 +554,11 @@ mod tests {
         assert!(agent.last_request().starts_with("GET /current?path="));
 
         c.sample(Some(42), Some(100), None).await.unwrap();
-        assert!(agent
-            .last_request()
-            .starts_with("GET /sample?from=42&count=100"));
+        assert!(
+            agent
+                .last_request()
+                .starts_with("GET /sample?from=42&count=100")
+        );
 
         c.sample(None, None, None).await.unwrap();
         assert!(agent.last_request().starts_with("GET /sample HTTP/1.1"));

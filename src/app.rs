@@ -26,7 +26,7 @@
 //! * Report **per-instance connectivity** ([`connectivity_of`]).
 //! * Serve **read/write/browse/reconnect/pause commands** — and allow-list the writes.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use edgecommons::prelude::*;
@@ -857,9 +857,10 @@ mod tests {
             u.topic_with_channel(UnsClass::Data, "a/b/c/d").is_err(),
             "one token over"
         );
-        assert!(u
-            .topic_with_channel(UnsClass::Data, &"x".repeat(b.max_bytes))
-            .is_ok());
+        assert!(
+            u.topic_with_channel(UnsClass::Data, &"x".repeat(b.max_bytes))
+                .is_ok()
+        );
         assert!(
             u.topic_with_channel(UnsClass::Data, &"x".repeat(b.max_bytes + 1))
                 .is_err(),
@@ -1317,10 +1318,11 @@ mod tests {
         let mut body = facade_body();
         stamp_component_path(&mut body, Some(""));
         assert_eq!(body[COMPONENT_PATH_KEY], json!(""));
-        assert!(body
-            .as_object()
-            .expect("object")
-            .contains_key(COMPONENT_PATH_KEY));
+        assert!(
+            body.as_object()
+                .expect("object")
+                .contains_key(COMPONENT_PATH_KEY)
+        );
     }
 
     #[test]
@@ -1331,10 +1333,11 @@ mod tests {
         let mut body = facade_body();
         stamp_component_path(&mut body, None);
         assert_eq!(body[COMPONENT_PATH_KEY], json!(null));
-        assert!(body
-            .as_object()
-            .expect("object")
-            .contains_key(COMPONENT_PATH_KEY));
+        assert!(
+            body.as_object()
+                .expect("object")
+                .contains_key(COMPONENT_PATH_KEY)
+        );
     }
 
     #[test]
@@ -1498,9 +1501,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn joining_nothing_costs_nothing() {
         let started = tokio::time::Instant::now();
-        assert!(join_all_within(Vec::new(), DEVICE_SHUTDOWN_BUDGET)
-            .await
-            .is_empty());
+        assert!(
+            join_all_within(Vec::new(), DEVICE_SHUTDOWN_BUDGET)
+                .await
+                .is_empty()
+        );
         assert_eq!(started.elapsed(), Duration::ZERO);
     }
 

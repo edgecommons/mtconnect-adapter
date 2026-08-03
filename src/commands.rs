@@ -48,18 +48,18 @@ use std::time::Instant;
 use edgecommons::commands::AVAILABILITY_UNSUPPORTED;
 use edgecommons::messaging::Message;
 use edgecommons::prelude::{
-    command_handler, CommandError, CommandHandler, CommandInbox, CommandScope,
+    CommandError, CommandHandler, CommandInbox, CommandScope, command_handler,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::app::{DeviceConfig, DeviceControl, Health, LinkState, Writes};
 use crate::device::{
-    BrowseError, Quality, Reading, SignalInfo, QUALITY_UNAVAILABLE, READ_ONLY_MESSAGE,
+    BrowseError, QUALITY_UNAVAILABLE, Quality, READ_ONLY_MESSAGE, Reading, SignalInfo,
 };
 use crate::metrics::DeviceMetrics;
 use crate::mtconnect::model::{BrowseNode, Category, NodeKind, ProbeModel, ROOT_NODE_ID};
-use crate::mtconnect::selection::{served_set, Provenance, ServedSet};
+use crate::mtconnect::selection::{Provenance, ServedSet, served_set};
 use crate::mtconnect::{AgentInfo, AgentRuntime};
 use crate::reload::{SignalRegistry, SignalSlot};
 
@@ -897,7 +897,7 @@ impl Commander {
                     ));
                 }
                 Ok(Err(BrowseError::Failed(e))) => {
-                    return Err(CommandError::new("BROWSE_FAILED", e))
+                    return Err(CommandError::new("BROWSE_FAILED", e));
                 }
                 Err(_) => return Err(device_unavailable()),
             };
@@ -1216,13 +1216,13 @@ fn browse_model_hierarchical(
 /// through a probe that changed underneath is refused rather than silently mixing two address
 /// spaces (D-MTC-5: drift is surfaced, never papered over).
 fn parse_cursor(cursor: &str, generation: &str) -> std::result::Result<usize, CommandError> {
-    let Some((gen, index)) = cursor.split_once('#') else {
+    let Some((cursor_gen, index)) = cursor.split_once('#') else {
         return Err(CommandError::new(
             "BROWSE_FAILED",
             format!("{BROWSE_BAD_CURSOR}: cursor `{cursor}` is malformed"),
         ));
     };
-    if gen != generation {
+    if cursor_gen != generation {
         return Err(CommandError::new(
             "BROWSE_FAILED",
             format!("{BROWSE_VIEW_CHANGED}: the probe model changed; restart the browse"),
@@ -1478,7 +1478,7 @@ mod tests {
 
     use edgecommons::prelude::{Config, Metric, MetricService};
 
-    use crate::app::{set_paused, Health};
+    use crate::app::{Health, set_paused};
     use crate::device::{BrowsePage, BrowsedSignal};
     use crate::mtconnect::config::{AgentCredentials, SignalConfig};
     use crate::mtconnect::xml::parse_devices;

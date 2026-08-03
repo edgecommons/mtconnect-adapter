@@ -97,6 +97,13 @@ pub struct Observation {
     pub sequence: u64,
     /// The agent's capture timestamp, verbatim (RFC3339). Published as `serverTs`.
     pub timestamp: String,
+    /// The moment the agent's payload **arrived** at this adapter — ISO-8601 UTC, from the
+    /// runtime's injected clock, stamped once per ingested document (C-6). It is the reading's
+    /// `received_ts`, and it is deliberately NOT the moment a device session happened to drain the
+    /// instance queue: a backlog or a slow poll cadence would otherwise contaminate the one
+    /// measurement that exists to expose them. `None` when nobody stamped it (a decode has no
+    /// clock of its own); the worker's own read-completion stamp is then the fallback.
+    pub received: Option<String>,
     pub value: ObsValue,
     /// Additive protocol fields, in a stable order: `resetTriggered`, `duration`, `nativeCode`, …
     /// for an ordinary observation; `conditionId`, `nativeCode`, `nativeSeverity`, `qualifier`,
@@ -248,6 +255,9 @@ pub fn decode(
         data_item_id,
         sequence,
         timestamp,
+        // Decoding is a pure transformation of bytes that already arrived; the arrival moment
+        // belongs to whoever received them, and the runtime stamps it per document (C-6).
+        received: None,
         value,
         extras,
         element: elem.name.clone(),
@@ -376,7 +386,7 @@ fn numeric_or_string(text: &str) -> Value {
 mod tests {
     use super::*;
     use crate::mtconnect::model::ProbeModel;
-    use crate::mtconnect::xml::{parse_devices, parse_streams, DeviceStream};
+    use crate::mtconnect::xml::{DeviceStream, parse_devices, parse_streams};
     use serde_json::json;
 
     const DEVICES_2_7: &str = include_str!("../../tests/fixtures/devices_2.7.xml");

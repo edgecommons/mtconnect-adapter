@@ -13,9 +13,9 @@
 //!
 //! The RNG is a seeded xorshift: every failure is reproducible from the printed iteration seed.
 
+use mtconnect_adapter::mtconnect::MtcError;
 use mtconnect_adapter::mtconnect::multipart::{MultipartReader, Part};
 use mtconnect_adapter::mtconnect::xml::{parse_document, parse_errors, parse_streams};
-use mtconnect_adapter::mtconnect::MtcError;
 
 const CURRENT_2_7: &str = include_str!("fixtures/current_2.7.xml");
 const ERRORS_2_7: &str = include_str!("fixtures/errors_out_of_range_2.7.xml");

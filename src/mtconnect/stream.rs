@@ -210,19 +210,25 @@ mod tests {
     #[test]
     fn every_readable_part_proves_liveness_including_a_heartbeat_and_an_error() {
         assert!(PartOutcome::Heartbeat.is_liveness());
-        assert!(PartOutcome::Observations {
-            count: 3,
-            next_sequence: Some(42)
-        }
-        .is_liveness());
-        assert!(PartOutcome::OutOfRange {
-            first_sequence: 153
-        }
-        .is_liveness());
-        assert!(PartOutcome::AgentError {
-            code: "UNAUTHORIZED".into()
-        }
-        .is_liveness());
+        assert!(
+            PartOutcome::Observations {
+                count: 3,
+                next_sequence: Some(42)
+            }
+            .is_liveness()
+        );
+        assert!(
+            PartOutcome::OutOfRange {
+                first_sequence: 153
+            }
+            .is_liveness()
+        );
+        assert!(
+            PartOutcome::AgentError {
+                code: "UNAUTHORIZED".into()
+            }
+            .is_liveness()
+        );
         // A part that cannot be read proves nothing about the agent.
         assert!(!PartOutcome::Undecodable.is_liveness());
     }

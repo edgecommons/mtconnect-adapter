@@ -28,7 +28,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use url::Url;
 
 /// One reading from the device.
@@ -57,8 +57,14 @@ pub struct Reading {
     /// stamp (an OPC UA server, an MTConnect agent). A direct-client protocol leaves it `None`:
     /// its receive moment IS the capture moment.
     pub capture_ts: Option<String>,
-    /// The **adapter receive** timestamp. The worker auto-stamps it at read completion for every
-    /// reading lacking it, so a backend only sets it when it has a better (earlier) receive stamp.
+    /// The **adapter receive** timestamp — when the protocol payload reached this adapter.
+    ///
+    /// For MTConnect it is the moment the agent's document was **ingested** (stamped once per
+    /// document by [`AgentRuntime`](crate::mtconnect::AgentRuntime), from its injected clock), not
+    /// the moment a device session drained the observation off the instance queue: queue backlog
+    /// and poll cadence are exactly what this measurement exists to expose, so they must not be
+    /// folded into it. The worker auto-stamps read completion only for readings a backend left
+    /// unstamped (the simulator, whose read *is* its arrival).
     pub received_ts: Option<String>,
     /// Additive protocol-specific fields ("extras", `docs/SOUTHBOUND.md` §2) copied onto the
     /// published sample: MTConnect rides its `sequence` here on every sample, plus
@@ -570,11 +576,12 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].signal_id, "temperature-1");
         // An unknown id resolves to nothing (the command layer reports it as a BAD/no-data entry).
-        assert!(s
-            .read_named(&["nope".to_string()])
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            s.read_named(&["nope".to_string()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -651,7 +658,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::mtconnect::config::{DeviceConfig as MtcDeviceConfig, PublishMode, SignalConfig};
 use crate::mtconnect::model::{Category, ProbeModel};
 use crate::mtconnect::observations::{CondState, ObsValue, Observation};
-use crate::mtconnect::selection::{served_set, ServedSignal};
+use crate::mtconnect::selection::{ServedSignal, served_set};
 use crate::mtconnect::{AgentRuntime, InstanceEvent, InstanceReceiver, MtcError};
 use crate::reload::{SignalRegistry, SignalSlot};
 
@@ -1786,7 +1793,8 @@ impl ConditionLedger {
 ///   native code in `qualityRaw` so an operator sees *which* alarm did it.
 /// * The observation timestamp is the agent's **capture** stamp (→ `serverTs`); `sourceTs` stays
 ///   absent (MTConnect does not distinguish a device-authored time), and the adapter's receive
-///   moment is stamped by the worker.
+///   moment is the observation's own **arrival** stamp, taken when the runtime ingested the
+///   document that carried it (C-6).
 /// * The `sequence` always rides as an extra: exact once-only ordering across reconnects.
 ///
 /// `condition` is the ledger snapshot taken right after this observation was folded in, and is what
@@ -1871,8 +1879,10 @@ pub fn reading_from_observation(
         // MTConnect has no device-authored time: the agent's stamp is a CAPTURE stamp.
         source_ts: None,
         capture_ts: (!obs.timestamp.is_empty()).then(|| obs.timestamp.clone()),
-        // The worker stamps the receive moment for the whole batch at read completion.
-        received_ts: None,
+        // The ARRIVAL moment, stamped by the runtime when the agent's document was ingested
+        // (C-6) — not the moment this session drained it. `None` only for an observation nobody
+        // stamped, and the worker's read-completion fallback then fills it.
+        received_ts: obs.received.clone(),
         extra: Some(extra),
         channel: sig.channel.clone(),
         // The canonical path, straight from the model that serves `sb/signals` — the derived
@@ -1928,10 +1938,10 @@ fn severity_of(q: Quality) -> u8 {
 mod mtconnect_seam_tests {
     use super::*;
     use crate::app::ChannelBudgets;
-    use crate::mtconnect::config::{parse_agents, AgentCredentials};
+    use crate::mtconnect::config::{AgentCredentials, parse_agents};
     use crate::mtconnect::model::Category;
-    use crate::mtconnect::xml::{parse_devices, parse_streams, StreamEntry, XmlElem};
-    use crate::mtconnect::{instance_queue, InstanceSender};
+    use crate::mtconnect::xml::{StreamEntry, XmlElem, parse_devices, parse_streams};
+    use crate::mtconnect::{InstanceSender, instance_queue};
     use serde_json::json;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
@@ -2103,7 +2113,23 @@ mod mtconnect_seam_tests {
         );
         assert!(
             r.received_ts.is_none(),
-            "the worker stamps the receive moment"
+            "nobody stamped this observation's arrival, so the worker's fallback still owns it"
+        );
+        // Stamped at ingest, the ARRIVAL moment travels onto the reading verbatim (C-6): the
+        // drain that produced this reading contributes nothing to it.
+        let arrived = reading_from_observation(
+            &Observation {
+                received: Some("2026-07-27T10:00:04.300000Z".into()),
+                ..obs("Xabs")
+            },
+            &signal("x-position", "Xabs"),
+            &model(),
+            &HashMap::new(),
+            None,
+        );
+        assert_eq!(
+            arrived.received_ts.as_deref(),
+            Some("2026-07-27T10:00:04.300000Z")
         );
         assert_eq!(r.extra.as_ref().unwrap()["sequence"], json!(37));
         // The label falls back to the agent's own name for the data item.
@@ -2798,14 +2824,18 @@ mod mtconnect_seam_tests {
 
         let mut missing = connection("line-a-agent", "X");
         missing.extra.remove("deviceUuid");
-        assert!(connection_binding(&missing)
-            .unwrap_err()
-            .contains("deviceUuid"));
+        assert!(
+            connection_binding(&missing)
+                .unwrap_err()
+                .contains("deviceUuid")
+        );
 
         let blank = connection("line-a-agent", "   ");
-        assert!(connection_binding(&blank)
-            .unwrap_err()
-            .contains("must not be empty"));
+        assert!(
+            connection_binding(&blank)
+                .unwrap_err()
+                .contains("must not be empty")
+        );
     }
 
     #[test]
@@ -2879,9 +2909,11 @@ mod mtconnect_seam_tests {
         assert_eq!(inv[0].name.as_deref(), Some("X position"));
         assert_eq!(inv[1].name, None);
         // An unknown device has no inventory, and asking is not an error.
-        assert!(backend
-            .inventory(&connection("line-a-agent", "NOPE"))
-            .is_empty());
+        assert!(
+            backend
+                .inventory(&connection("line-a-agent", "NOPE"))
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3037,9 +3069,10 @@ mod mtconnect_seam_tests {
         deliver(&agent).await;
         let live = session.passive_input().expect("link facts");
         assert!(!live.unreachable, "the authority says it is delivering");
-        assert!(live
-            .liveness_age
-            .is_some_and(|age| age < Duration::from_secs(1)));
+        assert!(
+            live.liveness_age
+                .is_some_and(|age| age < Duration::from_secs(1))
+        );
 
         // The simulator's read IS its liveness: there is nothing for a watchdog to observe.
         let sim_conn: ConnectionConfig =
@@ -3132,10 +3165,12 @@ mod mtconnect_seam_tests {
         let bad = watchdog.evaluate(link_at(expired), stale_after, expired);
         assert_eq!(bad.len(), 1);
         assert_eq!(bad[0].quality, Quality::Bad);
-        assert!(bad[0]
-            .quality_raw
-            .as_deref()
-            .is_some_and(|raw| raw.starts_with("MTC_STALE:")));
+        assert!(
+            bad[0]
+                .quality_raw
+                .as_deref()
+                .is_some_and(|raw| raw.starts_with("MTC_STALE:"))
+        );
 
         // And when the authority loses the agent outright, the reason names the link. (This is the
         // verdict the device task publishes on its way out of the poll loop.)
@@ -3275,6 +3310,7 @@ mod mtconnect_seam_tests {
             data_item_id: "Xtravel".into(),
             sequence: seq,
             timestamp: "2026-07-27T10:00:00Z".into(),
+            received: None,
             name: None,
             value: ObsValue::Condition(state),
             extras: smallvec::smallvec![("nativeCode", json!("ALM-2"))],
@@ -3833,10 +3869,12 @@ mod mtconnect_seam_tests {
             handle.rx,
         );
         // No configured signal matches, so there is nothing to read and no request to make.
-        assert!(session
-            .read_named(&["nope".to_string()])
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            session
+                .read_named(&["nope".to_string()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -38,8 +38,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::app::{ChannelBudgets, DeviceConfig};
-use crate::mtconnect::config::{DeviceConfig as MtcDeviceConfig, SignalConfig};
 use crate::mtconnect::SelectionConfig;
+use crate::mtconnect::config::{DeviceConfig as MtcDeviceConfig, SignalConfig};
 
 /// The rejection code for a candidate that changes something only a restart can apply.
 pub const RESTART_REQUIRED: &str = "RESTART_REQUIRED";

@@ -11,9 +11,9 @@
 
 use std::path::Path;
 
-use mtconnect_adapter::app::{compile_mtconnect, ChannelBudgets, DeviceConfig, PublishDefaults};
-use mtconnect_adapter::mtconnect::config::{parse_agents, PublishMode};
-use serde_json::{json, Value};
+use mtconnect_adapter::app::{ChannelBudgets, DeviceConfig, PublishDefaults, compile_mtconnect};
+use mtconnect_adapter::mtconnect::config::{PublishMode, parse_agents};
+use serde_json::{Value, json};
 
 fn schema() -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.schema.json");
@@ -107,14 +107,16 @@ fn the_shipped_simulator_configuration_still_works() {
     assert_eq!(devices[0].adapter, "sim");
     assert_eq!(devices[0].connection.endpoint, "sim://device-1");
     // No MTConnect instances, so no agent is needed.
-    assert!(compile_mtconnect(
-        &mut devices,
-        &[],
-        PublishDefaults::default(),
-        &ChannelBudgets::default()
-    )
-    .unwrap()
-    .is_empty());
+    assert!(
+        compile_mtconnect(
+            &mut devices,
+            &[],
+            PublishDefaults::default(),
+            &ChannelBudgets::default()
+        )
+        .unwrap()
+        .is_empty()
+    );
 }
 
 #[test]
@@ -126,29 +128,37 @@ fn an_mtconnect_instance_must_name_an_agent_and_a_device() {
     validate_instance(&ok).expect("the minimum valid instance");
 
     // No binding at all.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "connection": {}
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "connection": {}
+        }))
+        .is_err()
+    );
     // Half a binding.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "connection": { "agentId": "line-a-agent" }
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "connection": { "agentId": "line-a-agent" }
+        }))
+        .is_err()
+    );
     // A sim instance needs its endpoint instead.
     validate_instance(&json!({
         "id": "cnc-1", "adapter": "sim", "connection": { "endpoint": "sim://cnc-1" }
     }))
     .expect("the simulator's own shape");
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "adapter": "sim", "connection": { "agentId": "a", "deviceUuid": "u" }
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "adapter": "sim", "connection": { "agentId": "a", "deviceUuid": "u" }
+        }))
+        .is_err()
+    );
     // An unknown adapter is not a backend this component has.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "adapter": "opcua", "connection": { "agentId": "a", "deviceUuid": "u" }
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "adapter": "opcua", "connection": { "agentId": "a", "deviceUuid": "u" }
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -187,26 +197,32 @@ fn a_signal_must_bind_a_data_item_and_may_declare_its_conditions() {
     validate_instance(&instance).expect("the full signal shape");
 
     // A signal with no binding is not a signal.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1",
-        "connection": { "agentId": "a", "deviceUuid": "u" },
-        "signals": [{ "id": "x-position" }]
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1",
+            "connection": { "agentId": "a", "deviceUuid": "u" },
+            "signals": [{ "id": "x-position" }]
+        }))
+        .is_err()
+    );
     // A typo'd key is a mistake, not a no-op.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1",
-        "connection": { "agentId": "a", "deviceUuid": "u" },
-        "signals": [{ "id": "x", "dataItemID": "Xabs" }]
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1",
+            "connection": { "agentId": "a", "deviceUuid": "u" },
+            "signals": [{ "id": "x", "dataItemID": "Xabs" }]
+        }))
+        .is_err()
+    );
     // Signal ids are UNS tokens.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1",
-        "connection": { "agentId": "a", "deviceUuid": "u" },
-        "signals": [{ "id": "X_Position", "dataItemId": "Xabs" }]
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1",
+            "connection": { "agentId": "a", "deviceUuid": "u" },
+            "signals": [{ "id": "X_Position", "dataItemId": "Xabs" }]
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -272,40 +288,52 @@ fn the_selection_block_is_additive_closed_and_validated() {
     .expect("the full selection shape");
 
     // Closed objects: a typo'd key is a mistake, not a no-op.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
-        "selection": { "mode": "all", "includes": [] }
-    }))
-    .is_err());
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
-        "selection": { "mode": "include", "include": [{ "types": "POSITION" }] }
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+            "selection": { "mode": "all", "includes": [] }
+        }))
+        .is_err()
+    );
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+            "selection": { "mode": "include", "include": [{ "types": "POSITION" }] }
+        }))
+        .is_err()
+    );
     // An unknown mode, category, or a zero cap is refused by the schema itself.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
-        "selection": { "mode": "everything" }
-    }))
-    .is_err());
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
-        "selection": { "mode": "include", "include": [{ "category": "sample" }] }
-    }))
-    .is_err());
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
-        "selection": { "mode": "all", "maxSignals": 0 }
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+            "selection": { "mode": "everything" }
+        }))
+        .is_err()
+    );
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+            "selection": { "mode": "include", "include": [{ "category": "sample" }] }
+        }))
+        .is_err()
+    );
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+            "selection": { "mode": "all", "maxSignals": 0 }
+        }))
+        .is_err()
+    );
 
     // A regex the schema cannot judge is refused by the side-effect-free semantic validator.
-    let mut bad: Vec<DeviceConfig> = vec![serde_json::from_value(json!({
-        "id": "cnc-1",
-        "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.1" },
-        "selection": { "mode": "include", "include": [{ "type": "(" }] }
-    }))
-    .unwrap()];
+    let mut bad: Vec<DeviceConfig> = vec![
+        serde_json::from_value(json!({
+            "id": "cnc-1",
+            "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.1" },
+            "selection": { "mode": "include", "include": [{ "type": "(" }] }
+        }))
+        .unwrap(),
+    ];
     assert!(
         compile_mtconnect(
             &mut bad,
@@ -318,19 +346,23 @@ fn the_selection_block_is_additive_closed_and_validated() {
     );
 
     // A `sim` instance has no probe to derive from: selection is refused there.
-    let mut sim: Vec<DeviceConfig> = vec![serde_json::from_value(json!({
-        "id": "plc-1", "adapter": "sim",
-        "connection": { "endpoint": "sim://plc-1" },
-        "selection": { "mode": "all" }
-    }))
-    .unwrap()];
-    assert!(compile_mtconnect(
-        &mut sim,
-        &[],
-        PublishDefaults::default(),
-        &ChannelBudgets::default()
-    )
-    .is_err());
+    let mut sim: Vec<DeviceConfig> = vec![
+        serde_json::from_value(json!({
+            "id": "plc-1", "adapter": "sim",
+            "connection": { "endpoint": "sim://plc-1" },
+            "selection": { "mode": "all" }
+        }))
+        .unwrap(),
+    ];
+    assert!(
+        compile_mtconnect(
+            &mut sim,
+            &[],
+            PublishDefaults::default(),
+            &ChannelBudgets::default()
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -368,15 +400,17 @@ fn an_agent_declares_a_reachable_url_and_references_its_secrets() {
         "secrets are references, never values"
     );
     // Half a client identity.
-    assert!(validate_global(&json!({ "agents": [{
+    assert!(
+        validate_global(&json!({ "agents": [{
         "id": "a", "url": "http://a:5000", "tls": { "certSecretRef": "c" }
     }] }))
-    .is_err());
+        .is_err()
+    );
     // An unknown global key is a mistake, not a no-op.
-    assert!(validate_global(
-        &json!({ "agents": [{ "id": "a", "url": "http://a:5000" }], "nope": 1 })
-    )
-    .is_err());
+    assert!(
+        validate_global(&json!({ "agents": [{ "id": "a", "url": "http://a:5000" }], "nope": 1 }))
+            .is_err()
+    );
 }
 
 #[test]

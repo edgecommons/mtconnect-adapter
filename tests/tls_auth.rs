@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use mtconnect_adapter::mtconnect::config::{
-    parse_agents, AgentCredentials, AuthMaterial, TlsMaterial,
+    AgentCredentials, AuthMaterial, TlsMaterial, parse_agents,
 };
 use mtconnect_adapter::mtconnect::{MtcClient, MtcError};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
@@ -287,9 +287,11 @@ async fn basic_and_bearer_credentials_ride_the_encrypted_request() {
         token: "tok-123".into(),
     });
     client(&agent.url(), creds).probe().await.expect("probe");
-    assert!(agent
-        .last_request()
-        .contains("authorization: Bearer tok-123"));
+    assert!(
+        agent
+            .last_request()
+            .contains("authorization: Bearer tok-123")
+    );
 }
 
 #[tokio::test]

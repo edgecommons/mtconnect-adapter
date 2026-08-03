@@ -429,7 +429,7 @@ where
         other => {
             return Err(D::Error::custom(format!(
                 "unsupported url scheme `{other}`"
-            )))
+            )));
         }
     }
     if !url.username().is_empty() || url.password().is_some() {

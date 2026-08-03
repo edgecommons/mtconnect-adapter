@@ -17,10 +17,10 @@ use std::time::Duration;
 use edgecommons::messaging::{Message, MessageBuilder};
 use mtconnect_adapter::app::{build_sample, stamp_component_path};
 use mtconnect_adapter::device::{ConnectionConfig, DeviceBackend, MtcBackend, Quality, Reading};
-use mtconnect_adapter::mtconnect::config::{
-    parse_agents, AgentCredentials, DeviceConfig, SignalConfig,
-};
 use mtconnect_adapter::mtconnect::AgentRuntime;
+use mtconnect_adapter::mtconnect::config::{
+    AgentCredentials, DeviceConfig, SignalConfig, parse_agents,
+};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -989,10 +989,12 @@ async fn selection_matchers_scope_the_derived_set_and_explicit_entries_override(
         &agent,
         vec![selecting(
             // The explicit entry claims Xabs with its own identity and NO condition binding.
-            vec![serde_json::from_value(json!({
-                "id": "x-position", "dataItemId": "Xabs", "conditionBinding": []
-            }))
-            .unwrap()],
+            vec![
+                serde_json::from_value(json!({
+                    "id": "x-position", "dataItemId": "Xabs", "conditionBinding": []
+                }))
+                .unwrap(),
+            ],
             json!({ "mode": "include",
                     "include": [{ "path": "Axes/**", "category": "SAMPLE" }] }),
         )],

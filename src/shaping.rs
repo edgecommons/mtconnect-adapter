@@ -415,21 +415,25 @@ mod tests {
     fn a_trivial_policy_is_recognized_so_the_fast_path_stays_fast() {
         assert!(policy(0).is_trivial());
         assert!(!policy(100).is_trivial());
-        assert!(!PublishPolicy {
-            batch_ms: 0,
-            latest_only: false,
-            deadband: Some(1.0),
-            route: SignalRoute::default()
-        }
-        .is_trivial());
+        assert!(
+            !PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: Some(1.0),
+                route: SignalRoute::default()
+            }
+            .is_trivial()
+        );
         // latest_only with a zero window degenerates to immediate — trivial.
-        assert!(PublishPolicy {
-            batch_ms: 0,
-            latest_only: true,
-            deadband: None,
-            route: SignalRoute::default()
-        }
-        .is_trivial());
+        assert!(
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: true,
+                deadband: None,
+                route: SignalRoute::default()
+            }
+            .is_trivial()
+        );
     }
 
     // --- batching -------------------------------------------------------------------------------
@@ -1021,17 +1025,19 @@ mod tests {
     fn a_route_alone_never_forces_a_table_entry() {
         // A trivial policy never buffers, so it cannot mix generations — routing it would only cost
         // the unshaped fast path an entry it does not need.
-        assert!(PublishPolicy {
-            batch_ms: 0,
-            latest_only: false,
-            deadband: None,
-            route: SignalRoute {
-                channel: Some("spindle/speed".into()),
-                component_path: Some("/Device/Rotary".into()),
-                name: Some("Spindle speed".into()),
-            },
-        }
-        .is_trivial());
+        assert!(
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: None,
+                route: SignalRoute {
+                    channel: Some("spindle/speed".into()),
+                    component_path: Some("/Device/Rotary".into()),
+                    name: Some("Spindle speed".into()),
+                },
+            }
+            .is_trivial()
+        );
     }
 
     #[test]

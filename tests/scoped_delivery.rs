@@ -26,14 +26,14 @@ use async_trait::async_trait;
 use edgecommons::commands::{CommandInbox, InstanceConnectivitySource, ReloadAction};
 use edgecommons::config::model::Config;
 use edgecommons::messaging::{
-    topic_matches, Message, MessageBuilder, MessageHandler, MessagingService, Qos, ReplyFuture,
+    Message, MessageBuilder, MessageHandler, MessagingService, Qos, ReplyFuture, topic_matches,
 };
 use edgecommons::metrics::{Metric, MetricService};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use mtconnect_adapter::app::{set_paused, DeviceConfig, DeviceControl, Health, LinkState};
-use mtconnect_adapter::commands::{register_all, DeviceHandle, VERBS};
+use mtconnect_adapter::app::{DeviceConfig, DeviceControl, Health, LinkState, set_paused};
+use mtconnect_adapter::commands::{DeviceHandle, VERBS, register_all};
 use mtconnect_adapter::device::SignalInfo;
 use mtconnect_adapter::metrics::DeviceMetrics;
 

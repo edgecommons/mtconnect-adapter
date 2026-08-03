@@ -18,7 +18,7 @@ use edgecommons::prelude::SignalUpdate;
 use mtconnect_adapter::app::{build_sample, stamp_received};
 use mtconnect_adapter::device::{ConnectionConfig, DeviceBackend, Reading, SimBackend};
 use mtconnect_adapter::mtconnect::config::SignalConfig;
-use mtconnect_adapter::shaping::{policies_from_signals, Shaper};
+use mtconnect_adapter::shaping::{Shaper, policies_from_signals};
 use serde_json::json;
 
 fn signals(raw: serde_json::Value) -> Vec<SignalConfig> {
@@ -152,9 +152,11 @@ fn deadband_shapes_a_static_config_exactly_as_a_compiled_one() {
             .len(),
         1
     );
-    assert!(shaper
-        .offer(Reading::good("temperature-1", json!(20.2)), now)
-        .is_empty());
+    assert!(
+        shaper
+            .offer(Reading::good("temperature-1", json!(20.2)), now)
+            .is_empty()
+    );
     let bad = Reading::bad("temperature-1", "SENSOR_FAULT");
     assert_eq!(
         shaper.offer(bad, now).len(),

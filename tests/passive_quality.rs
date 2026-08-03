@@ -16,13 +16,13 @@ use std::time::{Duration, Instant};
 use edgecommons::messaging::{Message, MessageBuilder};
 use edgecommons::prelude::Sample;
 use mtconnect_adapter::app::{
-    build_sample, stamp_component_path, stamp_received, COMPONENT_PATH_KEY,
+    COMPONENT_PATH_KEY, build_sample, stamp_component_path, stamp_received,
 };
 use mtconnect_adapter::device::{Quality, Reading};
 use mtconnect_adapter::staleness::{
-    PassiveLink, QualityWatchdog, PASSIVE_EXTRA_KEY, QUALITY_AGENT_UNREACHABLE,
+    PASSIVE_EXTRA_KEY, PassiveLink, QUALITY_AGENT_UNREACHABLE, QualityWatchdog,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The wire name/version the `data()` facade publishes a signal update under.
 const MESSAGE_NAME: &str = "SouthboundSignalUpdate";

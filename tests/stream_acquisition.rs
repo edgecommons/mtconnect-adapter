@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mtconnect_adapter::mtconnect::config::{parse_agents, AgentCredentials};
+use mtconnect_adapter::mtconnect::config::{AgentCredentials, parse_agents};
 use mtconnect_adapter::mtconnect::{AgentRuntime, InstanceEvent, InstanceReceiver};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

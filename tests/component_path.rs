@@ -13,11 +13,11 @@
 use std::time::{Duration, Instant};
 
 use edgecommons::messaging::{Message, MessageBuilder};
-use mtconnect_adapter::app::{build_sample, stamp_component_path, COMPONENT_PATH_KEY};
+use mtconnect_adapter::app::{COMPONENT_PATH_KEY, build_sample, stamp_component_path};
 use mtconnect_adapter::device::Reading;
 use mtconnect_adapter::mtconnect::config::SignalConfig;
-use mtconnect_adapter::shaping::{policies_from_signals, Shaper};
-use serde_json::{json, Value};
+use mtconnect_adapter::shaping::{Shaper, policies_from_signals};
+use serde_json::{Value, json};
 
 /// The wire name/version the `data()` facade publishes a signal update under.
 const MESSAGE_NAME: &str = "SouthboundSignalUpdate";
@@ -96,10 +96,12 @@ fn an_empty_path_and_a_null_path_both_survive_as_themselves() {
         Some(""),
     ));
     assert_eq!(empty[COMPONENT_PATH_KEY], json!(""));
-    assert!(empty
-        .as_object()
-        .expect("body")
-        .contains_key(COMPONENT_PATH_KEY));
+    assert!(
+        empty
+            .as_object()
+            .expect("body")
+            .contains_key(COMPONENT_PATH_KEY)
+    );
 
     let null = round_trip(stamped_body(
         "ghost",
@@ -200,9 +202,11 @@ fn a_batched_window_carries_exactly_one_component_path_for_all_its_samples() {
             "one path per update, not one per sample"
         );
     }
-    assert!(readings
-        .iter()
-        .all(|r| r.component_path.as_deref() == Some("Axes/Linear[X]")));
+    assert!(
+        readings
+            .iter()
+            .all(|r| r.component_path.as_deref() == Some("Axes/Linear[X]"))
+    );
 }
 
 #[test]

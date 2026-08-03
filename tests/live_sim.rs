@@ -6,6 +6,11 @@
 //! test` and in the scaffold-build CI gate, and only runs against a real endpoint when a developer
 //! (or a lab CI leg) explicitly asks for it.
 //!
+//! A run that is **supposed** to reach a live endpoint sets `EC_REQUIRE_LIVE` as well: the skip then
+//! becomes a hard failure, so a lab leg that forgot to export `EC_LIVE_SIM` reports red rather than
+//! a green suite that exercised nothing. With the endpoint named, nothing here skips — every way of
+//! failing to reach it panics and names the endpoint.
+//!
 //! `ethernet-ip-adapter` points this at a real PLC simulator (cpppo/OpENer); `modbus-adapter` has a
 //! permanent Modbus sim container on the lab host. This scaffold ships only the in-process
 //! [`SimBackend`](mtconnect_adapter::device::SimBackend), which needs no real endpoint at all — so today
@@ -16,32 +21,55 @@
 
 use mtconnect_adapter::device::{ConnectionConfig, DeviceBackend, Quality, SimBackend};
 
+/// The switch a CI or lab leg sets to declare "a live endpoint is supposed to be reachable". It
+/// turns the self-skip below into a hard failure, so a leg that never exported `EC_LIVE_SIM` cannot
+/// report a green suite that exercised nothing. Unset (an ordinary developer machine) the skip
+/// stands.
+const REQUIRE_LIVE: &str = "EC_REQUIRE_LIVE";
+
+/// Whether this run claims to have a live endpoint.
+fn live_required() -> bool {
+    std::env::var(REQUIRE_LIVE).is_ok_and(|v| {
+        let v = v.trim();
+        !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+    })
+}
+
 #[tokio::test]
 async fn connects_polls_once_and_asserts_readings_and_quality() {
-    let Ok(endpoint) = std::env::var("EC_LIVE_SIM") else {
-        eprintln!("skipped: set EC_LIVE_SIM=<endpoint> to run against a real simulator/device");
-        return;
+    let endpoint = match std::env::var("EC_LIVE_SIM") {
+        Ok(endpoint) if !endpoint.trim().is_empty() => endpoint,
+        _ => {
+            assert!(
+                !live_required(),
+                "{REQUIRE_LIVE} is set, so this run is supposed to reach a live \
+                 simulator/device — but EC_LIVE_SIM is unset or empty. Export \
+                 EC_LIVE_SIM=<endpoint>. Refusing to report a pass for a suite that ran nothing."
+            );
+            eprintln!("skipped: set EC_LIVE_SIM=<endpoint> to run against a real simulator/device");
+            return;
+        }
     };
 
     // --- connect --------------------------------------------------------------------------
     let backend = SimBackend;
     let cfg = ConnectionConfig {
-        endpoint,
+        endpoint: endpoint.clone(),
         extra: serde_json::Map::new(),
     };
     let mut session = backend
         .connect(&cfg)
         .await
-        .expect("connect to the live endpoint");
+        .unwrap_or_else(|e| panic!("EC_LIVE_SIM={endpoint}: connect failed: {e}"));
 
     // --- one poll cycle ---------------------------------------------------------------------
     let readings = session
         .read_signals()
         .await
-        .expect("one read cycle against the live endpoint");
+        .unwrap_or_else(|e| panic!("EC_LIVE_SIM={endpoint}: the read cycle failed: {e}"));
     assert!(
         !readings.is_empty(),
-        "a live poll must return at least one reading"
+        "EC_LIVE_SIM={endpoint}: a live poll must return at least one reading"
     );
 
     // --- assert readings + quality ------------------------------------------------------------

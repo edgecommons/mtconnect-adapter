@@ -10,16 +10,21 @@
 //! ```
 //!
 //! Without the variable every test self-skips, so the ordinary `cargo test` gate stays green on a
-//! machine with no Docker. The SHDR feed is served by this process (the cppagent adapter
-//! protocol) on fixed host ports 7401/7402/7403 — the containers dial back via
-//! `host.docker.internal`. The restart and buffer-wrap tests drive the containers through the
-//! `docker` CLI, so the suite needs it on PATH.
+//! machine with no Docker. A run that is **supposed** to have the harness sets
+//! `EC_REQUIRE_LIVE` as well, and then the self-skip becomes a hard failure: a CI or lab leg
+//! whose compose harness never came up must report red, not a green suite that exercised nothing.
+//! Once the harness is named, nothing in this file skips — every way of failing to reach the peer
+//! (connection refused, timeout, an unexpected fixture shape) panics and names the URL.
+//!
+//! The SHDR feed is served by this process (the cppagent adapter protocol) on fixed host ports
+//! 7401/7402/7403 — the containers dial back via `host.docker.internal`. The restart and
+//! buffer-wrap tests drive the containers through the `docker` CLI, so the suite needs it on PATH.
 //!
 //! The tests serialize on one lock: they share the SHDR ports and one of them restarts the agent.
 
 use std::time::Duration;
 
-use mtconnect_adapter::mtconnect::config::{parse_agents, AgentCredentials};
+use mtconnect_adapter::mtconnect::config::{AgentCredentials, parse_agents};
 use mtconnect_adapter::mtconnect::{
     AgentRuntime, InstanceEvent, InstanceReceiver, MtcClient, ObsValue,
 };
@@ -35,10 +40,31 @@ const DEV_ONE: &str = "MTC-E2E-001";
 const DEV_TWO: &str = "MTC-E2E-002";
 const DEV_TINY: &str = "MTC-E2E-TINY";
 
+/// The switch a CI or lab leg sets to declare "the live harness is supposed to be up". It turns the
+/// self-skip below into a hard failure, so a leg whose compose harness never started cannot report
+/// a green suite that exercised nothing. Unset (an ordinary developer machine) the skip stands.
+const REQUIRE_LIVE: &str = "EC_REQUIRE_LIVE";
+
+/// Whether this run claims to have the live harness.
+fn live_required() -> bool {
+    std::env::var(REQUIRE_LIVE).is_ok_and(|v| {
+        let v = v.trim();
+        !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+    })
+}
+
 fn main_agent_url() -> Option<String> {
     match std::env::var("EC_MTC_AGENT") {
         Ok(url) if !url.trim().is_empty() => Some(url),
         _ => {
+            assert!(
+                !live_required(),
+                "{REQUIRE_LIVE} is set, so this run is supposed to exercise the pinned cppagent \
+                 harness — but EC_MTC_AGENT is unset or empty. Start it with `docker compose -f \
+                 tests/compose.mtconnect-agent.yaml up -d` and export \
+                 EC_MTC_AGENT=http://localhost:5010. Refusing to report a pass for a suite that \
+                 ran nothing."
+            );
             eprintln!("EC_MTC_AGENT not set - skipping the live agent integration test");
             None
         }
@@ -297,16 +323,20 @@ async fn a_buffer_wrap_is_recovered_without_wedging_the_machine() {
     .unwrap()
     .remove(0);
     let client = MtcClient::new(&cfg, &AgentCredentials::default()).unwrap();
+    let mut last_error = String::from("never attempted");
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            if client.current(None).await.is_ok() {
-                return;
+            match client.current(None).await {
+                Ok(_) => return,
+                Err(e) => last_error = e.to_string(),
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     })
     .await
-    .expect("tiny agent reachable");
+    .unwrap_or_else(|_| {
+        panic!("the tiny-buffer agent at {url} never answered /current: {last_error}")
+    });
     for i in 0..200 {
         feed.send(&format!("|Tpos|{}", 2.0 + f64::from(i)));
     }
@@ -314,7 +344,10 @@ async fn a_buffer_wrap_is_recovered_without_wedging_the_machine() {
     let overrun = client.sample(Some(2), Some(10), None).await;
     let overrun_evidence = match &overrun {
         Ok(text) => match mtconnect_adapter::mtconnect::xml::parse_errors(text) {
-            Ok(doc) => format!("HTTP 200 error document, OUT_OF_RANGE={:?}", doc.out_of_range()),
+            Ok(doc) => format!(
+                "HTTP 200 error document, OUT_OF_RANGE={:?}",
+                doc.out_of_range()
+            ),
             Err(_) => match mtconnect_adapter::mtconnect::xml::parse_streams(text) {
                 // cppagent >= 2.x clamps an expired `from` to its buffer floor instead of
                 // answering OUT_OF_RANGE — worth recording either way.
@@ -491,16 +524,20 @@ async fn selection_mode_all_derives_the_tiny_devices_signals_live() {
     .unwrap();
 
     // Connect (probing the real agent) — retried briefly while the container warms up.
+    let mut last_error = String::from("never attempted");
     let mut session = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match backend.connect(&conn).await {
                 Ok(session) => return session,
-                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                Err(e) => {
+                    last_error = e.to_string();
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
             }
         }
     })
     .await
-    .expect("tiny agent reachable");
+    .unwrap_or_else(|_| panic!("no session against the tiny-buffer agent at {url}: {last_error}"));
 
     // Not one signal was configured, yet the whole device serves: the derived set came from the
     // live probe.
@@ -591,10 +628,12 @@ async fn a_batched_signal_coalesces_live_streamed_readings_into_one_update() {
         id: "tiny".into(),
         agent_id: "live-agent".into(),
         device_uuid: DEV_TINY.into(),
-        signals: vec![serde_json::from_value(json!({
-            "id": "t-pos", "dataItemId": "t1-Tpos", "publish": { "batchMs": 60000 }
-        }))
-        .unwrap()],
+        signals: vec![
+            serde_json::from_value(json!({
+                "id": "t-pos", "dataItemId": "t1-Tpos", "publish": { "batchMs": 60000 }
+            }))
+            .unwrap(),
+        ],
         selection: None,
     };
     let backend = MtcBackend::new(
@@ -606,16 +645,20 @@ async fn a_batched_signal_coalesces_live_streamed_readings_into_one_update() {
         "agentId": "live-agent", "deviceUuid": DEV_TINY
     }))
     .unwrap();
+    let mut last_error = String::from("never attempted");
     let mut session = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match backend.connect(&conn).await {
                 Ok(session) => return session,
-                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                Err(e) => {
+                    last_error = e.to_string();
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
             }
         }
     })
     .await
-    .expect("tiny agent reachable");
+    .unwrap_or_else(|_| panic!("no session against the tiny-buffer agent at {url}: {last_error}"));
 
     // The session compiled the policy table from the live probe: the SAMPLE keeps its window.
     let mut shaper = Shaper::new();

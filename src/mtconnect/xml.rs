@@ -30,8 +30,8 @@
 
 use std::collections::BTreeMap;
 
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 
 use super::error::MtcError;
 use super::model::Category;
@@ -830,9 +830,11 @@ mod tests {
             let d = doc.device("OKUMA.123456").expect("the fixture's device");
             assert_eq!(d.attr("name"), Some("OKUMA-CNC"));
             let items = d.child("DataItems").unwrap();
-            assert!(items
-                .children_named("DataItem")
-                .any(|i| i.attr("id") == Some("avail")));
+            assert!(
+                items
+                    .children_named("DataItem")
+                    .any(|i| i.attr("id") == Some("avail"))
+            );
         }
     }
 
@@ -940,14 +942,16 @@ mod tests {
             .iter()
             .find(|d| d.uuid == "OKUMA.123456")
             .unwrap();
-        assert!(cnc
-            .entries
-            .iter()
-            .any(|e| e.category == Category::Sample && e.elem.attr("dataItemId") == Some("Xabs")));
-        assert!(cnc
-            .entries
-            .iter()
-            .any(|e| e.category == Category::Event && e.elem.attr("dataItemId") == Some("avail")));
+        assert!(
+            cnc.entries.iter().any(
+                |e| e.category == Category::Sample && e.elem.attr("dataItemId") == Some("Xabs")
+            )
+        );
+        assert!(
+            cnc.entries.iter().any(
+                |e| e.category == Category::Event && e.elem.attr("dataItemId") == Some("avail")
+            )
+        );
         let cond = cnc
             .entries
             .iter()

@@ -932,10 +932,11 @@ mod tests {
         let s = sel(json!({ "mode": "all", "exclude": [{ "category": "CONDITION" }] }));
         let set = served_set(&[], Some(&s), Some(&m));
         assert_eq!(set.signals.len(), 12, "14 items minus the 2 conditions");
-        assert!(set
-            .signals
-            .iter()
-            .all(|s| s.signal.data_item_id != "Xtravel"));
+        assert!(
+            set.signals
+                .iter()
+                .all(|s| s.signal.data_item_id != "Xtravel")
+        );
         assert!(set.signals.iter().all(|s| s.signal.data_item_id != "logic"));
     }
 
@@ -1184,10 +1185,11 @@ mod tests {
         // The opt-out flag turns the whole derivation off.
         let s = sel(json!({ "mode": "all", "autoConditionBinding": false }));
         let set = served_set(&[], Some(&s), Some(&m));
-        assert!(set
-            .signals
-            .iter()
-            .all(|s| s.signal.condition_bindings().is_empty()));
+        assert!(
+            set.signals
+                .iter()
+                .all(|s| s.signal.condition_bindings().is_empty())
+        );
     }
 
     // --- depth-aware channel derivation ---------------------------------------------------------
