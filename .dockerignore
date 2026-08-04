@@ -1,0 +1,10 @@
+# Build-context hygiene for `docker build .` (harness addition for the KUBERNETES leg).
+# Without this the 16G `target/` dev tree is uploaded as build context on every build.
+target/
+host-leg/target/
+k8s-leg/target/
+logs/
+.git/
+.claude/
+docs/
+tests/

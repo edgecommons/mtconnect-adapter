@@ -1,0 +1,99 @@
+RecipeFormatVersion: '2020-01-25'
+ComponentName: com.mbreissi.edgecommons.MtconnectAdapter
+ComponentVersion: 1.0.0
+ComponentDescription: The MtconnectAdapter component (GREENGRASS deployed release leg).
+ComponentPublisher: EdgeCommons
+ComponentConfiguration:
+  DefaultConfiguration:
+    ComponentConfig:
+      logging:
+        level: DEBUG
+        # `json` selects the library's structured layer, which KEEPS the tracing fields
+        # (instance, error, permanent, wait_ms, ...). The `{token}` template drops them.
+        rust_format: json
+        # The Nucleus's stdout Copier closes as soon as the `sh` wrapper exits, which truncates
+        # the tail of the teardown narration. Publishing log records over IPC routes them to the
+        # independent sniffer instead, which is not tied to this component's stdout pipe.
+        # (`fileLogging` is deliberately inert when `rust_format` selects `json` — see
+        # `logging::installs_file_appender` — so it is not an option alongside structured fields.)
+        publish:
+          enabled: true
+          destination: local
+          minLevel: INFO
+      heartbeat:
+        enabled: true
+        intervalSecs: 3
+        destination: local
+        measures:
+          cpu: true
+          memory: true
+          disk: false
+      metricEmission:
+        target: log
+        namespace: edgecommons
+        targetConfig:
+          logFileName: /greengrass/v2/work/{ComponentFullName}/metric.log
+      tags:
+        appId: mtconnect-gg-leg
+        site: lab-5950x
+      component:
+        token: mtconnect-adapter
+        global:
+          agents:
+          - id: live-agent
+            url: http://192.168.1.224:5010
+            streaming: prefer
+            heartbeatMs: 3000
+            pollIntervalMs: 500
+            requestTimeoutMs: 3000
+            reconnect:
+              initialMs: 500
+              maxMs: 4000
+          defaults:
+            pollIntervalMs: 250
+            publishMode: on-change
+          healthThresholds:
+            staleSignalSecs: 6
+        instances:
+        - id: cnc-1
+          adapter: mtconnect
+          connection:
+            agentId: live-agent
+            deviceUuid: MTC-E2E-001
+          pollIntervalMs: 250
+          signals:
+          - id: x-position
+            name: X axis actual position
+            dataItemId: d1-Xabs
+            conditionBinding:
+            - d1-travel
+          - id: availability
+            name: Device availability
+            dataItemId: d1-avail
+          - id: execution
+            name: Execution state
+            dataItemId: d1-exec
+          - id: x-travel
+            name: X axis travel condition
+            dataItemId: d1-travel
+          writes:
+            allow: []
+    accessControl:
+      aws.greengrass.ipc.pubsub:
+        com.mbreissi.edgecommons.MtconnectAdapter:pubsub:1:
+          policyDescription: Allows access to publish/subscribe to all local topics.
+          operations:
+          - aws.greengrass#PublishToTopic
+          - aws.greengrass#SubscribeToTopic
+          resources:
+          - '*'
+Manifests:
+- Platform:
+    os: linux
+  Artifacts:
+  - URI: s3://BUCKET_NAME/COMPONENT_NAME/COMPONENT_VERSION/mtconnect-adapter
+  Lifecycle:
+    Install:
+      Script: chmod +x {artifacts:path}/mtconnect-adapter
+    Run:
+      Script: '{artifacts:path}/mtconnect-adapter --platform GREENGRASS -c GG_CONFIG'

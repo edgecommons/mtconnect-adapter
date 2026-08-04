@@ -1,0 +1,63 @@
+# KUBERNETES release leg — the shipped k8s/deployment.yaml VERBATIM except for `image:`
+# (the shipped value is the literal placeholder REPLACE_ME) which is set to the locally-built,
+# `kind load`-ed image. No args are passed: --platform auto must detect KUBERNETES from the
+# projected ServiceAccount token, default the config source to CONFIGMAP and the transport to MQTT,
+# and resolve identity from the Downward API (EDGECOMMONS_THING_NAME ▸ POD_NAME).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mtconnect-adapter
+  labels:
+    app.kubernetes.io/name: mtconnect-adapter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mtconnect-adapter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mtconnect-adapter
+    spec:
+      automountServiceAccountToken: true   # the projected SA token is the platform=KUBERNETES auto-detect signal
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: component
+          image: mtconnect-adapter:k8s-leg
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: EDGECOMMONS_THING_NAME, value: "k8s-leg-thing-override" }
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: EDGECOMMONS_THING_NAME, value: "k8s-leg-thing-override" }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          ports:
+            - { name: health, containerPort: 8081 }
+            - { name: metrics, containerPort: 9090 }
+          startupProbe:
+            httpGet: { path: /startupz, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/edgecommons, readOnly: true }   # WHOLE volume, never subPath (hot-reload)
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap: { name: mtconnect-adapter-config }
+        - name: tmp
+          emptyDir: {}

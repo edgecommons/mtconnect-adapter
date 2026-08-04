@@ -23,6 +23,10 @@ standalone = ["edgecommons/standalone"]
 greengrass = ["edgecommons/greengrass"]
 # Direct CloudWatch metric target (AWS SDK PutMetricData); combine with `greengrass`.
 cloudwatch = ["edgecommons/cloudwatch"]
+# Prometheus pull metrics on :9090. The KUBERNETES platform profile selects this target by
+# default, so the container image builds with it (see Dockerfile) and k8s/deployment.yaml maps
+# the port. Absent the feature the profile's default target is unavailable and metrics are lost.
+metrics-prometheus = ["edgecommons/metrics-prometheus"]
 
 [dependencies]
 # edgecommons Rust library. The dependency form is chosen by `--dep-source` at generation:

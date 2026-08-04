@@ -1,0 +1,34 @@
+RecipeFormatVersion: '2020-01-25'
+ComponentName: com.mbreissi.edgecommons.MtcIpcSniffer
+ComponentVersion: 1.0.0
+ComponentDescription: Independent IPC witness for the MtconnectAdapter GREENGRASS release leg (harness).
+ComponentPublisher: EdgeCommons
+ComponentConfiguration:
+  DefaultConfiguration:
+    ComponentConfig:
+      logging:
+        level: INFO
+        rust_format: '{timestamp} [{level}] {target} - {message}'
+      heartbeat:
+        enabled: false
+      component:
+        token: mtc-ipc-sniffer
+    accessControl:
+      aws.greengrass.ipc.pubsub:
+        com.mbreissi.edgecommons.MtcIpcSniffer:pubsub:1:
+          policyDescription: Allows access to publish/subscribe to all local topics.
+          operations:
+          - aws.greengrass#PublishToTopic
+          - aws.greengrass#SubscribeToTopic
+          resources:
+          - '*'
+Manifests:
+- Platform:
+    os: linux
+  Artifacts:
+  - URI: s3://BUCKET_NAME/COMPONENT_NAME/COMPONENT_VERSION/mtc-ipc-sniffer
+  Lifecycle:
+    Install:
+      Script: chmod +x {artifacts:path}/mtc-ipc-sniffer
+    Run:
+      Script: '{artifacts:path}/mtc-ipc-sniffer --platform GREENGRASS --transport IPC -c GG_CONFIG'

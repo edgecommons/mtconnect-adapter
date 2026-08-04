@@ -11,3 +11,6 @@
 # evidence belongs in the release record, not in the source tree.
 /host-leg/evidence/
 /host-leg/target/
+/k8s-leg/target/
+/k8s-leg/*control.txt
+/lab-leg/ipc-sniffer/target/

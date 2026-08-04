@@ -12,7 +12,9 @@
 # `image:` in k8s/deployment.yaml.
 
 # ---- stage 1: build -------------------------------------------------------------------------
-FROM rust:1.85-slim AS build
+# The toolchain floor is set by the locked dependency graph, not by this crate's `rust-version`:
+# `time` needs 1.88 and the `icu`/`idna` chain needs 1.86, so an older base cannot build Cargo.lock.
+FROM rust:1.88-slim-bookworm AS build
 
 # Resolve the private edgecommons git dependency using the system git (honours GITHUB_TOKEN / SSH).
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
@@ -29,7 +31,11 @@ COPY Cargo.toml ./
 COPY Cargo.lock* ./
 COPY src ./src
 
-RUN cargo build --release --bin mtconnect-adapter
+# `metrics-prometheus` is what makes the KUBERNETES profile's default metric target real: that
+# profile selects `prometheus` on :9090, which k8s/deployment.yaml maps as the `metrics` port.
+# Without the feature the target falls back to a log file the read-only root filesystem refuses,
+# and the pod serves no metrics at all.
+RUN cargo build --release --bin mtconnect-adapter --features metrics-prometheus
 
 # ---- stage 2: runtime -----------------------------------------------------------------------
 # debian:bookworm-slim has glibc (the binary is glibc-linked) and is small.

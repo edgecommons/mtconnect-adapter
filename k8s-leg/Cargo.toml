@@ -1,0 +1,31 @@
+[package]
+name = "mtc-k8s-leg"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Its own workspace root: this harness is deliberately NOT a target of the component crate, so
+# `cargo test --all-targets`, `cargo fmt` and `cargo clippy` on the component are untouched by it.
+[workspace]
+
+[[bin]]
+name = "mtc-k8s-leg"
+path = "src/main.rs"
+
+[dependencies]
+edgecommons = { git = "https://github.com/edgecommons/edgecommons", rev = "a14a3285573ef2bb6a531e1e1936c6dc40a85ef4", default-features = false, features = [
+    "credentials",
+    "standalone",
+] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "io-util",
+    "net",
+    "sync",
+    "fs",
+] }
+rumqttc = "0.25"
+prost = "0.13"
+serde_json = "1"
