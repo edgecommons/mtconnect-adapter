@@ -467,13 +467,27 @@ incident: it raises no `device-unreachable` and counts no reconnect.
   `activeConditions`, D-R7/D-R8) and the passive `stale → expired → unreachable` ladder with its
   `passive` marker (D-R14). The `d1-travel` CONDITION data item in `tests/fixtures/agent-e2e/devices.xml`
   exists for it, and the fixture speaks MTConnect 2.3 so cppagent emits `conditionId`.
-- Release gates still open: the Greengrass and Kubernetes platform legs. A cppagent-over-TLS compose
-  variant is not in the harness; the transport-security row is covered by `tests/tls_auth.rs`
-  against a local TLS server instead.
+- `host-leg/`, `lab-leg/`, `k8s-leg/` — the three platform legs, each a harness crate outside the
+  component workspace so none of them enters its build, test or coverage gates. HOST runs the real
+  binary as an OS process so `SIGTERM` is a real signal; `lab-leg/` deploys to a Greengrass nucleus
+  and reads the bus through a second component over IPC; `k8s-leg/` deploys to a cluster and proves
+  the ConfigMap source, both Downward-API identity tiers, the health endpoints and the Prometheus
+  endpoint. Each exercises the connectivity ladder, the condition aggregate, the passive ladder and
+  the bounded teardown on its own platform.
+- A cppagent-over-TLS compose variant is not in the harness; the transport-security row is covered
+  by `tests/tls_auth.rs` against a local TLS server instead.
+- Two limits the platform legs established, both outside this component's control. On Greengrass the
+  nucleus revokes IPC authorization several hundred milliseconds *before* it signals a component
+  being removed, so a `--remove` teardown drops the handful of updates still in flight — the publish
+  fails, is logged, and is not retried, because the channel it would retry on is already gone.
+  Stopping a component does not do this. And a `--remove` teardown carrying a genuinely full batch
+  window has not been exercised, so whether a loaded flush completes inside the nucleus's kill
+  window is not established.
 
 ## Appendix — revision history
 
 | Date | Change |
 |---|---|
+| 2026-08-04 | Release legs recorded: the three platform harnesses, the Greengrass IPC-revocation and loaded-flush limits, and the packaging repairs they found (container toolchain floor, Kubernetes Prometheus feature, Greengrass `exec` lifecycle form). |
 | 2026-08-03 | Adversarial-review remediation folded in: the D-R1..D-R16 register; the `driver.rs`/`staleness.rs` module split; the lifecycle section; validation/coverage discipline and the metrics/events sections brought to current state. |
 | 2026-07-28 | Initial version (R1 + selection/shaping/channel-depth decisions). |
