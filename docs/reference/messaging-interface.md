@@ -39,7 +39,7 @@ with the same `correlation_id`.
 | `cmd` | `sb/resume` | `instance` | bus → adapter | `ecv1/{device}/mtconnect-adapter/[{instance}/]cmd/sb/resume` | `{ok,result}` |
 | `cmd` | `reconnect` | `instance` | bus → adapter | `ecv1/{device}/mtconnect-adapter/[{instance}/]cmd/reconnect` | `{ok,result}` |
 | `cmd` | `repoll` | `instance` | bus → adapter | `ecv1/{device}/mtconnect-adapter/[{instance}/]cmd/repoll` | `{ok,result}` |
-| `metric` | `southbound_health`, `MtconnectAdapterConnection`, `MtconnectAdapterCommand`, `MtconnectStream`, `MtconnectProbe`, `MtconnectParse` | — | adapter → bus (auto) | `ecv1/{device}/mtconnect-adapter/metric/{metricName}` | — |
+| `metric` | `southbound_health`, `MtconnectAdapterConnection`, `MtconnectAdapterCommand`, `MtconnectAdapterShaping`, `MtconnectStream`, `MtconnectProbe`, `MtconnectParse` | — | adapter → bus (auto) | `ecv1/{device}/mtconnect-adapter/metric/{metricName}` | — |
 | `state` | keepalive | — | adapter → bus (auto) | `ecv1/{device}/mtconnect-adapter/state` | — |
 
 **Scope** is the verb's declared addressing, advertised on its `describe` entry. All nine verbs act
@@ -112,7 +112,9 @@ The sample's `serverTs` is the **capture** moment: the seam's `capture_ts` when 
 supplies one, else the worker's read-completion receive stamp (a direct client's receive moment IS
 the capture moment). A device-authored `source_ts` rides as `sourceTs` only when present — never
 synthesized — and when a mediating server makes the adapter's receive moment differ from the
-effective `serverTs`, it rides as a per-sample `receivedTs` extra:
+effective `serverTs`, it rides as a per-sample `receivedTs` extra. For MTConnect that receive
+moment is the **arrival** of the agent's document at this adapter — so `receivedTs − serverTs`
+measures agent-side buffering plus transit, never internal queueing:
 
 ```jsonc
 "samples": [ { "value": 21.7, "quality": "GOOD", "qualityRaw": "OK",
@@ -125,6 +127,15 @@ batch window into one update ([configuration.md](configuration.md#publish-shapin
 carries every reading of the window in arrival order, each sample keeping its own `serverTs`,
 quality, and extras (`sequence`, `receivedTs`, ...). An unbatched signal publishes one sample per
 update.
+
+Condition observations additionally carry `conditionId`, `conditionText`, and `activeConditions`
+extras, and publish the data item's **aggregate** state across concurrent activations
+([data-types.md](data-types.md#conditions-state-as-value-and-as-a-quality-modifier)). When the
+agent stops vouching for its data's currency, held values are republished with degraded verdicts —
+`UNCERTAIN`/`BAD` with `qualityRaw: MTC_STALE:<ageMs>` or `MTC_AGENT_UNREACHABLE` — each synthetic
+sample carrying the `passive` extra (`stale`|`expired`|`unreachable`|`recovered`) and the held
+`sequence`, bypassing any batch window
+([data-types.md](data-types.md#passive-quality--held-values-under-a-silent-agent)).
 
 #### `componentPath` — the canonical address, on every update
 
@@ -330,7 +341,7 @@ data-item ids belong here, in the event's `context` — never as a metric dimens
 | `MtconnectAgentEvent` | info / critical / warning | the agent became reachable (`state: "up"`), unreachable (`"down"`), or streaming could not be established and acquisition degraded to polling (`"degraded"`) | `instance`, `agentId`, `state`; plus `mode`, `instanceId`, `agentVersion`, `standardVersion` when up, `reason` when down, `failures` when degraded |
 | `MtconnectDataLossEvent` | warning | the agent's buffer overran the adapter's position, so observations are provably lost (resync ladder step 2) | `instance`, `agentId`, `skipped`, `firstSequence`, `nextSequence`, `bufferSize` |
 | `MtconnectModelDriftEvent` | warning | a re-probe returned a different device model: signals recompile and browse cursors are void | `instance`, `agentId`, `deviceUuid`, `oldDigest`, `newDigest` |
-| `MtconnectConditionEvent` | critical | a CONDITION data item **transitioned into** `Fault` | `instance`, `dataItemId`, `state`, `previousState`, `nativeCode`, `timestamp` |
+| `MtconnectConditionEvent` | critical | a CONDITION data item's **aggregate** state transitioned into `Fault` — a second concurrent Fault on an already-faulted item is not a new alarm, and clearing one of two is not a recovery | `instance`, `dataItemId`, `state`, `previousState`, `nativeCode`, `conditionId`, `activeConditions`, `timestamp` |
 | `MtconnectSignalSetEvent` | info / warning | the `selection`-derived signal set changed shape — it followed a model change or a reload (info, with counts), or `maxSignals` truncated the derived set (warning; a cap is never silent) | `instance`, `deviceUuid`; set change: `added`, `removed`, `discovered`, `served`; truncation: `reason: "maxSignals"`, `maxSignals`, `matched`, `truncated` |
 
 A condition that is merely still asserted is not a new event, and a fault that clears and re-latches
@@ -343,9 +354,12 @@ through `conditionBinding`.
 { "severity": "critical", "type": "MtconnectConditionEvent",
   "message": "condition `Xtravel` went to Fault", "timestamp": "2026-07-27T10:00:05.000Z",
   "context": { "instance": "cnc-1", "dataItemId": "Xtravel", "state": "FAULT",
-               "previousState": "NORMAL", "nativeCode": "ALM-2",
-               "timestamp": "2026-07-27T10:00:04.900000Z" } }
+               "previousState": "NORMAL", "nativeCode": "ALM-2", "conditionId": "xtravel-max",
+               "activeConditions": 1, "timestamp": "2026-07-27T10:00:04.900000Z" } }
 ```
+
+`previousState` is the aggregate the data item held before this observation (`null` for a data item
+never observed before); `activeConditions` is how many activations stand behind the new state.
 
 The `conditions` and `diagnostics` panels subscribe to these families by name.
 
@@ -371,3 +385,10 @@ one that has gone quiet; `connected` stays the normalized flag any consumer can 
 | `--transport` | `MQTT [path]` \| `IPC` | HOST/Kubernetes use MQTT; the path is the messaging config. |
 | `-c/--config` | `FILE <path>` \| `ENV` \| `GG_CONFIG` \| `CONFIGMAP` | Default from the platform. |
 | `-t/--thing` | `<name>` | Thing name; the `{device}` token of every UNS topic. |
+
+## Appendix — revision history
+
+| Date | Change |
+|---|---|
+| 2026-08-03 | `MtconnectConditionEvent` context gains `conditionId`/`activeConditions` and its trigger is the aggregate transition; the condition/passive-quality sample extras; `receivedTs` defined as payload arrival. |
+| 2026-07-28 | Initial version. |

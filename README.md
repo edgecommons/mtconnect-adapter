@@ -216,10 +216,11 @@ What to watch when something looks wrong:
 |---|---|---|
 | Link down | `southbound_health.connectionState` | `0` means this machine's session is not established. `MtconnectAgentEvent` says whether the agent went away or the stream degraded to polling. |
 | Fewer signals than expected | `southbound_health.signalsSubscribed` | What the session is actually serving. A drop means data items the configuration names are missing from the current device model. |
-| Values going quiet | `southbound_health.staleSignals` | Signals with no update for longer than `healthThresholds.staleSignalSecs`. |
+| Values going quiet | `southbound_health.staleSignals` | Signals with no value update for longer than `healthThresholds.staleSignalSecs`. |
+| Values frozen with `MTC_STALE` / `MTC_AGENT_UNREACHABLE` | the `data` topics themselves | The agent stopped vouching for its data; held values were republished with degraded verdicts. The machine may be fine — the agent link is not. |
 | Gaps in history | `MtconnectDataLossEvent` | The agent's ring buffer overran our position; the event names how many observations were provably lost and the sequence window they fell in. |
 | Ids or structure changed | `MtconnectModelDriftEvent`, `MtconnectSignalSetEvent` | The machine's model changed and the signal set was recomputed; the events name the digests and the added/removed counts. |
-| A machine alarm | `MtconnectConditionEvent` | A condition transitioned into `Fault`. Any signal bound to it through `conditionBinding` degrades to BAD at the same moment. |
+| A machine alarm | `MtconnectConditionEvent` | A condition's aggregate state transitioned into `Fault`. Any signal bound to it through `conditionBinding` degrades to BAD at the same moment, and stays degraded until every concurrent activation clears. |
 
 Every measure is defined in [the metrics reference](docs/reference/metrics.md); every event body in
 [the messaging reference](docs/reference/messaging-interface.md).
@@ -238,8 +239,16 @@ re-probes, surfaces any model drift, and resyncs. Each of those raises an event,
 never received is a fact an operator needs, not a log line to find later.
 
 **Two timestamps, two meanings.** `serverTs` is when the machine's data was captured, as the agent
-reported it. `receivedTs` is when this adapter received it — the two differ by however long the
-observation sat in the agent's buffer, which is why both are published.
+reported it. `receivedTs` is when the agent's payload arrived at this adapter — the two differ by
+however long the observation sat in the agent's buffer, which is why both are published.
+
+**A silent agent cannot leave GOOD values behind.** When an agent stops vouching for its data —
+a missed heartbeat, missed polls, a lost link — every value this adapter holds on the wire is
+republished with a degraded verdict: `UNCERTAIN`, then `BAD`, with `qualityRaw` naming the reason
+(`MTC_STALE:<ageMs>`, `MTC_AGENT_UNREACHABLE`) and a `passive` marker so synthetic quality motion
+is never mistaken for machine data. When the agent comes back, the held verdicts are restored
+exactly. The ladder is specified in
+[the data-types reference](docs/reference/data-types.md#passive-quality--held-values-under-a-silent-agent).
 
 **What it does not do.** MTConnect Assets (`/asset`) and the optional JSON representation are not
 read — only the XML `Devices`, `Streams`, and `Errors` documents. Consuming an agent's MQTT sink
@@ -267,8 +276,9 @@ Three packs ship in the repo, all driven by the same CLI contract
 
 The repo:
 
-- `src/` — the component above the protocol: the device seam, the connect/acquire/publish supervisor,
-  the command surface, the metric families, the reload gate, and the publish-shaping engine.
+- `src/` — the component above the protocol: the device seam, the connect/acquire/publish drivers
+  and their supervisor shell, the command surface, the metric families, the reload gate, the
+  publish-shaping engine, and the passive-quality watchdog.
 - `src/mtconnect/` — the owned MTConnect HTTP/XML client: probe model, observations, the sequence and
   resync state machine, multipart streaming, and signal derivation.
 - `tests/` — the unit and integration suites, plus `compose.mtconnect-agent.yaml`, which stands up
@@ -289,7 +299,9 @@ cargo clippy --all-targets -- -D warnings
 cargo llvm-cov --fail-under-lines 90          # the coverage gate CI enforces
 ```
 
-The live suites self-skip unless you point them at something. For the real-agent harness:
+The live suites self-skip unless you point them at something (set `EC_REQUIRE_LIVE=1` in a run that
+is supposed to reach live infrastructure, and the skip becomes a hard failure). For the real-agent
+harness:
 
 ```bash
 docker compose -f tests/compose.mtconnect-agent.yaml up -d
@@ -306,3 +318,10 @@ remove, and [`docs/`](docs/README.md) for the user-facing documentation set.
 ## License
 
 Business Source License 1.1 — see [`LICENSE`](LICENSE).
+
+## Appendix — revision history
+
+| Date | Change |
+|---|---|
+| 2026-08-03 | Passive-quality behavior (held values under a silent agent), aggregate condition semantics, `receivedTs` as payload arrival, `EC_REQUIRE_LIVE`. |
+| 2026-07-28 | Initial version. |
