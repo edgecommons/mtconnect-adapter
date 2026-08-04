@@ -65,7 +65,7 @@ carries a runnable example.
   module. What is excluded is only what genuinely needs a live runtime: `src/supervisor.rs` (the
   thin live shell — construction, spawning, the shutdown invocation, and `FacadeWire`, the
   facade-backed `Wire`), `main.rs`, and the env-gated live suites — the coverage job passes
-  `--ignore-filename-regex '(supervisor\.rs|main\.rs|tests[/\\](live_.*|agent_integration)\.rs)'`,
+  `--ignore-filename-regex '(supervisor\.rs|main\.rs|tests[/\\](live_.*|agent_integration|wire_gate)\.rs)'`,
   each exclusion pinned to a reason in the workflow. Every pure decision the shell composes
   (backoff, the write allow-list, connectivity, the metric-family math, XML parsing, the probe
   model, the sequence/resync state machine, shaping, staleness) stays in
@@ -90,6 +90,20 @@ carries a runnable example.
   feed both containers dial into is served in-process by the test binary itself (fixed host ports,
   reached via `host.docker.internal`), so no separate simulator process is needed. Without
   `EC_MTC_AGENT` every test in this file self-skips, so `cargo test` stays green with no Docker.
+  The `dev-one` fixture speaks **MTConnect 2.3** and declares a CONDITION data item (`d1-travel`,
+  the `Xtravel` position condition): both exist so the wire gate below can drive concurrent
+  condition activations and read a real `conditionId` off the agent — cppagent emits that attribute
+  only from 2.3 onwards. `DEV_ONE_ITEMS` names every data item the device declares, the condition
+  included, because a re-baseline that quietly omitted one is exactly the regression it guards.
+- `tests/wire_gate.rs` is the **third** env-gated live suite and the LLD §12 `wire | local MQTT` row:
+  set `EC_MTC_AGENT` **and** `EC_MQTT_BROKER=<host:port>` with both the cppagent compose harness and
+  a local broker up. It is the only suite that puts bytes on a broker: a genuine `EdgeCommons`
+  runtime (built through `EdgeCommonsBuilder::build()` — the only construction path the library
+  offers for `DataFacade`) drives `driver::run_device` over the live agent, and a **raw** MQTT
+  subscriber decodes what landed with `prost` against the generated `edgecommons.v1` schema. Do not
+  weaken it into an in-process round-trip: the point is that nothing between `build_sample` and the
+  broker is this test's own code. It reconstructs `supervisor::FacadeWire` (a private struct) with
+  the identical three public calls on the same real facade; if that seam changes, change it here too.
 - `edgecommons component validate` checks this repo's config against `config.schema.json` and warns
   if `Cargo.lock` is not committed.
 

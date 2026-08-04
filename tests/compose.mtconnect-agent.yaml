@@ -1,8 +1,11 @@
-# The pinned MTConnect reference agent (cppagent) for the env-gated integration suite
-# (tests/agent_integration.rs — LLD §12 row 6).
+# The pinned MTConnect reference agent (cppagent) for the env-gated integration suites
+# (tests/agent_integration.rs — LLD §12 row 6 — and tests/wire_gate.rs — the `wire | local MQTT`
+# row, which additionally needs a broker and drives the containers through `docker pause`).
 #
 #   docker compose -f tests/compose.mtconnect-agent.yaml up -d
 #   EC_MTC_AGENT=http://localhost:5010 cargo test --test agent_integration -- --test-threads=1
+#   EC_MTC_AGENT=http://localhost:5010 EC_MQTT_BROKER=localhost:1883 \
+#     cargo test --test wire_gate -- --test-threads=1
 #
 # The agent image ships an EMPTY /mtconnect/config, so the simulator configuration is mounted
 # from tests/fixtures/agent-e2e/. The SHDR data feed itself is served by the test process on the
@@ -10,7 +13,9 @@
 # reach via host.docker.internal.
 #
 #   agent       : two simulated devices, default buffer  — probe/stream E2E, restart/instanceId
-#                 resync, multi-device demultiplexing.
+#                 resync, multi-device demultiplexing, and (dev-one) the CONDITION data item the
+#                 wire gate drives. Its fixture speaks MTConnect 2.3 so cppagent emits the
+#                 `conditionId` attribute that identifies one activation across its transitions.
 #   agent-tiny  : one device, BufferSize = 7 (2^7 = 128 observations) — buffer-wrap / OUT_OF_RANGE
 #                 recovery.
 services:

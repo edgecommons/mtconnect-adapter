@@ -53,11 +53,15 @@ jobs:
       #   - `tests/agent_integration.rs` — the self-skipping (`EC_MTC_AGENT`) live suite against the
       #     pinned cppagent Docker harness (tests/compose.mtconnect-agent.yaml): its body needs a
       #     real agent plus the docker CLI, so it is uncovered in a normal `cargo test` run.
-      # Both live suites self-skip only when their endpoint is unset; a leg that sets
+      #   - `tests/wire_gate.rs` — the self-skipping (`EC_MTC_AGENT` + `EC_MQTT_BROKER`) local-MQTT
+      #     wire gate: it builds a genuine `EdgeCommons` runtime against a real broker and reads the
+      #     published bytes back off it, so its body needs the broker AND the agent AND the docker
+      #     CLI, and is uncovered in a normal `cargo test` run.
+      # Every live suite self-skips only when its endpoint is unset; a leg that sets
       # `EC_REQUIRE_LIVE` turns the skip into a hard failure, so a run that was supposed to have the
       # infrastructure can never pass vacuously. They are validated against real endpoints (the
       # validation-matrix HOST/lab legs) and by the scaffold→build gate.
       # NOTHING ELSE is excluded.
       - run: >
           cargo llvm-cov --fail-under-lines 90
-          --ignore-filename-regex '(supervisor\.rs|main\.rs|tests[/\\](live_.*|agent_integration)\.rs)'
+          --ignore-filename-regex '(supervisor\.rs|main\.rs|tests[/\\](live_.*|agent_integration|wire_gate)\.rs)'

@@ -64,3 +64,11 @@ tokio = { version = "1", features = ["test-util"] }
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
+# The local-MQTT wire gate (tests/wire_gate.rs, LLD 12 row "wire | local MQTT"). A RAW subscriber —
+# the same MQTT client the library's standalone provider uses, but driven independently of it — so
+# the gate reads the bytes that actually landed on the broker rather than anything the publishing
+# runtime hands back, and `prost` decodes those bytes straight against the generated
+# `edgecommons.v1` schema (`edgecommons::proto`) instead of through the library's own envelope
+# reader. Both versions match the ones `edgecommons` already resolves, so neither adds a build.
+rumqttc = "0.25"
+prost = "0.13"

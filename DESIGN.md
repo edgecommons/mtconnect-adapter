@@ -455,10 +455,21 @@ incident: it raises no `device-unreachable` and counts no reconnect.
   the canonical cppagent harness: agent restart, `instanceId` resync, buffer wrap/`OUT_OF_RANGE`
   recovery, multi-device demultiplexing. Both self-skip without their variable; `EC_REQUIRE_LIVE=1`
   turns the self-skip into a hard failure for runs that are supposed to reach live infrastructure.
-- Release gates still open: the extended wire gate over local MQTT (the `passive` and
-  `conditionId`/`activeConditions` extras, exact-byte envelope assertions) and the
-  Greengrass/Kubernetes platform legs. A cppagent-over-TLS compose variant is not in the harness;
-  the transport-security row is covered by `tests/tls_auth.rs` against a local TLS server instead.
+- `tests/wire_gate.rs` (`EC_MTC_AGENT=<url>` **and** `EC_MQTT_BROKER=<host:port>`) — the local-MQTT
+  wire gate. A genuine `EdgeCommons` runtime built through `EdgeCommonsBuilder::build()` against the
+  real broker (the only construction path for `DataFacade`) drives `driver::run_device` over the
+  live cppagent, and a **raw** MQTT subscriber decodes the bytes that landed with `prost`, straight
+  against the generated `edgecommons.v1` schema. It pins the topic grammar, the stamped top-level
+  `identity`, the update-level `componentPath`/`device` extras, the `sequence`/`receivedTs` sample
+  extras, the whole quality vocabulary (`MTC_OK`, `MTC_OK:NORMAL`, `MTC_CONDITION:FAULT|WARNING:<code>`,
+  `UNAVAILABLE` as a BAD explicit null, `MTC_STALE:<ageMs>`, `MTC_AGENT_UNREACHABLE`), and the two
+  behaviors only a live bus can show: concurrent condition activations (`conditionId` +
+  `activeConditions`, D-R7/D-R8) and the passive `stale → expired → unreachable` ladder with its
+  `passive` marker (D-R14). The `d1-travel` CONDITION data item in `tests/fixtures/agent-e2e/devices.xml`
+  exists for it, and the fixture speaks MTConnect 2.3 so cppagent emits `conditionId`.
+- Release gates still open: the Greengrass and Kubernetes platform legs. A cppagent-over-TLS compose
+  variant is not in the harness; the transport-security row is covered by `tests/tls_auth.rs`
+  against a local TLS server instead.
 
 ## Appendix — revision history
 

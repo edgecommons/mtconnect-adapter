@@ -61,9 +61,11 @@ const DEV_ONE: &str = "MTC-E2E-001";
 const DEV_TWO: &str = "MTC-E2E-002";
 const DEV_TINY: &str = "MTC-E2E-TINY";
 
-/// Every data item `dev-one` declares in `tests/fixtures/agent-e2e/devices.xml`. A re-baseline of
-/// this device must carry all of them — that is what makes it a rebuilt *view*.
-const DEV_ONE_ITEMS: [&str; 3] = ["d1-avail", "d1-Xabs", "d1-exec"];
+/// Every data item `dev-one` declares in `tests/fixtures/agent-e2e/devices.xml` — the EVENT and
+/// SAMPLE items and the CONDITION one (`d1-travel`, the `Xtravel` position condition the wire gate
+/// drives). A re-baseline of this device must carry all of them — that is what makes it a rebuilt
+/// *view*, and a condition is exactly the kind of item a rebuild must not quietly omit.
+const DEV_ONE_ITEMS: [&str; 4] = ["d1-avail", "d1-Xabs", "d1-exec", "d1-travel"];
 
 /// The switch a CI or lab leg sets to declare "the live harness is supposed to be up". It turns the
 /// self-skip below into a hard failure, so a leg whose compose harness never started cannot report

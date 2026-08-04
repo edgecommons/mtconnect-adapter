@@ -311,6 +311,18 @@ EC_MTC_AGENT=http://localhost:5010 cargo test --test agent_integration -- --test
 That harness covers what a fake agent cannot: agent restart, `instanceId` resync, buffer wrap and
 `OUT_OF_RANGE` recovery, and multi-device demultiplexing on one stream.
 
+Point the same harness at a local MQTT broker as well and the wire gate runs — the suite that puts
+real bytes on a real bus and reads them back with a raw subscriber:
+
+```bash
+EC_MTC_AGENT=http://localhost:5010 EC_MQTT_BROKER=localhost:1883 \
+  cargo test --test wire_gate -- --test-threads=1
+```
+
+It pins the published topic, envelope, identity and sample extras exactly, and proves the two
+behaviors only a live bus shows: concurrent condition activations, and the passive
+stale → expired → unreachable ladder a silent agent produces.
+
 Where to look next: [`DESIGN.md`](DESIGN.md) for why the component is shaped this way and which
 decisions are binding, [`AGENTS.md`](AGENTS.md) for the invariants an agent or a contributor must not
 remove, and [`docs/`](docs/README.md) for the user-facing documentation set.
