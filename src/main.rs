@@ -14,10 +14,10 @@
 //!   -t my-thing
 //! ```
 
-use edgecommons::config::{ConfigurationValidationResult, ConfigurationValidationPhase};
+use edgecommons::config::{ConfigurationValidationPhase, ConfigurationValidationResult};
+use edgecommons::prelude::*;
 use mtconnect_adapter::reload::{self, Verdict};
 use mtconnect_adapter::supervisor;
-use edgecommons::prelude::*;
 
 /// The component's full name (matches `recipe.yaml` / `gdk-config.json`).
 const COMPONENT_NAME: &str = "com.mbreissi.edgecommons.MtconnectAdapter";

@@ -12,8 +12,10 @@
 pub mod app;
 pub mod commands;
 pub mod device;
+pub mod driver;
 pub mod metrics;
 pub mod mtconnect;
 pub mod reload;
 pub mod shaping;
+pub mod staleness;
 pub mod supervisor;

@@ -39,6 +39,16 @@ use crate::mtconnect::config::{PublishMode, SignalConfig};
 /// arrival order. Never empty.
 pub type Update = Vec<Reading>;
 
+/// Where a signal's readings publish. Part of the policy **identity**: one flushed update carries
+/// one signal's window on one route, so a route change must flush the open window rather than let
+/// readings from two routing generations leave together (D-R16).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SignalRoute {
+    pub channel: Option<String>,
+    pub component_path: Option<String>,
+    pub name: Option<String>,
+}
+
 /// One signal's effective shaping policy — the engine's own vocabulary, compiled from
 /// [`PublishCfg`](crate::mtconnect::config::PublishCfg) by whoever knows the signal (the MTConnect
 /// session compiles the served set against the probe model; a backend with no compile step uses
@@ -53,11 +63,14 @@ pub struct PublishPolicy {
     /// Absolute deadband, applied on entry. Set only where it applies (numeric SAMPLE-category
     /// data items for MTConnect); `None` means every reading enters.
     pub deadband: Option<f64>,
+    /// Where the signal publishes. A route change is a policy change.
+    pub route: SignalRoute,
 }
 
 impl PublishPolicy {
     /// Whether this policy shapes anything at all. A trivial policy is not worth a table entry:
-    /// the unshaped fast path is identical.
+    /// the unshaped fast path is identical. The route alone never forces an entry — a trivial
+    /// policy never buffers, so it cannot mix routing generations.
     #[must_use]
     pub fn is_trivial(&self) -> bool {
         self.batch_ms == 0 && self.deadband.is_none()
@@ -69,7 +82,8 @@ impl PublishPolicy {
 /// are kept: an absent entry IS the immediate-publish default.
 ///
 /// Without a model there is no category to gate on, so a configured `deadband` applies to any
-/// numeric value the signal produces.
+/// numeric value the signal produces — and no component path either, so the route is the
+/// configured `channel`/`name` alone.
 #[must_use]
 pub fn policies_from_signals(signals: &[SignalConfig]) -> HashMap<String, PublishPolicy> {
     let mut out = HashMap::new();
@@ -79,6 +93,11 @@ pub fn policies_from_signals(signals: &[SignalConfig]) -> HashMap<String, Publis
             batch_ms: p.batch_ms,
             latest_only: p.mode == PublishMode::Interval,
             deadband: p.deadband,
+            route: SignalRoute {
+                channel: s.channel.clone(),
+                component_path: None,
+                name: s.name.clone(),
+            },
         };
         if !policy.is_trivial() {
             out.insert(s.id.clone(), policy);
@@ -193,10 +212,13 @@ impl Shaper {
             return vec![readings];
         }
 
-        let buffer = self.buffers.entry(reading.signal_id.clone()).or_insert_with(|| Buffer {
-            readings: Vec::new(),
-            deadline: now + Duration::from_millis(u64::from(policy.batch_ms)),
-        });
+        let buffer = self
+            .buffers
+            .entry(reading.signal_id.clone())
+            .or_insert_with(|| Buffer {
+                readings: Vec::new(),
+                deadline: now + Duration::from_millis(u64::from(policy.batch_ms)),
+            });
         if policy.latest_only {
             buffer.readings.clear();
         }
@@ -221,7 +243,10 @@ impl Shaper {
             .map(|(id, b)| (b.deadline, id.clone()))
             .collect();
         expired.sort();
-        expired.into_iter().filter_map(|(_, id)| self.flush_signal(&id)).collect()
+        expired
+            .into_iter()
+            .filter_map(|(_, id)| self.flush_signal(&id))
+            .collect()
     }
 
     /// Flush every open window — shutdown, link loss, reconnect: buffered readings are data, and
@@ -233,7 +258,9 @@ impl Shaper {
             .map(|(id, b)| (b.deadline, id.clone()))
             .collect();
         all.sort();
-        all.into_iter().filter_map(|(_, id)| self.flush_signal(&id)).collect()
+        all.into_iter()
+            .filter_map(|(_, id)| self.flush_signal(&id))
+            .collect()
     }
 
     /// Discard every open window — the pause discipline: nothing reaches the wire while paused,
@@ -274,9 +301,10 @@ impl Shaper {
         if (reading.quality, reading.quality_raw.clone()) != state.last_quality {
             return false; // a quality transition must never be suppressed
         }
-        let (Some(value), Some(last)) =
-            (reading.value.as_ref().and_then(serde_json::Value::as_f64), state.last_value)
-        else {
+        let (Some(value), Some(last)) = (
+            reading.value.as_ref().and_then(serde_json::Value::as_f64),
+            state.last_value,
+        ) else {
             return false; // non-numeric/array values (and a missing baseline) always pass
         };
         (value - last).abs() < deadband
@@ -289,7 +317,10 @@ impl Shaper {
         let state = self
             .entries
             .entry(reading.signal_id.clone())
-            .or_insert_with(|| EntryState { last_value: None, last_quality: (reading.quality, reading.quality_raw.clone()) });
+            .or_insert_with(|| EntryState {
+                last_value: None,
+                last_quality: (reading.quality, reading.quality_raw.clone()),
+            });
         state.last_quality = (reading.quality, reading.quality_raw.clone());
         if let Some(v) = numeric {
             state.last_value = Some(v);
@@ -303,11 +334,19 @@ mod tests {
     use serde_json::json;
 
     fn policy(batch_ms: u32) -> PublishPolicy {
-        PublishPolicy { batch_ms, latest_only: false, deadband: None }
+        PublishPolicy {
+            batch_ms,
+            latest_only: false,
+            deadband: None,
+            route: SignalRoute::default(),
+        }
     }
 
     fn table(entries: &[(&str, PublishPolicy)]) -> HashMap<String, PublishPolicy> {
-        entries.iter().map(|(id, p)| ((*id).to_string(), p.clone())).collect()
+        entries
+            .iter()
+            .map(|(id, p)| ((*id).to_string(), p.clone()))
+            .collect()
     }
 
     fn good(id: &str, value: f64) -> Reading {
@@ -330,10 +369,17 @@ mod tests {
         let mut s = Shaper::new();
         let out = s.offer(good("a", 1.0), t0());
         assert_eq!(out, vec![vec![good("a", 1.0)]]);
-        assert_eq!(s.next_deadline(), None, "nothing buffered, nothing to sleep on");
+        assert_eq!(
+            s.next_deadline(),
+            None,
+            "nothing buffered, nothing to sleep on"
+        );
         assert_eq!(
             s.take_counters(),
-            Some(ShapingCounters { published: 1, ..Default::default() })
+            Some(ShapingCounters {
+                published: 1,
+                ..Default::default()
+            })
         );
     }
 
@@ -342,11 +388,27 @@ mod tests {
         let mut s = Shaper::new();
         s.set_policies(table(&[(
             "a",
-            PublishPolicy { batch_ms: 0, latest_only: false, deadband: Some(0.5) },
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: Some(0.5),
+                route: SignalRoute::default(),
+            },
         )]));
-        assert_eq!(s.offer(good("a", 1.0), t0()).len(), 1, "the first reading always passes");
-        assert!(s.offer(good("a", 1.2), t0()).is_empty(), "sub-deadband change dropped");
-        assert_eq!(s.offer(good("a", 2.0), t0()).len(), 1, "a real change publishes immediately");
+        assert_eq!(
+            s.offer(good("a", 1.0), t0()).len(),
+            1,
+            "the first reading always passes"
+        );
+        assert!(
+            s.offer(good("a", 1.2), t0()).is_empty(),
+            "sub-deadband change dropped"
+        );
+        assert_eq!(
+            s.offer(good("a", 2.0), t0()).len(),
+            1,
+            "a real change publishes immediately"
+        );
     }
 
     #[test]
@@ -354,10 +416,24 @@ mod tests {
         assert!(policy(0).is_trivial());
         assert!(!policy(100).is_trivial());
         assert!(
-            !PublishPolicy { batch_ms: 0, latest_only: false, deadband: Some(1.0) }.is_trivial()
+            !PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: Some(1.0),
+                route: SignalRoute::default()
+            }
+            .is_trivial()
         );
         // latest_only with a zero window degenerates to immediate — trivial.
-        assert!(PublishPolicy { batch_ms: 0, latest_only: true, deadband: None }.is_trivial());
+        assert!(
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: true,
+                deadband: None,
+                route: SignalRoute::default()
+            }
+            .is_trivial()
+        );
     }
 
     // --- batching -------------------------------------------------------------------------------
@@ -368,7 +444,10 @@ mod tests {
         s.set_policies(table(&[("a", policy(250))]));
         let start = t0();
 
-        assert!(s.offer(good("a", 1.0), start).is_empty(), "buffered, not published");
+        assert!(
+            s.offer(good("a", 1.0), start).is_empty(),
+            "buffered, not published"
+        );
         assert!(s.offer(good("a", 2.0), ms(start, 100)).is_empty());
         assert!(s.offer(good("a", 3.0), ms(start, 200)).is_empty());
 
@@ -378,12 +457,23 @@ mod tests {
 
         let flushed = s.due(ms(start, 250));
         assert_eq!(flushed.len(), 1, "ONE update for the whole window");
-        let values: Vec<_> = flushed[0].iter().map(|r| r.value.clone().unwrap()).collect();
-        assert_eq!(values, vec![json!(1.0), json!(2.0), json!(3.0)], "arrival order");
+        let values: Vec<_> = flushed[0]
+            .iter()
+            .map(|r| r.value.clone().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec![json!(1.0), json!(2.0), json!(3.0)],
+            "arrival order"
+        );
         assert_eq!(s.next_deadline(), None, "the window closed");
         assert_eq!(
             s.take_counters(),
-            Some(ShapingCounters { published: 1, coalesced: 3, ..Default::default() })
+            Some(ShapingCounters {
+                published: 1,
+                coalesced: 3,
+                ..Default::default()
+            })
         );
     }
 
@@ -404,7 +494,11 @@ mod tests {
         s.offer(second.clone(), ms(start, 50));
 
         let flushed = s.due(ms(start, 100));
-        assert_eq!(flushed[0], vec![first, second], "readings ride the flush untouched");
+        assert_eq!(
+            flushed[0],
+            vec![first, second],
+            "readings ride the flush untouched"
+        );
     }
 
     #[test]
@@ -416,13 +510,21 @@ mod tests {
         s.offer(good("b", 9.0), ms(start, 10));
         s.offer(good("a", 2.0), ms(start, 20));
 
-        assert_eq!(s.next_deadline(), Some(ms(start, 100)), "the EARLIEST window");
+        assert_eq!(
+            s.next_deadline(),
+            Some(ms(start, 100)),
+            "the EARLIEST window"
+        );
         let flushed = s.due(ms(start, 100));
         assert_eq!(flushed.len(), 1, "only a's window expired");
         assert_eq!(flushed[0].len(), 2);
         assert_eq!(flushed[0][0].signal_id, "a");
 
-        assert_eq!(s.next_deadline(), Some(ms(start, 310)), "b's window is still open");
+        assert_eq!(
+            s.next_deadline(),
+            Some(ms(start, 310)),
+            "b's window is still open"
+        );
         let flushed = s.due(ms(start, 310));
         assert_eq!(flushed[0][0].signal_id, "b");
     }
@@ -436,7 +538,11 @@ mod tests {
         s.due(ms(start, 100));
 
         s.offer(good("a", 2.0), ms(start, 500));
-        assert_eq!(s.next_deadline(), Some(ms(start, 600)), "the window opens at arrival");
+        assert_eq!(
+            s.next_deadline(),
+            Some(ms(start, 600)),
+            "the window opens at arrival"
+        );
     }
 
     #[test]
@@ -444,7 +550,12 @@ mod tests {
         let mut s = Shaper::new();
         s.set_policies(table(&[(
             "a",
-            PublishPolicy { batch_ms: 200, latest_only: true, deadband: None },
+            PublishPolicy {
+                batch_ms: 200,
+                latest_only: true,
+                deadband: None,
+                route: SignalRoute::default(),
+            },
         )]));
         let start = t0();
         s.offer(good("a", 1.0), start);
@@ -461,7 +572,11 @@ mod tests {
     #[test]
     fn multiple_expired_windows_flush_in_deadline_then_id_order() {
         let mut s = Shaper::new();
-        s.set_policies(table(&[("b", policy(50)), ("a", policy(100)), ("c", policy(50))]));
+        s.set_policies(table(&[
+            ("b", policy(50)),
+            ("a", policy(100)),
+            ("c", policy(50)),
+        ]));
         let start = t0();
         s.offer(good("c", 3.0), start);
         s.offer(good("b", 2.0), start);
@@ -469,7 +584,11 @@ mod tests {
 
         let flushed = s.due(ms(start, 100));
         let order: Vec<_> = flushed.iter().map(|u| u[0].signal_id.clone()).collect();
-        assert_eq!(order, vec!["b", "c", "a"], "deadline first, id as the tiebreak");
+        assert_eq!(
+            order,
+            vec!["b", "c", "a"],
+            "deadline first, id as the tiebreak"
+        );
     }
 
     // --- quality flushes ------------------------------------------------------------------------
@@ -483,9 +602,17 @@ mod tests {
         s.offer(good("a", 2.0), ms(start, 10));
 
         let flushed = s.offer(Reading::bad("a", "UNAVAILABLE"), ms(start, 20));
-        assert_eq!(flushed.len(), 1, "a quality problem must not sit in a window");
+        assert_eq!(
+            flushed.len(),
+            1,
+            "a quality problem must not sit in a window"
+        );
         let ids: Vec<_> = flushed[0].iter().map(|r| r.value.clone()).collect();
-        assert_eq!(ids, vec![Some(json!(1.0)), Some(json!(2.0)), None], "buffered first, BAD last");
+        assert_eq!(
+            ids,
+            vec![Some(json!(1.0)), Some(json!(2.0)), None],
+            "buffered first, BAD last"
+        );
         assert_eq!(s.next_deadline(), None, "the window closed with the flush");
     }
 
@@ -499,7 +626,11 @@ mod tests {
             ..good("a", 5.0)
         };
         let flushed = s.offer(uncertain.clone(), t0());
-        assert_eq!(flushed, vec![vec![uncertain]], "no buffer to drain — it goes out alone, now");
+        assert_eq!(
+            flushed,
+            vec![vec![uncertain]],
+            "no buffer to drain — it goes out alone, now"
+        );
     }
 
     // --- deadband -------------------------------------------------------------------------------
@@ -509,13 +640,35 @@ mod tests {
         let mut s = Shaper::new();
         s.set_policies(table(&[(
             "a",
-            PublishPolicy { batch_ms: 0, latest_only: false, deadband: Some(1.0) },
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: Some(1.0),
+                route: SignalRoute::default(),
+            },
         )]));
-        assert_eq!(s.offer(good("a", 10.0), t0()).len(), 1, "first always passes");
-        assert!(s.offer(good("a", 10.5), t0()).is_empty(), "|10.5-10.0| < 1.0");
-        assert!(s.offer(good("a", 10.9), t0()).is_empty(), "still against 10.0 — the last ACCEPTED");
-        assert_eq!(s.offer(good("a", 11.0), t0()).len(), 1, "|11.0-10.0| >= 1.0 passes");
-        assert!(s.offer(good("a", 11.5), t0()).is_empty(), "the anchor moved to 11.0");
+        assert_eq!(
+            s.offer(good("a", 10.0), t0()).len(),
+            1,
+            "first always passes"
+        );
+        assert!(
+            s.offer(good("a", 10.5), t0()).is_empty(),
+            "|10.5-10.0| < 1.0"
+        );
+        assert!(
+            s.offer(good("a", 10.9), t0()).is_empty(),
+            "still against 10.0 — the last ACCEPTED"
+        );
+        assert_eq!(
+            s.offer(good("a", 11.0), t0()).len(),
+            1,
+            "|11.0-10.0| >= 1.0 passes"
+        );
+        assert!(
+            s.offer(good("a", 11.5), t0()).is_empty(),
+            "the anchor moved to 11.0"
+        );
         assert_eq!(
             s.take_counters().unwrap().deadband_dropped,
             3,
@@ -528,7 +681,12 @@ mod tests {
         let mut s = Shaper::new();
         s.set_policies(table(&[(
             "a",
-            PublishPolicy { batch_ms: 0, latest_only: false, deadband: Some(100.0) },
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: Some(100.0),
+                route: SignalRoute::default(),
+            },
         )]));
         s.offer(good("a", 10.0), t0());
 
@@ -546,11 +704,19 @@ mod tests {
             quality_raw: Some("MTC_CONDITION:WARNING:ALM-9".into()),
             ..good("a", 10.0)
         };
-        assert_eq!(s.offer(other_alarm, t0()).len(), 1, "a qualityRaw change must pass");
+        assert_eq!(
+            s.offer(other_alarm, t0()).len(),
+            1,
+            "a qualityRaw change must pass"
+        );
 
         // Recovery is a transition as well.
         let recovered = good("a", 10.0);
-        assert_eq!(s.offer(recovered, t0()).len(), 1, "UNCERTAIN->GOOD must pass");
+        assert_eq!(
+            s.offer(recovered, t0()).len(),
+            1,
+            "UNCERTAIN->GOOD must pass"
+        );
 
         // And only now does the deadband suppress a same-quality subthreshold change.
         assert!(s.offer(good("a", 10.1), t0()).is_empty());
@@ -561,15 +727,27 @@ mod tests {
         let mut s = Shaper::new();
         s.set_policies(table(&[(
             "a",
-            PublishPolicy { batch_ms: 0, latest_only: false, deadband: Some(100.0) },
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: Some(100.0),
+                route: SignalRoute::default(),
+            },
         )]));
         s.offer(good("a", 1.0), t0());
         let array = Reading::good("a", json!([1.0, 2.0]));
-        assert_eq!(s.offer(array, t0()).len(), 1, "a TIME_SERIES array is never suppressed");
+        assert_eq!(
+            s.offer(array, t0()).len(),
+            1,
+            "a TIME_SERIES array is never suppressed"
+        );
         let text = Reading::good("a", json!("ACTIVE"));
         assert_eq!(s.offer(text, t0()).len(), 1, "a string is never suppressed");
         // After non-numeric values the anchor is still the last accepted NUMERIC value.
-        assert!(s.offer(good("a", 1.5), t0()).is_empty(), "anchored on 1.0, not the array");
+        assert!(
+            s.offer(good("a", 1.5), t0()).is_empty(),
+            "anchored on 1.0, not the array"
+        );
     }
 
     #[test]
@@ -577,14 +755,29 @@ mod tests {
         let mut s = Shaper::new();
         s.set_policies(table(&[(
             "a",
-            PublishPolicy { batch_ms: 0, latest_only: false, deadband: Some(1.0) },
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: Some(1.0),
+                route: SignalRoute::default(),
+            },
         )]));
         s.offer(good("a", 10.0), t0());
-        assert!(s.offer(good("a", 10.1), t0()).is_empty(), "suppressed before the resync");
+        assert!(
+            s.offer(good("a", 10.1), t0()).is_empty(),
+            "suppressed before the resync"
+        );
 
         s.reset_deadband();
-        assert_eq!(s.offer(good("a", 10.1), t0()).len(), 1, "the first after a resync passes");
-        assert!(s.offer(good("a", 10.2), t0()).is_empty(), "and the gate is armed again");
+        assert_eq!(
+            s.offer(good("a", 10.1), t0()).len(),
+            1,
+            "the first after a resync passes"
+        );
+        assert!(
+            s.offer(good("a", 10.2), t0()).is_empty(),
+            "and the gate is armed again"
+        );
     }
 
     #[test]
@@ -592,7 +785,12 @@ mod tests {
         let mut s = Shaper::new();
         s.set_policies(table(&[(
             "a",
-            PublishPolicy { batch_ms: 100, latest_only: false, deadband: Some(1.0) },
+            PublishPolicy {
+                batch_ms: 100,
+                latest_only: false,
+                deadband: Some(1.0),
+                route: SignalRoute::default(),
+            },
         )]));
         let start = t0();
         s.offer(good("a", 10.0), start);
@@ -600,8 +798,15 @@ mod tests {
         s.offer(good("a", 12.0), ms(start, 20)); // buffered
 
         let flushed = s.due(ms(start, 100));
-        let values: Vec<_> = flushed[0].iter().map(|r| r.value.clone().unwrap()).collect();
-        assert_eq!(values, vec![json!(10.0), json!(12.0)], "the dropped reading never buffered");
+        let values: Vec<_> = flushed[0]
+            .iter()
+            .map(|r| r.value.clone().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec![json!(10.0), json!(12.0)],
+            "the dropped reading never buffered"
+        );
     }
 
     // --- lifecycle ------------------------------------------------------------------------------
@@ -628,7 +833,11 @@ mod tests {
         s.offer(good("a", 1.0), t0());
         s.offer(good("a", 2.0), t0());
 
-        assert_eq!(s.clear_buffers(), 2, "the discarded readings are counted for the log line");
+        assert_eq!(
+            s.clear_buffers(),
+            2,
+            "the discarded readings are counted for the log line"
+        );
         assert_eq!(s.next_deadline(), None);
         assert!(s.flush_all().is_empty(), "nothing left to flush");
         let counters = s.take_counters().unwrap();
@@ -638,7 +847,11 @@ mod tests {
     #[test]
     fn a_policy_swap_flushes_the_windows_of_changed_and_removed_signals_only() {
         let mut s = Shaper::new();
-        s.set_policies(table(&[("a", policy(60_000)), ("b", policy(60_000)), ("c", policy(60_000))]));
+        s.set_policies(table(&[
+            ("a", policy(60_000)),
+            ("b", policy(60_000)),
+            ("c", policy(60_000)),
+        ]));
         let start = t0();
         s.offer(good("a", 1.0), start);
         s.offer(good("b", 2.0), start);
@@ -648,11 +861,183 @@ mod tests {
         let flushed = s.set_policies(table(&[("a", policy(100)), ("c", policy(60_000))]));
         let mut ids: Vec<_> = flushed.iter().map(|u| u[0].signal_id.clone()).collect();
         ids.sort();
-        assert_eq!(ids, vec!["a", "b"], "changed + removed flush with their old buffers");
-        assert_eq!(s.next_deadline(), Some(ms(start, 60_000)), "c's window keeps running");
+        assert_eq!(
+            ids,
+            vec!["a", "b"],
+            "changed + removed flush with their old buffers"
+        );
+        assert_eq!(
+            s.next_deadline(),
+            Some(ms(start, 60_000)),
+            "c's window keeps running"
+        );
 
         // b is unshaped now: its next reading publishes immediately.
         assert_eq!(s.offer(good("b", 9.0), ms(start, 10)).len(), 1);
+    }
+
+    /// A reading as the publish path really sees it: routed, because `publish_shaped` mints the
+    /// topic from the FIRST reading of the flushed window.
+    fn routed(id: &str, value: f64, channel: &str) -> Reading {
+        Reading {
+            channel: Some(channel.to_string()),
+            ..good(id, value)
+        }
+    }
+
+    #[test]
+    fn a_route_change_flushes_the_open_window_so_one_update_never_mixes_routes() {
+        // D-R16 / P1-8. A reload that moves a signal's channel while leaving its batching alone
+        // used to leave the window open: the post-reload readings joined the pre-reload ones and
+        // the whole update published on the route of whichever reading happened to be first — one
+        // update, two routing generations. Routing is part of the policy identity, so the swap
+        // flushes the old window with the readings its old route collected.
+        let mut s = Shaper::new();
+        let old = PublishPolicy {
+            batch_ms: 500,
+            latest_only: false,
+            deadband: None,
+            route: SignalRoute {
+                channel: Some("line-a/spindle/speed".into()),
+                component_path: Some("/Device/Rotary".into()),
+                name: Some("Spindle speed".into()),
+            },
+        };
+        let new = PublishPolicy {
+            route: SignalRoute {
+                channel: Some("line-b/spindle/speed".into()),
+                ..old.route.clone()
+            },
+            ..old.clone()
+        };
+        let start = t0();
+        s.set_policies(table(&[("a", old)]));
+        s.offer(routed("a", 1.0, "line-a/spindle/speed"), start);
+        s.offer(routed("a", 2.0, "line-a/spindle/speed"), ms(start, 100));
+
+        // Identical batching, a new route: the window flushes NOW, on the OLD route.
+        let flushed = s.set_policies(table(&[("a", new)]));
+        assert_eq!(flushed.len(), 1, "the route change is a policy change");
+        assert_eq!(
+            flushed[0]
+                .iter()
+                .map(|r| r.value.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec![json!(1.0), json!(2.0)],
+            "with exactly the readings the old route collected"
+        );
+        assert!(
+            flushed[0]
+                .iter()
+                .all(|r| r.channel.as_deref() == Some("line-a/spindle/speed")),
+            "and they publish on the route they were captured under"
+        );
+        assert_eq!(s.next_deadline(), None, "the old window closed with them");
+
+        // The next reading opens a FRESH window on the new route, and flushes separately.
+        s.offer(routed("a", 3.0, "line-b/spindle/speed"), ms(start, 200));
+        assert_eq!(
+            s.next_deadline(),
+            Some(ms(start, 700)),
+            "a new window, opened at arrival"
+        );
+        let due = s.due(ms(start, 700));
+        assert_eq!(due.len(), 1);
+        assert_eq!(
+            due[0].len(),
+            1,
+            "nothing from the old generation rode along"
+        );
+        assert_eq!(
+            due[0][0].channel.as_deref(),
+            Some("line-b/spindle/speed"),
+            "the new route publishes alone"
+        );
+    }
+
+    #[test]
+    fn a_component_path_or_name_change_flushes_the_window_too() {
+        // The route is all three: `publish_shaped` takes the update's componentPath and name from
+        // the first reading as well, so either moving alone would mix generations.
+        let base = PublishPolicy {
+            batch_ms: 500,
+            latest_only: false,
+            deadband: None,
+            route: SignalRoute {
+                channel: Some("spindle/speed".into()),
+                component_path: Some("/Device/Rotary".into()),
+                name: Some("Spindle speed".into()),
+            },
+        };
+        for moved in [
+            PublishPolicy {
+                route: SignalRoute {
+                    component_path: Some("/Device/Rotary/Spindle".into()),
+                    ..base.route.clone()
+                },
+                ..base.clone()
+            },
+            PublishPolicy {
+                route: SignalRoute {
+                    name: Some("Spindle rotary velocity".into()),
+                    ..base.route.clone()
+                },
+                ..base.clone()
+            },
+        ] {
+            let mut s = Shaper::new();
+            s.set_policies(table(&[("a", base.clone())]));
+            s.offer(good("a", 1.0), t0());
+            assert_eq!(
+                s.set_policies(table(&[("a", moved.clone())])).len(),
+                1,
+                "a moved {moved:?} flushes its open window"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unchanged_route_keeps_its_window_running_so_l11_is_not_widened() {
+        // The flush-only-what-changed rule is preserved, not replaced: a reload that leaves a
+        // signal's policy AND route alone must not disturb its window mid-flight.
+        let mut s = Shaper::new();
+        let policy = PublishPolicy {
+            batch_ms: 500,
+            latest_only: false,
+            deadband: None,
+            route: SignalRoute {
+                channel: Some("spindle/speed".into()),
+                component_path: Some("/Device/Rotary".into()),
+                name: Some("Spindle speed".into()),
+            },
+        };
+        let start = t0();
+        s.set_policies(table(&[("a", policy.clone())]));
+        s.offer(good("a", 1.0), start);
+        assert!(
+            s.set_policies(table(&[("a", policy)])).is_empty(),
+            "same policy, same route: the window keeps running"
+        );
+        assert_eq!(s.next_deadline(), Some(ms(start, 500)));
+    }
+
+    #[test]
+    fn a_route_alone_never_forces_a_table_entry() {
+        // A trivial policy never buffers, so it cannot mix generations — routing it would only cost
+        // the unshaped fast path an entry it does not need.
+        assert!(
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: None,
+                route: SignalRoute {
+                    channel: Some("spindle/speed".into()),
+                    component_path: Some("/Device/Rotary".into()),
+                    name: Some("Spindle speed".into()),
+                },
+            }
+            .is_trivial()
+        );
     }
 
     #[test]
@@ -685,19 +1070,44 @@ mod tests {
             { "id": "batched", "dataItemId": "d2", "publish": { "batchMs": 250 } },
             { "id": "banded", "dataItemId": "d3", "publish": { "deadband": 0.5 } },
             { "id": "latest", "dataItemId": "d4",
-              "publish": { "mode": "interval", "batchMs": 100 } }
+              "publish": { "mode": "interval", "batchMs": 100 } },
+            { "id": "routed", "dataItemId": "d5", "name": "Spindle speed",
+              "channel": "spindle/speed", "publish": { "batchMs": 250 } }
         ]))
         .unwrap();
         let policies = policies_from_signals(&signals);
-        assert!(!policies.contains_key("plain"), "the default is not worth a table entry");
+        assert!(
+            !policies.contains_key("plain"),
+            "the default is not worth a table entry"
+        );
         assert_eq!(policies["batched"], policy(250));
         assert_eq!(
             policies["banded"],
-            PublishPolicy { batch_ms: 0, latest_only: false, deadband: Some(0.5) }
+            PublishPolicy {
+                batch_ms: 0,
+                latest_only: false,
+                deadband: Some(0.5),
+                route: SignalRoute::default()
+            }
         );
         assert_eq!(
             policies["latest"],
-            PublishPolicy { batch_ms: 100, latest_only: true, deadband: None }
+            PublishPolicy {
+                batch_ms: 100,
+                latest_only: true,
+                deadband: None,
+                route: SignalRoute::default()
+            }
+        );
+        // Without a model there is no component path, but the configured channel and name are the
+        // route this backend publishes on — and a reload that moves either flushes the window.
+        assert_eq!(
+            policies["routed"].route,
+            SignalRoute {
+                channel: Some("spindle/speed".into()),
+                component_path: None,
+                name: Some("Spindle speed".into()),
+            }
         );
     }
 }

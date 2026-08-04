@@ -29,7 +29,10 @@ use super::xml::{self, DocKind, ErrorsDoc, StreamsDoc};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartOutcome {
     /// A Streams document carrying observations.
-    Observations { count: usize, next_sequence: Option<u64> },
+    Observations {
+        count: usize,
+        next_sequence: Option<u64>,
+    },
     /// An empty Streams document: liveness, no data.
     Heartbeat,
     /// The agent's buffer ran past our position (recovery ladder 2).
@@ -161,7 +164,8 @@ impl HeartbeatWatch {
     /// How long until the window expires — what a `select!` waits on.
     #[must_use]
     pub fn remaining(&self, now: Instant) -> Duration {
-        self.window.saturating_sub(now.duration_since(self.last_seen))
+        self.window
+            .saturating_sub(now.duration_since(self.last_seen))
     }
 }
 
@@ -174,10 +178,23 @@ mod tests {
         let t0 = Instant::now();
         let w = HeartbeatWatch::new(10_000, t0);
         assert_eq!(w.window(), Duration::from_secs(20));
-        assert!(!w.is_expired(t0 + Duration::from_secs(19)), "one missed heartbeat is a hiccup");
-        assert!(w.is_expired(t0 + Duration::from_secs(20)), "two is a dead stream");
-        assert_eq!(w.remaining(t0 + Duration::from_secs(5)), Duration::from_secs(15));
-        assert_eq!(w.remaining(t0 + Duration::from_secs(30)), Duration::ZERO, "never negative");
+        assert!(
+            !w.is_expired(t0 + Duration::from_secs(19)),
+            "one missed heartbeat is a hiccup"
+        );
+        assert!(
+            w.is_expired(t0 + Duration::from_secs(20)),
+            "two is a dead stream"
+        );
+        assert_eq!(
+            w.remaining(t0 + Duration::from_secs(5)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            w.remaining(t0 + Duration::from_secs(30)),
+            Duration::ZERO,
+            "never negative"
+        );
     }
 
     #[test]
@@ -193,9 +210,25 @@ mod tests {
     #[test]
     fn every_readable_part_proves_liveness_including_a_heartbeat_and_an_error() {
         assert!(PartOutcome::Heartbeat.is_liveness());
-        assert!(PartOutcome::Observations { count: 3, next_sequence: Some(42) }.is_liveness());
-        assert!(PartOutcome::OutOfRange { first_sequence: 153 }.is_liveness());
-        assert!(PartOutcome::AgentError { code: "UNAUTHORIZED".into() }.is_liveness());
+        assert!(
+            PartOutcome::Observations {
+                count: 3,
+                next_sequence: Some(42)
+            }
+            .is_liveness()
+        );
+        assert!(
+            PartOutcome::OutOfRange {
+                first_sequence: 153
+            }
+            .is_liveness()
+        );
+        assert!(
+            PartOutcome::AgentError {
+                code: "UNAUTHORIZED".into()
+            }
+            .is_liveness()
+        );
         // A part that cannot be read proves nothing about the agent.
         assert!(!PartOutcome::Undecodable.is_liveness());
     }

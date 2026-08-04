@@ -74,7 +74,10 @@ impl Default for ChannelBudget {
     /// The fallback used when no identity has been resolved — configuration-shape validation and
     /// unit tests. The live path always stamps the instance's exact budget instead.
     fn default() -> Self {
-        Self { max_tokens: Self::DEFAULT_MAX_TOKENS, max_bytes: Self::DEFAULT_MAX_BYTES }
+        Self {
+            max_tokens: Self::DEFAULT_MAX_TOKENS,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+        }
     }
 }
 
@@ -348,8 +351,16 @@ impl CompiledMatcher {
 /// or the empty pattern match it.
 #[must_use]
 pub fn glob_match(pattern: &str, path: &str) -> bool {
-    let pat: Vec<&str> = if pattern.is_empty() { Vec::new() } else { pattern.split('/').collect() };
-    let segs: Vec<&str> = if path.is_empty() { Vec::new() } else { path.split('/').collect() };
+    let pat: Vec<&str> = if pattern.is_empty() {
+        Vec::new()
+    } else {
+        pattern.split('/').collect()
+    };
+    let segs: Vec<&str> = if path.is_empty() {
+        Vec::new()
+    } else {
+        path.split('/').collect()
+    };
     match_segments(&pat, &segs)
 }
 
@@ -357,12 +368,14 @@ fn match_segments(pat: &[&str], segs: &[&str]) -> bool {
     match pat.first() {
         None => segs.is_empty(),
         Some(&"**") => {
-            match_segments(&pat[1..], segs)
-                || (!segs.is_empty() && match_segments(pat, &segs[1..]))
+            match_segments(&pat[1..], segs) || (!segs.is_empty() && match_segments(pat, &segs[1..]))
         }
         Some(p) => {
             !segs.is_empty()
-                && match_one(&p.chars().collect::<Vec<_>>(), &segs[0].chars().collect::<Vec<_>>())
+                && match_one(
+                    &p.chars().collect::<Vec<_>>(),
+                    &segs[0].chars().collect::<Vec<_>>(),
+                )
                 && match_segments(&pat[1..], &segs[1..])
         }
     }
@@ -402,7 +415,11 @@ pub fn sanitize_token(raw: &str) -> String {
         prev = Some(c);
     }
     let out = out.trim_matches('-').to_string();
-    if out.is_empty() { "signal".to_string() } else { out }
+    if out.is_empty() {
+        "signal".to_string()
+    } else {
+        out
+    }
 }
 
 /// The derived channel: the UNS-sanitized component path, then the signal id
@@ -437,7 +454,11 @@ pub fn derive_channel(component_path: &str, id: &str, budget: ChannelBudget) -> 
     // Bytes of the channel built from the last `k` segments plus the id: each kept segment costs
     // its own length plus the `/` that follows it.
     let bytes_of = |k: usize| -> usize {
-        segments[total - k..].iter().map(|s| s.len() + 1).sum::<usize>() + id.len()
+        segments[total - k..]
+            .iter()
+            .map(|s| s.len() + 1)
+            .sum::<usize>()
+            + id.len()
     };
 
     // One token of the budget belongs to the id; the rest is what the path may claim.
@@ -453,7 +474,11 @@ pub fn derive_channel(component_path: &str, id: &str, budget: ChannelBudget) -> 
         channel.push('/');
     }
     channel.push_str(id);
-    DerivedChannel { channel, dropped: total - kept, fits }
+    DerivedChannel {
+        channel,
+        dropped: total - kept,
+        fits,
+    }
 }
 
 /// Where a served signal came from — surfaced on `sb/signals` rows and browse entries.
@@ -535,7 +560,10 @@ pub fn served_set(
 ) -> ServedSet {
     let mut out: Vec<ServedSignal> = explicit
         .iter()
-        .map(|s| ServedSignal { signal: s.clone(), provenance: Provenance::Configured })
+        .map(|s| ServedSignal {
+            signal: s.clone(),
+            provenance: Provenance::Configured,
+        })
         .collect();
 
     let bare = |signals: Vec<ServedSignal>| ServedSet {
@@ -552,10 +580,16 @@ pub fn served_set(
         return bare(out);
     }
 
-    let include: Vec<CompiledMatcher> =
-        sel.include.iter().filter_map(CompiledMatcher::compile).collect();
-    let exclude: Vec<CompiledMatcher> =
-        sel.exclude.iter().filter_map(CompiledMatcher::compile).collect();
+    let include: Vec<CompiledMatcher> = sel
+        .include
+        .iter()
+        .filter_map(CompiledMatcher::compile)
+        .collect();
+    let exclude: Vec<CompiledMatcher> = sel
+        .exclude
+        .iter()
+        .filter_map(CompiledMatcher::compile)
+        .collect();
 
     // CONDITION items per component, in browse-tree order — what auto-binding binds.
     let mut conditions_by_component: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -585,8 +619,7 @@ pub fn served_set(
     let mut channel_unfit = 0usize;
 
     for item in items_in_tree_order(model) {
-        let selected = (sel.mode == SelectionMode::All
-            || include.iter().any(|m| m.matches(item)))
+        let selected = (sel.mode == SelectionMode::All || include.iter().any(|m| m.matches(item)))
             && !exclude.iter().any(|m| m.matches(item));
         if !selected {
             continue;
@@ -611,7 +644,11 @@ pub fn served_set(
                     deadband: None,
                 },
                 // EVENT/CONDITION: on-change, immediate.
-                _ => PublishCfg { mode: PublishMode::OnChange, batch_ms: 0, deadband: None },
+                _ => PublishCfg {
+                    mode: PublishMode::OnChange,
+                    batch_ms: 0,
+                    deadband: None,
+                },
             }
         };
         let derived_id = || -> String {
@@ -638,16 +675,14 @@ pub fn served_set(
             for &i in indices {
                 let served = &mut out[i].signal;
                 if served.name.is_none() {
-                    served.name =
-                        Some(item.name.clone().unwrap_or_else(|| derived_name(item)));
+                    served.name = Some(item.name.clone().unwrap_or_else(|| derived_name(item)));
                 }
                 if served.channel.is_none() {
                     // An explicit entry that names no channel takes the derived one — so it is
                     // shaped to the same budget. A hand-set channel is never touched: it is the
                     // operator's statement, and the library refuses it loudly if it does not fit.
                     let id = served.id.clone();
-                    let derived =
-                        derive_channel(&item.component_path, &id, sel.channel_budget);
+                    let derived = derive_channel(&item.component_path, &id, sel.channel_budget);
                     if derived.dropped > 0 {
                         channel_truncated += 1;
                     }
@@ -695,7 +730,13 @@ pub fn served_set(
         });
     }
 
-    ServedSet { signals: out, derived_matched, derived_truncated, channel_truncated, channel_unfit }
+    ServedSet {
+        signals: out,
+        derived_matched,
+        derived_truncated,
+        channel_truncated,
+        channel_unfit,
+    }
 }
 
 /// The fallback name when the probe declares none: the type, plus the subType when there is one
@@ -740,7 +781,10 @@ mod tests {
 
     /// The budget of an ordinary rootless, instance-scoped adapter topic.
     fn budget(tokens: usize, bytes: usize) -> ChannelBudget {
-        ChannelBudget { max_tokens: tokens, max_bytes: bytes }
+        ChannelBudget {
+            max_tokens: tokens,
+            max_bytes: bytes,
+        }
     }
 
     fn sel(v: serde_json::Value) -> SelectionConfig {
@@ -756,7 +800,10 @@ mod tests {
     }
 
     fn find<'a>(set: &'a ServedSet, id: &str) -> &'a ServedSignal {
-        set.signals.iter().find(|s| s.signal.id == id).unwrap_or_else(|| panic!("no `{id}`"))
+        set.signals
+            .iter()
+            .find(|s| s.signal.id == id)
+            .unwrap_or_else(|| panic!("no `{id}`"))
     }
 
     // --- configuration shape -------------------------------------------------------------------
@@ -767,7 +814,10 @@ mod tests {
         assert_eq!(s.mode, SelectionMode::All);
         assert!(s.include.is_empty() && s.exclude.is_empty());
         assert_eq!(s.max_signals, DEFAULT_MAX_SIGNALS, "the 500 default");
-        assert!(s.auto_condition_binding, "auto conditionBinding is on by default");
+        assert!(
+            s.auto_condition_binding,
+            "auto conditionBinding is on by default"
+        );
         assert_eq!(s.default_batch_ms, 0);
 
         let s = sel(json!({
@@ -788,10 +838,9 @@ mod tests {
         assert!(!s.auto_condition_binding);
 
         // Matchers and the block itself are CLOSED objects.
-        assert!(serde_json::from_value::<SelectionConfig>(
-            json!({ "mode": "all", "nope": 1 })
-        )
-        .is_err());
+        assert!(
+            serde_json::from_value::<SelectionConfig>(json!({ "mode": "all", "nope": 1 })).is_err()
+        );
         assert!(serde_json::from_value::<Matcher>(json!({ "types": "POSITION" })).is_err());
     }
 
@@ -802,22 +851,34 @@ mod tests {
         // A regex that does not compile is refused at load, naming the field.
         let bad = sel(json!({ "mode": "include", "include": [{ "type": "(" }] }));
         let err = validate_selection("cnc-1", &bad).unwrap_err().to_string();
-        assert!(err.contains("cnc-1") && err.contains("include[0]") && err.contains("type"), "{err}");
+        assert!(
+            err.contains("cnc-1") && err.contains("include[0]") && err.contains("type"),
+            "{err}"
+        );
 
         let bad = sel(json!({ "mode": "all", "exclude": [{ "idMatch": "[" }] }));
         assert!(validate_selection("cnc-1", &bad).is_err());
 
         // An unknown category is a mistake, not a matcher that never fires.
         let bad = sel(json!({ "mode": "include", "include": [{ "category": "sample" }] }));
-        assert!(validate_selection("cnc-1", &bad).is_err(), "categories are the exact tokens");
+        assert!(
+            validate_selection("cnc-1", &bad).is_err(),
+            "categories are the exact tokens"
+        );
 
         // Inert combinations are refused rather than silently selecting nothing.
         let inert = sel(json!({ "mode": "explicit", "include": [{ "type": "POSITION" }] }));
         assert!(validate_selection("cnc-1", &inert).is_err());
         let inert = sel(json!({ "mode": "include" }));
-        assert!(validate_selection("cnc-1", &inert).is_err(), "include mode needs matchers");
+        assert!(
+            validate_selection("cnc-1", &inert).is_err(),
+            "include mode needs matchers"
+        );
         let inert = sel(json!({ "mode": "all", "include": [{ "type": "POSITION" }] }));
-        assert!(validate_selection("cnc-1", &inert).is_err(), "all already includes everything");
+        assert!(
+            validate_selection("cnc-1", &inert).is_err(),
+            "all already includes everything"
+        );
 
         // A zero cap can serve nothing and says so.
         let zero = sel(json!({ "mode": "all", "maxSignals": 0 }));
@@ -845,7 +906,10 @@ mod tests {
             "include": [{ "category": "SAMPLE", "type": "POSITION" }] }));
         assert_eq!(ids(&served_set(&[], Some(&and), Some(&m))), vec!["xabs"]);
         let loose = sel(json!({ "mode": "include", "include": [{ "type": "POSITION" }] }));
-        assert_eq!(ids(&served_set(&[], Some(&loose), Some(&m))), vec!["xabs", "xtravel"]);
+        assert_eq!(
+            ids(&served_set(&[], Some(&loose), Some(&m))),
+            vec!["xabs", "xtravel"]
+        );
         let never = sel(json!({ "mode": "include",
             "include": [{ "category": "EVENT", "type": "POSITION" }] }));
         assert_eq!(served_set(&[], Some(&never), Some(&m)).signals.len(), 0);
@@ -868,7 +932,11 @@ mod tests {
         let s = sel(json!({ "mode": "all", "exclude": [{ "category": "CONDITION" }] }));
         let set = served_set(&[], Some(&s), Some(&m));
         assert_eq!(set.signals.len(), 12, "14 items minus the 2 conditions");
-        assert!(set.signals.iter().all(|s| s.signal.data_item_id != "Xtravel"));
+        assert!(
+            set.signals
+                .iter()
+                .all(|s| s.signal.data_item_id != "Xtravel")
+        );
         assert!(set.signals.iter().all(|s| s.signal.data_item_id != "logic"));
     }
 
@@ -878,16 +946,24 @@ mod tests {
         // Anchored: `POSITION` must not select `PATH_POSITION` — the whole field matches.
         let s = sel(json!({ "mode": "include", "include": [{ "type": "POSITION" }] }));
         let set = served_set(&[], Some(&s), Some(&m));
-        assert!(set.signals.iter().all(|s| s.signal.data_item_id != "Ppos"),
-            "no partial-match creep into PATH_POSITION");
+        assert!(
+            set.signals.iter().all(|s| s.signal.data_item_id != "Ppos"),
+            "no partial-match creep into PATH_POSITION"
+        );
 
         // subType: an item WITHOUT a subType never matches a subType regex.
         let s = sel(json!({ "mode": "include", "include": [{ "subType": "ACTUAL" }] }));
-        assert_eq!(ids(&served_set(&[], Some(&s), Some(&m))), vec!["xabs", "sspeed"]);
+        assert_eq!(
+            ids(&served_set(&[], Some(&s), Some(&m))),
+            vec!["xabs", "sspeed"]
+        );
 
         // idMatch is a real regex.
         let s = sel(json!({ "mode": "include", "include": [{ "idMatch": "X(abs|load)" }] }));
-        assert_eq!(ids(&served_set(&[], Some(&s), Some(&m))), vec!["xabs", "xload"]);
+        assert_eq!(
+            ids(&served_set(&[], Some(&s), Some(&m))),
+            vec!["xabs", "xload"]
+        );
 
         // An empty matcher matches everything (AND of no constraints).
         let s = sel(json!({ "mode": "include", "include": [{}] }));
@@ -898,26 +974,44 @@ mod tests {
     fn path_globs_match_segment_wise_with_double_star() {
         assert!(glob_match("Axes/Linear[X]", "Axes/Linear[X]"));
         assert!(glob_match("Axes/*", "Axes/Linear[X]"));
-        assert!(!glob_match("Axes/*", "Axes"), "* is one whole segment, not optional");
+        assert!(
+            !glob_match("Axes/*", "Axes"),
+            "* is one whole segment, not optional"
+        );
         assert!(glob_match("Axes/**", "Axes"));
         assert!(glob_match("Axes/**", "Axes/Linear[X]"));
         assert!(glob_match("**/Linear[X]", "Axes/Linear[X]"));
-        assert!(glob_match("**", ""), "** spans zero segments: the device level matches");
-        assert!(glob_match("", ""), "the empty pattern is the device level exactly");
+        assert!(
+            glob_match("**", ""),
+            "** spans zero segments: the device level matches"
+        );
+        assert!(
+            glob_match("", ""),
+            "the empty pattern is the device level exactly"
+        );
         assert!(!glob_match("", "Axes"));
         assert!(glob_match("Axes/Linear[?]", "Axes/Linear[X]"));
         assert!(!glob_match("Axes/Linear[?]", "Axes/Linear[XY]"));
-        assert!(glob_match("**/Path[P1]/**", "Controller/Path[P1]"), "trailing ** spans zero");
+        assert!(
+            glob_match("**/Path[P1]/**", "Controller/Path[P1]"),
+            "trailing ** spans zero"
+        );
         assert!(!glob_match("Controller", "Controller/Path[P1]"));
 
         let m = model();
         let s = sel(json!({ "mode": "include", "include": [{ "path": "Axes/**" }] }));
         let set = served_set(&[], Some(&s), Some(&m));
-        assert_eq!(ids(&set), vec!["xabs", "xload", "xfreq", "xtravel", "sspeed"]);
+        assert_eq!(
+            ids(&set),
+            vec!["xabs", "xload", "xfreq", "xtravel", "sspeed"]
+        );
 
         // The device level is the empty path.
         let s = sel(json!({ "mode": "include", "include": [{ "path": "" }] }));
-        assert_eq!(ids(&served_set(&[], Some(&s), Some(&m))), vec!["avail", "asset-changed"]);
+        assert_eq!(
+            ids(&served_set(&[], Some(&s), Some(&m))),
+            vec!["avail", "asset-changed"]
+        );
     }
 
     // --- derivation ----------------------------------------------------------------------------
@@ -935,7 +1029,10 @@ mod tests {
         assert_eq!(sanitize_token(""), "signal");
         // The result is always a valid UNS token.
         for raw in ["Xabs", "SpindleSpeed", "a__b", "-x-", "[X]"] {
-            assert!(crate::mtconnect::config::is_lower_kebab(&sanitize_token(raw)), "{raw}");
+            assert!(
+                crate::mtconnect::config::is_lower_kebab(&sanitize_token(raw)),
+                "{raw}"
+            );
         }
     }
 
@@ -948,7 +1045,11 @@ mod tests {
         let x = &set.signals[0];
         assert_eq!(x.provenance, Provenance::Discovered);
         assert_eq!(x.signal.id, "xabs", "lower-kebab of the dataItemId");
-        assert_eq!(x.signal.name.as_deref(), Some("Xabs"), "the probe's own name wins");
+        assert_eq!(
+            x.signal.name.as_deref(),
+            Some("Xabs"),
+            "the probe's own name wins"
+        );
         assert_eq!(
             x.signal.channel.as_deref(),
             Some("axes/linear-x/xabs"),
@@ -976,8 +1077,14 @@ mod tests {
         let asset = find(&set, "asset-changed");
         assert_eq!(asset.signal.name.as_deref(), Some("ASSET_CHANGED"));
         // EVENT: on-change immediate, no batching even when a defaults window exists.
-        assert_eq!(asset.signal.publish_policy(),
-            PublishCfg { mode: PublishMode::OnChange, batch_ms: 0, deadband: None });
+        assert_eq!(
+            asset.signal.publish_policy(),
+            PublishCfg {
+                mode: PublishMode::OnChange,
+                batch_ms: 0,
+                deadband: None
+            }
+        );
 
         // A nameless item WITH a subType names both.
         let doc = parse_devices(
@@ -991,7 +1098,10 @@ mod tests {
         .unwrap();
         let tiny = ProbeModel::from_devices(&doc, "U").unwrap();
         let set2 = served_set(&[], Some(&sel(json!({ "mode": "all" }))), Some(&tiny));
-        assert_eq!(set2.signals[0].signal.name.as_deref(), Some("POSITION COMMANDED"));
+        assert_eq!(
+            set2.signals[0].signal.name.as_deref(),
+            Some("POSITION COMMANDED")
+        );
 
         // A device-level item publishes on its id alone.
         let avail = find(&set, "avail");
@@ -1010,8 +1120,15 @@ mod tests {
         s.default_publish_mode = PublishMode::Interval;
         let set = served_set(&[], Some(&s), Some(&m));
         let p = set.signals[0].signal.publish_policy();
-        assert_eq!(p.batch_ms, 250, "defaults.batchMs is the derived SAMPLE window");
-        assert_eq!(p.mode, PublishMode::Interval, "defaults.publishMode is the derived SAMPLE mode");
+        assert_eq!(
+            p.batch_ms, 250,
+            "defaults.batchMs is the derived SAMPLE window"
+        );
+        assert_eq!(
+            p.mode,
+            PublishMode::Interval,
+            "defaults.publishMode is the derived SAMPLE mode"
+        );
         // ... and events stay on-change immediate regardless.
         let mut s = sel(json!({ "mode": "include", "include": [{ "idMatch": "execution" }] }));
         s.default_batch_ms = 250;
@@ -1019,7 +1136,11 @@ mod tests {
         let set = served_set(&[], Some(&s), Some(&m));
         let p = set.signals[0].signal.publish_policy();
         assert_eq!(p.batch_ms, 0);
-        assert_eq!(p.mode, PublishMode::OnChange, "an EVENT's state is never latest-only coalesced");
+        assert_eq!(
+            p.mode,
+            PublishMode::OnChange,
+            "an EVENT's state is never latest-only coalesced"
+        );
     }
 
     #[test]
@@ -1045,19 +1166,30 @@ mod tests {
         let set = served_set(&[], Some(&s), Some(&m));
         // Same component (Axes/Linear[X]): Xabs, Xload, Xfreq all bind Xtravel.
         for id in ["xabs", "xload", "xfreq"] {
-            assert_eq!(find(&set, id).signal.condition_bindings(), ["Xtravel"], "{id}");
+            assert_eq!(
+                find(&set, id).signal.condition_bindings(),
+                ["Xtravel"],
+                "{id}"
+            );
         }
         // A different component's items do not: Sspeed is on Rotary[C], which has no condition.
         assert!(find(&set, "sspeed").signal.condition_bindings().is_empty());
         // Path[P1] has its own condition (`logic`), bound by its non-condition items.
-        assert_eq!(find(&set, "execution").signal.condition_bindings(), ["logic"]);
+        assert_eq!(
+            find(&set, "execution").signal.condition_bindings(),
+            ["logic"]
+        );
         // Device-level items bind device-level conditions (there are none in the fixture).
         assert!(find(&set, "avail").signal.condition_bindings().is_empty());
 
         // The opt-out flag turns the whole derivation off.
         let s = sel(json!({ "mode": "all", "autoConditionBinding": false }));
         let set = served_set(&[], Some(&s), Some(&m));
-        assert!(set.signals.iter().all(|s| s.signal.condition_bindings().is_empty()));
+        assert!(
+            set.signals
+                .iter()
+                .all(|s| s.signal.condition_bindings().is_empty())
+        );
     }
 
     // --- depth-aware channel derivation ---------------------------------------------------------
@@ -1079,14 +1211,26 @@ mod tests {
         assert_eq!(fitted.channel, "materials-materials/stock-stock/stock");
         assert_eq!(fitted.dropped, 1);
         assert!(fitted.fits);
-        assert_eq!(fitted.channel.split('/').count(), 3, "exactly the budget, never over");
+        assert_eq!(
+            fitted.channel.split('/').count(),
+            3,
+            "exactly the budget, never over"
+        );
 
         // Deeper paths drop more, and the id is never one of the casualties.
         let six = "A/B/C/D/E/F";
         for tokens in 1..=7 {
             let d = derive_channel(six, "sig", budget(tokens, 256));
-            assert_eq!(d.channel.split('/').count(), tokens.min(7), "tokens={tokens}");
-            assert!(d.channel.ends_with("sig"), "the id is terminal: {}", d.channel);
+            assert_eq!(
+                d.channel.split('/').count(),
+                tokens.min(7),
+                "tokens={tokens}"
+            );
+            assert!(
+                d.channel.ends_with("sig"),
+                "the id is terminal: {}",
+                d.channel
+            );
             assert_eq!(d.dropped, 6 - (tokens.min(7) - 1));
             // The kept segments are a SUFFIX of the path, in order.
             let kept: Vec<&str> = d.channel.split('/').collect();
@@ -1095,8 +1239,10 @@ mod tests {
         }
 
         // A shallow path and a device-level item are untouched by the rule.
-        assert_eq!(derive_channel("Axes/Linear[X]", "xabs", budget(3, 256)).channel,
-            "axes/linear-x/xabs");
+        assert_eq!(
+            derive_channel("Axes/Linear[X]", "xabs", budget(3, 256)).channel,
+            "axes/linear-x/xabs"
+        );
         assert_eq!(derive_channel("", "avail", budget(3, 256)).channel, "avail");
         assert_eq!(derive_channel("", "avail", budget(3, 256)).dropped, 0);
     }
@@ -1143,7 +1289,10 @@ mod tests {
         for bytes in (5..=len).rev() {
             let d = derive_channel(path, "ptemp", budget(9, bytes));
             assert!(d.channel.len() <= bytes, "bytes={bytes}: {}", d.channel);
-            assert!(d.dropped >= previous, "k must not grow as the budget shrinks");
+            assert!(
+                d.dropped >= previous,
+                "k must not grow as the budget shrinks"
+            );
             assert!(d.fits, "the id itself always fits five bytes");
             previous = d.dropped;
         }
@@ -1186,7 +1335,9 @@ mod tests {
         // instance really has.
         let m = deep_model();
         assert_eq!(
-            m.item("stock").expect("the fixture reproduces the demo item").component_path,
+            m.item("stock")
+                .expect("the fixture reproduces the demo item")
+                .component_path,
             MAZAK_STOCK_PATH,
             "the fixture is the live shape, not an approximation"
         );
@@ -1243,9 +1394,16 @@ mod tests {
             let mut s = sel(json!({ "mode": "all" }));
             s.channel_budget = budget(tokens, 256);
             let set = served_set(&[], Some(&s), Some(&m));
-            let channels: BTreeSet<&str> =
-                set.signals.iter().filter_map(|x| x.signal.channel.as_deref()).collect();
-            assert_eq!(channels.len(), set.signals.len(), "tokens={tokens}: channels collided");
+            let channels: BTreeSet<&str> = set
+                .signals
+                .iter()
+                .filter_map(|x| x.signal.channel.as_deref())
+                .collect();
+            assert_eq!(
+                channels.len(),
+                set.signals.len(),
+                "tokens={tokens}: channels collided"
+            );
             let ids: BTreeSet<&str> = set.signals.iter().map(|x| x.signal.id.as_str()).collect();
             assert_eq!(ids.len(), set.signals.len(), "ids are unique per instance");
             for x in &set.signals {
@@ -1258,8 +1416,11 @@ mod tests {
         let mut s = sel(json!({ "mode": "all" }));
         s.channel_budget = budget(1, 256);
         let set = served_set(&[], Some(&s), Some(&m));
-        let channels: BTreeSet<&str> =
-            set.signals.iter().filter_map(|x| x.signal.channel.as_deref()).collect();
+        let channels: BTreeSet<&str> = set
+            .signals
+            .iter()
+            .filter_map(|x| x.signal.channel.as_deref())
+            .collect();
         assert_eq!(channels.len(), set.signals.len());
     }
 
@@ -1269,7 +1430,11 @@ mod tests {
         let mut s = sel(json!({ "mode": "all" }));
         s.channel_budget = budget(0, 0);
         let set = served_set(&[], Some(&s), Some(&m));
-        assert_eq!(set.channel_unfit, set.signals.len(), "every signal reports the floor");
+        assert_eq!(
+            set.channel_unfit,
+            set.signals.len(),
+            "every signal reports the floor"
+        );
         // The channel is still the id, so the library's own validation is what refuses it.
         assert_eq!(find(&set, "stock").signal.channel.as_deref(), Some("stock"));
     }
@@ -1332,7 +1497,11 @@ mod tests {
 
         // The untruncated component path is still what the model serves as `signal.address`.
         let address = m.address_of("line-a-agent", "stock").expect("an address");
-        assert_eq!(address["componentPath"], json!(MAZAK_STOCK_PATH), "nothing is lost");
+        assert_eq!(
+            address["componentPath"],
+            json!(MAZAK_STOCK_PATH),
+            "nothing is lost"
+        );
     }
 
     // --- precedence ----------------------------------------------------------------------------
@@ -1347,13 +1516,30 @@ mod tests {
         let set = served_set(&bare, Some(&s), Some(&m));
         let x = find(&set, "x-position");
         assert_eq!(x.provenance, Provenance::Configured);
-        assert_eq!(x.signal.name.as_deref(), Some("Xabs"), "unset name takes the derived one");
-        assert_eq!(x.signal.channel.as_deref(), Some("axes/linear-x/x-position"),
-            "the derived channel carries the EXPLICIT id");
-        assert_eq!(x.signal.condition_bindings(), ["Xtravel"], "unset binding takes the auto one");
+        assert_eq!(
+            x.signal.name.as_deref(),
+            Some("Xabs"),
+            "unset name takes the derived one"
+        );
+        assert_eq!(
+            x.signal.channel.as_deref(),
+            Some("axes/linear-x/x-position"),
+            "the derived channel carries the EXPLICIT id"
+        );
+        assert_eq!(
+            x.signal.condition_bindings(),
+            ["Xtravel"],
+            "unset binding takes the auto one"
+        );
         assert_eq!(x.signal.publish_policy().mode, PublishMode::OnChange);
         // ... and no second entry serves Xabs.
-        assert_eq!(set.signals.iter().filter(|s| s.signal.data_item_id == "Xabs").count(), 1);
+        assert_eq!(
+            set.signals
+                .iter()
+                .filter(|s| s.signal.data_item_id == "Xabs")
+                .count(),
+            1
+        );
 
         // Set fields override: name, channel, an EMPTY conditionBinding, and a publish policy all
         // beat their derived counterparts.
@@ -1367,8 +1553,10 @@ mod tests {
         let x = find(&set, "x-position");
         assert_eq!(x.signal.name.as_deref(), Some("X actual"));
         assert_eq!(x.signal.channel.as_deref(), Some("machining/x"));
-        assert!(x.signal.condition_bindings().is_empty(),
-            "conditionBinding: [] explicitly clears the auto binding");
+        assert!(
+            x.signal.condition_bindings().is_empty(),
+            "conditionBinding: [] explicitly clears the auto binding"
+        );
         assert_eq!(x.signal.publish_policy().mode, PublishMode::Interval);
         assert_eq!(x.signal.publish_policy().batch_ms, 500);
     }
@@ -1381,7 +1569,10 @@ mod tests {
         for selection in [None, Some(sel(json!({ "mode": "explicit" })))] {
             let set = served_set(&bare, selection.as_ref(), Some(&m));
             assert_eq!(set.signals.len(), 1);
-            assert_eq!(set.signals[0].signal, bare[0], "no enrichment without a selection");
+            assert_eq!(
+                set.signals[0].signal, bare[0],
+                "no enrichment without a selection"
+            );
             assert_eq!(set.signals[0].provenance, Provenance::Configured);
             assert_eq!(set.derived_matched, 0);
         }
@@ -1398,16 +1589,26 @@ mod tests {
         let m = model();
         let s = sel(json!({ "mode": "all", "maxSignals": 3 }));
         let set = served_set(&[], Some(&s), Some(&m));
-        assert_eq!(ids(&set), vec!["avail", "asset-changed", "xabs"], "the FIRST three, tree order");
+        assert_eq!(
+            ids(&set),
+            vec!["avail", "asset-changed", "xabs"],
+            "the FIRST three, tree order"
+        );
         assert_eq!(set.derived_matched, 14);
-        assert_eq!(set.derived_truncated, 11, "the cut is counted, never silent");
+        assert_eq!(
+            set.derived_truncated, 11,
+            "the cut is counted, never silent"
+        );
 
         // Explicit signals do not count against the cap.
         let explicit = vec![explicit("spindle", "Sspeed"), explicit("prog", "program")];
         let set = served_set(&explicit, Some(&s), Some(&m));
         assert_eq!(set.signals.len(), 5, "2 explicit + 3 derived");
         assert_eq!(
-            set.signals.iter().filter(|s| s.provenance == Provenance::Discovered).count(),
+            set.signals
+                .iter()
+                .filter(|s| s.provenance == Provenance::Discovered)
+                .count(),
             3
         );
         // ... and the explicitly-bound items were never derived candidates at all.

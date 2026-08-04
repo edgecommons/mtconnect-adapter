@@ -18,7 +18,7 @@ use edgecommons::prelude::SignalUpdate;
 use mtconnect_adapter::app::{build_sample, stamp_received};
 use mtconnect_adapter::device::{ConnectionConfig, DeviceBackend, Reading, SimBackend};
 use mtconnect_adapter::mtconnect::config::SignalConfig;
-use mtconnect_adapter::shaping::{policies_from_signals, Shaper};
+use mtconnect_adapter::shaping::{Shaper, policies_from_signals};
 use serde_json::json;
 
 fn signals(raw: serde_json::Value) -> Vec<SignalConfig> {
@@ -68,12 +68,23 @@ fn a_flushed_window_becomes_one_update_whose_samples_ride_in_arrival_order() {
         .build();
 
     assert_eq!(update.signal_id.as_deref(), Some("x-position"));
-    assert_eq!(update.samples.len(), 3, "samples[] carries every buffered reading");
+    assert_eq!(
+        update.samples.len(),
+        3,
+        "samples[] carries every buffered reading"
+    );
     for (i, sample) in update.samples.iter().enumerate() {
         // Arrival order, each sample keeping its OWN capture stamp and extras.
         assert_eq!(sample.value, Some(json!((i + 1) as f64)));
-        let extra = sample.extra.as_ref().expect("per-sample extras survive batching");
-        assert_eq!(extra["sequence"], json!(37 + i as u64), "exact once-only ordering per sample");
+        let extra = sample
+            .extra
+            .as_ref()
+            .expect("per-sample extras survive batching");
+        assert_eq!(
+            extra["sequence"],
+            json!(37 + i as u64),
+            "exact once-only ordering per sample"
+        );
         assert_eq!(
             extra["receivedTs"],
             json!("2026-07-27T10:00:05.000000Z"),
@@ -85,7 +96,10 @@ fn a_flushed_window_becomes_one_update_whose_samples_ride_in_arrival_order() {
         Some("2026-07-27T10:00:04.250000Z"),
         "the agent's capture stamp is each sample's serverTs"
     );
-    assert_eq!(update.samples[2].server_ts.as_deref(), Some("2026-07-27T10:00:04.750000Z"));
+    assert_eq!(
+        update.samples[2].server_ts.as_deref(),
+        Some("2026-07-27T10:00:04.750000Z")
+    );
 }
 
 #[tokio::test]
@@ -132,12 +146,27 @@ fn deadband_shapes_a_static_config_exactly_as_a_compiled_one() {
     ]))));
 
     let now = Instant::now();
-    assert_eq!(shaper.offer(Reading::good("temperature-1", json!(20.0)), now).len(), 1);
-    assert!(shaper.offer(Reading::good("temperature-1", json!(20.2)), now).is_empty());
-    let bad = Reading::bad("temperature-1", "SENSOR_FAULT");
-    assert_eq!(shaper.offer(bad, now).len(), 1, "a quality transition is never suppressed");
     assert_eq!(
-        shaper.offer(Reading::good("temperature-1", json!(20.2)), now).len(),
+        shaper
+            .offer(Reading::good("temperature-1", json!(20.0)), now)
+            .len(),
+        1
+    );
+    assert!(
+        shaper
+            .offer(Reading::good("temperature-1", json!(20.2)), now)
+            .is_empty()
+    );
+    let bad = Reading::bad("temperature-1", "SENSOR_FAULT");
+    assert_eq!(
+        shaper.offer(bad, now).len(),
+        1,
+        "a quality transition is never suppressed"
+    );
+    assert_eq!(
+        shaper
+            .offer(Reading::good("temperature-1", json!(20.2)), now)
+            .len(),
         1,
         "recovery is a transition too"
     );

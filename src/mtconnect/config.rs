@@ -92,7 +92,10 @@ pub struct ReconnectCfg {
 
 impl Default for ReconnectCfg {
     fn default() -> Self {
-        Self { initial_ms: 1_000, max_ms: 60_000 }
+        Self {
+            initial_ms: 1_000,
+            max_ms: 60_000,
+        }
     }
 }
 
@@ -102,7 +105,10 @@ impl Default for ReconnectCfg {
 pub enum AuthRef {
     /// HTTP Basic: a plain username plus a vault reference for the password.
     #[serde(rename_all = "camelCase")]
-    Basic { username: String, secret_ref: String },
+    Basic {
+        username: String,
+        secret_ref: String,
+    },
     /// A bearer token held in the vault.
     #[serde(rename_all = "camelCase")]
     Bearer { secret_ref: String },
@@ -232,7 +238,11 @@ pub struct PublishCfg {
 
 impl Default for PublishCfg {
     fn default() -> Self {
-        Self { mode: PublishMode::OnChange, batch_ms: 0, deadband: None }
+        Self {
+            mode: PublishMode::OnChange,
+            batch_ms: 0,
+            deadband: None,
+        }
     }
 }
 
@@ -264,7 +274,9 @@ pub fn parse_agents(global: &Value) -> Result<Vec<AgentConfig>, MtcError> {
         .as_array()
         .ok_or_else(|| MtcError::Config("component.global.agents must be an array".into()))?;
     if arr.is_empty() {
-        return Err(MtcError::Config("component.global.agents[] must not be empty".into()));
+        return Err(MtcError::Config(
+            "component.global.agents[] must not be empty".into(),
+        ));
     }
 
     let mut agents = Vec::with_capacity(arr.len());
@@ -295,7 +307,10 @@ pub fn parse_agents(global: &Value) -> Result<Vec<AgentConfig>, MtcError> {
 /// material that names a certificate without its key.
 pub fn validate_agent(a: &AgentConfig) -> Result<(), MtcError> {
     if !is_lower_kebab(&a.id) {
-        return Err(MtcError::Config(format!("agent id `{}` must be lower-kebab", a.id)));
+        return Err(MtcError::Config(format!(
+            "agent id `{}` must be lower-kebab",
+            a.id
+        )));
     }
     if a.heartbeat_ms == 0 || a.poll_interval_ms == 0 || a.request_timeout_ms == 0 {
         return Err(MtcError::Config(format!(
@@ -304,7 +319,10 @@ pub fn validate_agent(a: &AgentConfig) -> Result<(), MtcError> {
         )));
     }
     if a.max_document_bytes == 0 {
-        return Err(MtcError::Config(format!("agent `{}`: maxDocumentBytes must be > 0", a.id)));
+        return Err(MtcError::Config(format!(
+            "agent `{}`: maxDocumentBytes must be > 0",
+            a.id
+        )));
     }
     if a.reconnect.initial_ms == 0 || a.reconnect.max_ms < a.reconnect.initial_ms {
         return Err(MtcError::Config(format!(
@@ -342,9 +360,16 @@ pub fn validate_bindings(agents: &[AgentConfig], devices: &[DeviceConfig]) -> Re
             )));
         }
         if d.device_uuid.trim().is_empty() {
-            return Err(MtcError::Config(format!("device `{}`: deviceUuid must not be empty", d.id)));
+            return Err(MtcError::Config(format!(
+                "device `{}`: deviceUuid must not be empty",
+                d.id
+            )));
         }
-        if !per_agent_uuids.entry(&d.agent_id).or_default().insert(&d.device_uuid) {
+        if !per_agent_uuids
+            .entry(&d.agent_id)
+            .or_default()
+            .insert(&d.device_uuid)
+        {
             return Err(MtcError::Config(format!(
                 "agent `{}` has two devices with uuid `{}`",
                 d.agent_id, d.device_uuid
@@ -387,7 +412,8 @@ pub fn is_lower_kebab(s: &str) -> bool {
         && !s.starts_with('-')
         && !s.ends_with('-')
         && !s.contains("--")
-        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 fn de_base_url<'de, D>(d: D) -> Result<Url, D::Error>
@@ -396,10 +422,15 @@ where
 {
     use serde::de::Error as _;
     let raw = String::deserialize(d)?;
-    let url = Url::parse(&raw).map_err(|e| D::Error::custom(format!("invalid url `{raw}`: {e}")))?;
+    let url =
+        Url::parse(&raw).map_err(|e| D::Error::custom(format!("invalid url `{raw}`: {e}")))?;
     match url.scheme() {
         "http" | "https" => {}
-        other => return Err(D::Error::custom(format!("unsupported url scheme `{other}`"))),
+        other => {
+            return Err(D::Error::custom(format!(
+                "unsupported url scheme `{other}`"
+            )));
+        }
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(D::Error::custom(
@@ -438,12 +469,25 @@ mod tests {
         let a = &agents[0];
         assert_eq!(a.id, "line-a-agent");
         assert_eq!(a.url.as_str(), "http://agent:5000/");
-        assert_eq!(a.heartbeat_ms, DEFAULT_HEARTBEAT_MS, "the standard's 10 s default");
+        assert_eq!(
+            a.heartbeat_ms, DEFAULT_HEARTBEAT_MS,
+            "the standard's 10 s default"
+        );
         assert_eq!(a.poll_interval_ms, DEFAULT_POLL_INTERVAL_MS);
         assert_eq!(a.request_timeout_ms, DEFAULT_REQUEST_TIMEOUT_MS);
         assert_eq!(a.max_document_bytes, DEFAULT_MAX_DOCUMENT_BYTES);
-        assert_eq!(a.streaming, StreamPolicy::Prefer, "streaming is the primary acquisition");
-        assert_eq!(a.reconnect, ReconnectCfg { initial_ms: 1_000, max_ms: 60_000 });
+        assert_eq!(
+            a.streaming,
+            StreamPolicy::Prefer,
+            "streaming is the primary acquisition"
+        );
+        assert_eq!(
+            a.reconnect,
+            ReconnectCfg {
+                initial_ms: 1_000,
+                max_ms: 60_000
+            }
+        );
         assert!(a.auth.is_none() && a.tls.is_none());
     }
 
@@ -459,9 +503,15 @@ mod tests {
         let a = &agents[0];
         assert_eq!(
             a.auth,
-            Some(AuthRef::Basic { username: "reader".into(), secret_ref: "mtc/agent-a".into() })
+            Some(AuthRef::Basic {
+                username: "reader".into(),
+                secret_ref: "mtc/agent-a".into()
+            })
         );
-        assert_eq!(a.tls.as_ref().unwrap().ca_secret_ref.as_deref(), Some("mtc/ca"));
+        assert_eq!(
+            a.tls.as_ref().unwrap().ca_secret_ref.as_deref(),
+            Some("mtc/ca")
+        );
         assert_eq!(a.streaming, StreamPolicy::PollOnly);
         assert_eq!(a.poll_interval_ms, 500);
         assert_eq!(a.max_document_bytes, 1024);
@@ -472,7 +522,12 @@ mod tests {
             "auth": { "type": "bearer", "secretRef": "mtc/token" }
         }] }))
         .unwrap();
-        assert_eq!(agents[0].auth, Some(AuthRef::Bearer { secret_ref: "mtc/token".into() }));
+        assert_eq!(
+            agents[0].auth,
+            Some(AuthRef::Bearer {
+                secret_ref: "mtc/token".into()
+            })
+        );
     }
 
     #[test]
@@ -484,10 +539,16 @@ mod tests {
             "not a url",
         ] {
             let err = parse_agents(&json!({ "agents": [{ "id": "a", "url": bad }] })).unwrap_err();
-            assert!(matches!(err, MtcError::Config(_)), "`{bad}` must be refused");
+            assert!(
+                matches!(err, MtcError::Config(_)),
+                "`{bad}` must be refused"
+            );
         }
         // A username alone is still userinfo.
-        assert!(parse_agents(&json!({ "agents": [{ "id": "a", "url": "http://user@agent" }] })).is_err());
+        assert!(
+            parse_agents(&json!({ "agents": [{ "id": "a", "url": "http://user@agent" }] }))
+                .is_err()
+        );
     }
 
     #[test]
@@ -517,15 +578,20 @@ mod tests {
 
     #[test]
     fn an_unknown_agent_key_is_rejected_rather_than_ignored() {
-        let bad = json!({ "agents": [{ "id": "a", "url": "http://x:5000", "pollIntervalMS": 10 }] });
-        assert!(parse_agents(&bad).is_err(), "a typo'd key is a mistake, not a no-op");
+        let bad =
+            json!({ "agents": [{ "id": "a", "url": "http://x:5000", "pollIntervalMS": 10 }] });
+        assert!(
+            parse_agents(&bad).is_err(),
+            "a typo'd key is a mistake, not a no-op"
+        );
     }
 
     #[test]
     fn non_positive_timings_and_half_specified_tls_are_refused() {
         let zero = json!({ "agents": [{ "id": "a", "url": "http://x:5000", "heartbeatMs": 0 }] });
         assert!(parse_agents(&zero).is_err());
-        let zero_cap = json!({ "agents": [{ "id": "a", "url": "http://x:5000", "maxDocumentBytes": 0 }] });
+        let zero_cap =
+            json!({ "agents": [{ "id": "a", "url": "http://x:5000", "maxDocumentBytes": 0 }] });
         assert!(parse_agents(&zero_cap).is_err());
         let bad_backoff = json!({ "agents": [{
             "id": "a", "url": "http://x:5000", "reconnect": { "initialMs": 5000, "maxMs": 1000 }
@@ -583,20 +649,33 @@ mod tests {
         assert_eq!(s.condition_binding, None);
         assert_eq!(
             s.publish_policy(),
-            PublishCfg { mode: PublishMode::OnChange, batch_ms: 0, deadband: None }
+            PublishCfg {
+                mode: PublishMode::OnChange,
+                batch_ms: 0,
+                deadband: None
+            }
         );
         assert!(s.condition_bindings().is_empty());
         let cleared: SignalConfig = serde_json::from_value(json!({
             "id": "a", "dataItemId": "d1", "conditionBinding": []
         }))
         .unwrap();
-        assert_eq!(cleared.condition_binding, Some(Vec::new()), "[] is a statement, not absence");
+        assert_eq!(
+            cleared.condition_binding,
+            Some(Vec::new()),
+            "[] is a statement, not absence"
+        );
     }
 
     #[test]
     fn the_cross_invariants_of_lld_8_are_enforced() {
         let agents = parse_agents(&one_agent()).unwrap();
-        let ok = vec![device("cnc-1", "line-a-agent", "OKUMA.1", vec![signal("a", "d1")])];
+        let ok = vec![device(
+            "cnc-1",
+            "line-a-agent",
+            "OKUMA.1",
+            vec![signal("a", "d1")],
+        )];
         validate_bindings(&agents, &ok).unwrap();
 
         // Unknown agent.
@@ -624,7 +703,12 @@ mod tests {
         assert!(validate_bindings(&agents, &bad).is_err());
 
         // Empty dataItemId.
-        let bad = vec![device("cnc-1", "line-a-agent", "OKUMA.1", vec![signal("a", "")])];
+        let bad = vec![device(
+            "cnc-1",
+            "line-a-agent",
+            "OKUMA.1",
+            vec![signal("a", "")],
+        )];
         assert!(validate_bindings(&agents, &bad).is_err());
 
         // A signal binding its own data item as a condition.
@@ -642,8 +726,7 @@ mod tests {
         let err = validate_bindings(&agents, &[with_selection]).unwrap_err();
         assert!(err.to_string().contains("cnc-1"), "{err}");
         let mut ok_selection = device("cnc-1", "line-a-agent", "OKUMA.1", vec![]);
-        ok_selection.selection =
-            Some(serde_json::from_value(json!({ "mode": "all" })).unwrap());
+        ok_selection.selection = Some(serde_json::from_value(json!({ "mode": "all" })).unwrap());
         validate_bindings(&agents, &[ok_selection]).unwrap();
     }
 

@@ -30,7 +30,7 @@ Dimensions: `instance`.
 | `publishLatencyMs` | Milliseconds | 1 | Time spent publishing the most recent poll's readings. |
 | `pollLatencyMs` | Milliseconds | 1 | Time spent draining and reading the device on the most recent cycle. |
 | `readErrors` | Count | 60 | Failed reads in the reporting interval — polling failures without reading logs. |
-| `staleSignals` | Count | 60 | Signals with no update for longer than `healthThresholds.staleSignalSecs`. |
+| `staleSignals` | Count | 60 | Signals with no **value** update for longer than `healthThresholds.staleSignalSecs` — genuine value silence. The synthetic passive-quality republishes ([data-types.md](data-types.md#passive-quality--held-values-under-a-silent-agent)) are not value updates and do not reset it. |
 | `reconnects` | Count | 60 | Reconnects (link drops that required re-establishing the session). |
 | `writeErrors` | Count | 60 | Structurally always `0` for this adapter — MTConnect has no write path — kept for cross-adapter dashboard uniformity. |
 | `signalsSubscribed` | Count | 1 | Signals the connected instance currently **serves**: its configured set minus any whose `dataItemId` the current device model does not have (those publish a permanent BAD instead). The same number whether acquisition is streaming or polling — the compiled set is what is served, and the mode only decides how it arrives. `0` while disconnected. A gauge, not a pair. |
@@ -120,6 +120,7 @@ Dimensions: `instance`, `result`.
 |---|---:|---|
 | `documentsParsedTotal` / `documentsParsedInterval` | Count | Documents this instance's agent decoded successfully. |
 | `parseErrorsTotal` / `parseErrorsInterval` | Count | Documents that failed to decode. |
+| `rejectedObservationsTotal` / `rejectedObservationsInterval` | Count | Observations the agent sent that this client refused for a missing required field — no `dataItemId`, no `sequence` parsable as an integer ≥ 1, or an empty `timestamp`. A reject is dropped and counted, never defaulted. |
 
 This family is only defined for an `mtconnect`-adapter instance; the built-in simulator parses no
 documents and emits nothing under this name.
@@ -135,3 +136,10 @@ dashboard reads every adapter's operational metrics the same way. Within `Mtconn
 measure exists in both the `success` and `error` cells, and each counter is non-zero only in the cell
 its outcome actually belongs to (a stream gap is by definition a recovery from something that went
 wrong, so it only ever appears in the `error` cell).
+
+## Appendix — revision history
+
+| Date | Change |
+|---|---|
+| 2026-08-03 | `MtconnectParse` gains `rejectedObservations`; `staleSignals` meaning pinned to value silence. |
+| 2026-07-28 | Initial version. |

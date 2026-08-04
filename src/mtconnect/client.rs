@@ -193,7 +193,10 @@ impl MtcClient {
     /// # Errors
     /// [`MtcError::Http`]/[`MtcError::Auth`] for a refused request, [`MtcError::Transport`] when the
     /// connection fails.
-    pub async fn open_sample_stream(&self, req: &StreamRequest) -> Result<StreamResponse, MtcError> {
+    pub async fn open_sample_stream(
+        &self,
+        req: &StreamRequest,
+    ) -> Result<StreamResponse, MtcError> {
         let mut query = vec![
             ("interval", req.interval_ms.to_string()),
             ("heartbeat", req.heartbeat_ms.to_string()),
@@ -263,7 +266,9 @@ impl MtcClient {
         // itself is bounded too.
         if let Some(len) = response.content_length() {
             if len > self.max_document_bytes as u64 {
-                return Err(MtcError::TooLarge { limit: self.max_document_bytes });
+                return Err(MtcError::TooLarge {
+                    limit: self.max_document_bytes,
+                });
             }
         }
 
@@ -272,7 +277,9 @@ impl MtcClient {
             match response.chunk().await {
                 Ok(Some(chunk)) => {
                     if body.len() + chunk.len() > self.max_document_bytes {
-                        return Err(MtcError::TooLarge { limit: self.max_document_bytes });
+                        return Err(MtcError::TooLarge {
+                            limit: self.max_document_bytes,
+                        });
                     }
                     body.extend_from_slice(&chunk);
                 }
@@ -280,7 +287,8 @@ impl MtcClient {
                 Err(e) => return Err(map_transport_error(&e)),
             }
         }
-        String::from_utf8(body).map_err(|_| MtcError::Xml("response body is not valid UTF-8".into()))
+        String::from_utf8(body)
+            .map_err(|_| MtcError::Xml("response body is not valid UTF-8".into()))
     }
 
     fn authorize(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -297,8 +305,8 @@ impl MtcClient {
 pub fn authorization_header(auth: &AuthMaterial) -> String {
     match auth {
         AuthMaterial::Basic { username, password } => {
-            let encoded = base64::engine::general_purpose::STANDARD
-                .encode(format!("{username}:{password}"));
+            let encoded =
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
             format!("Basic {encoded}")
         }
         AuthMaterial::Bearer { token } => format!("Bearer {token}"),
@@ -337,7 +345,9 @@ fn check_status(response: reqwest::Response) -> Result<reqwest::Response, MtcErr
         return Ok(response);
     }
     match status.as_u16() {
-        401 | 403 => Err(MtcError::Auth(format!("agent refused the credentials (HTTP {status})"))),
+        401 | 403 => Err(MtcError::Auth(format!(
+            "agent refused the credentials (HTTP {status})"
+        ))),
         code => Err(MtcError::Http { status: code }),
     }
 }
@@ -375,7 +385,12 @@ mod tests {
             format!("http://{}", self.addr)
         }
         fn last_request(&self) -> String {
-            self.requests.lock().unwrap().last().cloned().unwrap_or_default()
+            self.requests
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default()
         }
         fn request_count(&self) -> usize {
             self.requests.lock().unwrap().len()
@@ -394,7 +409,9 @@ mod tests {
 
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 let seen = Arc::clone(&seen);
                 let responder = Arc::clone(&responder);
                 tokio::spawn(async move {
@@ -443,9 +460,14 @@ mod tests {
     #[test]
     fn urls_are_built_against_the_configured_base_path() {
         let c = client_for("http://agent:5000", json!({}));
-        assert_eq!(c.url_for("probe", &[]).unwrap().as_str(), "http://agent:5000/probe");
         assert_eq!(
-            c.url_for("current", &[("path", "//Axes".to_string())]).unwrap().as_str(),
+            c.url_for("probe", &[]).unwrap().as_str(),
+            "http://agent:5000/probe"
+        );
+        assert_eq!(
+            c.url_for("current", &[("path", "//Axes".to_string())])
+                .unwrap()
+                .as_str(),
             "http://agent:5000/current?path=%2F%2FAxes"
         );
         assert_eq!(
@@ -462,7 +484,10 @@ mod tests {
             "https://gw.example.com/plant-a/probe"
         );
         assert_eq!(c.base().as_str(), "https://gw.example.com/plant-a/");
-        assert_eq!(c.max_document_bytes(), super::super::config::DEFAULT_MAX_DOCUMENT_BYTES);
+        assert_eq!(
+            c.max_document_bytes(),
+            super::super::config::DEFAULT_MAX_DOCUMENT_BYTES
+        );
     }
 
     #[test]
@@ -476,7 +501,9 @@ mod tests {
             "Basic cmVhZGVyOnMzY3JldA=="
         );
         assert_eq!(
-            authorization_header(&AuthMaterial::Bearer { token: "abc.def".into() }),
+            authorization_header(&AuthMaterial::Bearer {
+                token: "abc.def".into()
+            }),
             "Bearer abc.def"
         );
     }
@@ -490,20 +517,30 @@ mod tests {
         let head = agent.last_request();
         assert!(head.starts_with("GET /probe HTTP/1.1"), "{head}");
         assert!(head.contains("accept: application/xml"), "{head}");
-        assert!(!head.to_lowercase().contains("authorization:"), "no auth configured, none sent");
+        assert!(
+            !head.to_lowercase().contains("authorization:"),
+            "no auth configured, none sent"
+        );
     }
 
     #[tokio::test]
     async fn credentials_ride_every_request_when_configured() {
         let agent = spawn_agent(|_| Some(http_ok("<MTConnectStreams/>"))).await;
-        let agents = parse_agents(&json!({ "agents": [{ "id": "a", "url": agent.url() }] })).unwrap();
+        let agents =
+            parse_agents(&json!({ "agents": [{ "id": "a", "url": agent.url() }] })).unwrap();
         let creds = AgentCredentials {
-            auth: Some(AuthMaterial::Bearer { token: "tok-123".into() }),
+            auth: Some(AuthMaterial::Bearer {
+                token: "tok-123".into(),
+            }),
             tls: None,
         };
         let c = MtcClient::new(&agents[0], &creds).unwrap();
         c.current(None).await.unwrap();
-        assert!(agent.last_request().contains("authorization: Bearer tok-123"));
+        assert!(
+            agent
+                .last_request()
+                .contains("authorization: Bearer tok-123")
+        );
     }
 
     #[tokio::test]
@@ -511,11 +548,17 @@ mod tests {
         let agent = spawn_agent(|_| Some(http_ok("<MTConnectStreams/>"))).await;
         let c = client_for(&agent.url(), json!({}));
 
-        c.current(Some("//Axes//DataItem[@category='SAMPLE']")).await.unwrap();
+        c.current(Some("//Axes//DataItem[@category='SAMPLE']"))
+            .await
+            .unwrap();
         assert!(agent.last_request().starts_with("GET /current?path="));
 
         c.sample(Some(42), Some(100), None).await.unwrap();
-        assert!(agent.last_request().starts_with("GET /sample?from=42&count=100"));
+        assert!(
+            agent
+                .last_request()
+                .starts_with("GET /sample?from=42&count=100")
+        );
 
         c.sample(None, None, None).await.unwrap();
         assert!(agent.last_request().starts_with("GET /sample HTTP/1.1"));
@@ -546,13 +589,23 @@ mod tests {
         assert!(head.contains("from=42"), "{head}");
         assert!(head.contains("path=%2F%2FAxes"), "{head}");
 
-        assert_eq!(stream.content_type(), "multipart/x-mixed-replace;boundary=x");
-        assert_eq!(stream.max_document_bytes(), super::super::config::DEFAULT_MAX_DOCUMENT_BYTES);
+        assert_eq!(
+            stream.content_type(),
+            "multipart/x-mixed-replace;boundary=x"
+        );
+        assert_eq!(
+            stream.max_document_bytes(),
+            super::super::config::DEFAULT_MAX_DOCUMENT_BYTES
+        );
         let mut seen = Vec::new();
         while let Some(chunk) = stream.next_chunk().await.unwrap() {
             seen.extend_from_slice(&chunk);
         }
-        assert_eq!(String::from_utf8(seen).unwrap(), body, "the body arrives unparsed");
+        assert_eq!(
+            String::from_utf8(seen).unwrap(),
+            body,
+            "the body arrives unparsed"
+        );
     }
 
     #[tokio::test]
@@ -560,7 +613,10 @@ mod tests {
         let big = "<MTConnectDevices>".to_string() + &"x".repeat(4096) + "</MTConnectDevices>";
         let agent = spawn_agent(move |_| Some(http_ok(&big))).await;
         let c = client_for(&agent.url(), json!({ "maxDocumentBytes": 512 }));
-        assert!(matches!(c.probe().await, Err(MtcError::TooLarge { limit: 512 })));
+        assert!(matches!(
+            c.probe().await,
+            Err(MtcError::TooLarge { limit: 512 })
+        ));
     }
 
     #[tokio::test]
@@ -576,7 +632,10 @@ mod tests {
         })
         .await;
         let c = client_for(&agent.url(), json!({ "maxDocumentBytes": 512 }));
-        assert!(matches!(c.probe().await, Err(MtcError::TooLarge { limit: 512 })));
+        assert!(matches!(
+            c.probe().await,
+            Err(MtcError::TooLarge { limit: 512 })
+        ));
     }
 
     #[tokio::test]
@@ -590,15 +649,25 @@ mod tests {
     #[tokio::test]
     async fn refused_credentials_are_an_auth_error_and_other_statuses_are_not() {
         let agent = spawn_agent(|head: &str| {
-            let status = if head.contains("/probe") { "401 Unauthorized" } else { "503 Service Unavailable" };
-            Some(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes())
+            let status = if head.contains("/probe") {
+                "401 Unauthorized"
+            } else {
+                "503 Service Unavailable"
+            };
+            Some(
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .into_bytes(),
+            )
         })
         .await;
         let c = client_for(&agent.url(), json!({}));
 
         let err = c.probe().await.unwrap_err();
         assert!(matches!(err, MtcError::Auth(_)), "{err:?}");
-        assert!(!err.is_transient(), "a rejected credential will not fix itself");
+        assert!(
+            !err.is_transient(),
+            "a rejected credential will not fix itself"
+        );
 
         let err = c.current(None).await.unwrap_err();
         assert!(matches!(err, MtcError::Http { status: 503 }), "{err:?}");
@@ -612,7 +681,11 @@ mod tests {
         let err = c.probe().await.unwrap_err();
         assert!(matches!(err, MtcError::Timeout { .. }), "{err:?}");
         assert!(err.is_transient());
-        assert_eq!(agent.request_count(), 1, "the client does not retry on its own");
+        assert_eq!(
+            agent.request_count(),
+            1,
+            "the client does not retry on its own"
+        );
     }
 
     #[tokio::test]
@@ -621,10 +694,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let c = client_for(&format!("http://{addr}"), json!({ "requestTimeoutMs": 500 }));
+        let c = client_for(
+            &format!("http://{addr}"),
+            json!({ "requestTimeoutMs": 500 }),
+        );
         let err = c.probe().await.unwrap_err();
         // Refused or unanswered - both are the link, and both are worth reconnecting to.
-        assert!(matches!(err, MtcError::Transport(_) | MtcError::Timeout { .. }), "{err:?}");
+        assert!(
+            matches!(err, MtcError::Transport(_) | MtcError::Timeout { .. }),
+            "{err:?}"
+        );
         assert!(err.is_transient(), "a down agent is worth reconnecting to");
     }
 
@@ -640,14 +719,18 @@ mod tests {
         })
         .await;
         let c = client_for(&agent.url(), json!({}));
-        assert!(matches!(c.probe().await, Err(MtcError::Http { status: 302 })));
+        assert!(matches!(
+            c.probe().await,
+            Err(MtcError::Http { status: 302 })
+        ));
         assert_eq!(agent.request_count(), 1);
     }
 
     #[tokio::test]
     async fn a_non_utf8_body_is_a_parse_error_not_a_panic() {
         let agent = spawn_agent(|_| {
-            let mut out = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n".to_vec();
+            let mut out =
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n".to_vec();
             out.extend_from_slice(&[0xff, 0xfe, 0xfd, 0xfc]);
             Some(out)
         })
@@ -658,12 +741,16 @@ mod tests {
 
     #[test]
     fn tls_material_is_validated_when_the_client_is_built() {
-        let agents = parse_agents(&json!({ "agents": [{ "id": "a", "url": "https://agent:5001" }] }))
-            .unwrap();
+        let agents =
+            parse_agents(&json!({ "agents": [{ "id": "a", "url": "https://agent:5001" }] }))
+                .unwrap();
         let creds = AgentCredentials {
             auth: None,
             tls: Some(TlsMaterial {
-                ca_pem: Some("-----BEGIN CERTIFICATE-----\nnot base64 at all\n-----END CERTIFICATE-----\n".into()),
+                ca_pem: Some(
+                    "-----BEGIN CERTIFICATE-----\nnot base64 at all\n-----END CERTIFICATE-----\n"
+                        .into(),
+                ),
                 ..TlsMaterial::default()
             }),
         };
@@ -676,10 +763,17 @@ mod tests {
             auth: None,
             tls: Some(TlsMaterial {
                 ca_pem: None,
-                client_cert_pem: Some("-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----".into()),
-                client_key_pem: Some("-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----\n".into()),
+                client_cert_pem: Some(
+                    "-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----".into(),
+                ),
+                client_key_pem: Some(
+                    "-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----\n".into(),
+                ),
             }),
         };
-        assert!(matches!(MtcClient::new(&agents[0], &creds), Err(MtcError::Tls(_))));
+        assert!(matches!(
+            MtcClient::new(&agents[0], &creds),
+            Err(MtcError::Tls(_))
+        ));
     }
 }

@@ -28,8 +28,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use serde_json::{Value, json};
 use url::Url;
 
 /// One reading from the device.
@@ -58,8 +57,14 @@ pub struct Reading {
     /// stamp (an OPC UA server, an MTConnect agent). A direct-client protocol leaves it `None`:
     /// its receive moment IS the capture moment.
     pub capture_ts: Option<String>,
-    /// The **adapter receive** timestamp. The worker auto-stamps it at read completion for every
-    /// reading lacking it, so a backend only sets it when it has a better (earlier) receive stamp.
+    /// The **adapter receive** timestamp — when the protocol payload reached this adapter.
+    ///
+    /// For MTConnect it is the moment the agent's document was **ingested** (stamped once per
+    /// document by [`AgentRuntime`](crate::mtconnect::AgentRuntime), from its injected clock), not
+    /// the moment a device session drained the observation off the instance queue: queue backlog
+    /// and poll cadence are exactly what this measurement exists to expose, so they must not be
+    /// folded into it. The worker auto-stamps read completion only for readings a backend left
+    /// unstamped (the simulator, whose read *is* its arrival).
     pub received_ts: Option<String>,
     /// Additive protocol-specific fields ("extras", `docs/SOUTHBOUND.md` §2) copied onto the
     /// published sample: MTConnect rides its `sequence` here on every sample, plus
@@ -120,7 +125,9 @@ impl Reading {
     /// Attach one extra field (fluent).
     #[must_use]
     pub fn with_extra(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
-        self.extra.get_or_insert_with(serde_json::Map::new).insert(key.into(), value);
+        self.extra
+            .get_or_insert_with(serde_json::Map::new)
+            .insert(key.into(), value);
         self
     }
 }
@@ -220,7 +227,10 @@ pub trait DeviceSession: Send + Sync {
     /// Only when the *connection* is broken (same contract as [`read_signals`](Self::read_signals)).
     async fn read_named(&mut self, ids: &[String]) -> Result<Vec<Reading>> {
         let all = self.read_signals().await?;
-        Ok(all.into_iter().filter(|r| ids.iter().any(|id| id == &r.signal_id)).collect())
+        Ok(all
+            .into_iter()
+            .filter(|r| ids.iter().any(|id| id == &r.signal_id))
+            .collect())
     }
 
     /// Write a value back to the device.
@@ -297,6 +307,13 @@ pub trait DeviceSession: Send + Sync {
     /// deadband (the first reading after a resync always passes). Draining it resets it.
     fn take_resync(&mut self) -> bool {
         false
+    }
+
+    /// The link facts passive-quality evaluation needs. `None` (the default) means this backend has
+    /// no **mediated** liveness — its read IS its liveness (the simulator), so there is nothing a
+    /// watchdog could observe between reads.
+    fn passive_input(&self) -> Option<crate::staleness::PassiveLink> {
+        None
     }
 
     /// Close the connection. Must be safe to call twice.
@@ -413,7 +430,10 @@ impl DeviceBackend for SimBackend {
     fn inventory(&self, _cfg: &ConnectionConfig) -> Vec<SignalInfo> {
         SIM_SIGNALS
             .iter()
-            .map(|(id, name, _)| SignalInfo { id: (*id).to_string(), name: Some((*name).to_string()) })
+            .map(|(id, name, _)| SignalInfo {
+                id: (*id).to_string(),
+                name: Some((*name).to_string()),
+            })
             .collect()
     }
 
@@ -421,7 +441,9 @@ impl DeviceBackend for SimBackend {
         if cfg.endpoint.is_empty() {
             // A missing endpoint will never fix itself: permanent, so the supervisor does not
             // spend the next hour reconnecting to nothing.
-            return Err(DeviceError::Permanent(anyhow::anyhow!("no endpoint configured")));
+            return Err(DeviceError::Permanent(anyhow::anyhow!(
+                "no endpoint configured"
+            )));
         }
         Ok(Box::new(SimSession { tick: 0 }))
     }
@@ -478,7 +500,10 @@ impl DeviceSession for SimSession {
                 type_name: (*ty).to_string(),
             })
             .collect();
-        Ok(BrowsePage { entries, next_cursor: None })
+        Ok(BrowsePage {
+            entries,
+            next_cursor: None,
+        })
     }
 }
 
@@ -487,7 +512,10 @@ mod tests {
     use super::*;
 
     fn conn(endpoint: &str) -> ConnectionConfig {
-        ConnectionConfig { endpoint: endpoint.into(), extra: serde_json::Map::new() }
+        ConnectionConfig {
+            endpoint: endpoint.into(),
+            extra: serde_json::Map::new(),
+        }
     }
 
     #[tokio::test]
@@ -510,7 +538,10 @@ mod tests {
         // that silently vanishes is indistinguishable from one that is not changing.
         let mut s = SimBackend.connect(&conn("sim://device")).await.unwrap();
         let readings = s.read_signals().await.unwrap();
-        let bad = readings.iter().find(|r| r.signal_id == "pressure-1").unwrap();
+        let bad = readings
+            .iter()
+            .find(|r| r.signal_id == "pressure-1")
+            .unwrap();
         assert_eq!(bad.quality, Quality::Bad);
         assert_eq!(bad.quality_raw.as_deref(), Some("SENSOR_FAULT"));
     }
@@ -522,7 +553,10 @@ mod tests {
         let Err(e) = SimBackend.connect(&conn("")).await else {
             panic!("connecting with no endpoint must fail");
         };
-        assert!(!e.is_transient(), "a missing endpoint will never fix itself by retrying");
+        assert!(
+            !e.is_transient(),
+            "a missing endpoint will never fix itself by retrying"
+        );
     }
 
     #[tokio::test]
@@ -542,7 +576,12 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].signal_id, "temperature-1");
         // An unknown id resolves to nothing (the command layer reports it as a BAD/no-data entry).
-        assert!(s.read_named(&["nope".to_string()]).await.unwrap().is_empty());
+        assert!(
+            s.read_named(&["nope".to_string()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -551,7 +590,10 @@ mod tests {
         let page = s.browse(None, 100).await.unwrap();
         assert_eq!(page.entries.len(), 2);
         assert_eq!(page.entries[0].id, "temperature-1");
-        assert!(page.next_cursor.is_none(), "the sim's first page is its last");
+        assert!(
+            page.next_cursor.is_none(),
+            "the sim's first page is its last"
+        );
         // A cursor asks for the page after the last — empty.
         let page2 = s.browse(Some("x".into()), 100).await.unwrap();
         assert!(page2.entries.is_empty());
@@ -580,7 +622,10 @@ mod tests {
             }
         }
         let mut s = NoBrowse;
-        assert!(matches!(s.browse(None, 10).await, Err(BrowseError::Unsupported)));
+        assert!(matches!(
+            s.browse(None, 10).await,
+            Err(BrowseError::Unsupported)
+        ));
     }
 }
 
@@ -608,13 +653,13 @@ mod tests {
 // the `conditionBinding` degradation), the agent's capture timestamp, and the `sequence` extra
 // that gives a consumer exact once-only ordering across reconnects.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::mtconnect::config::{DeviceConfig as MtcDeviceConfig, PublishMode, SignalConfig};
 use crate::mtconnect::model::{Category, ProbeModel};
 use crate::mtconnect::observations::{CondState, ObsValue, Observation};
-use crate::mtconnect::selection::{served_set, ServedSignal};
-use crate::mtconnect::{AgentRuntime, InstanceEvent, MtcError};
+use crate::mtconnect::selection::{ServedSignal, served_set};
+use crate::mtconnect::{AgentRuntime, InstanceEvent, InstanceReceiver, MtcError};
 use crate::reload::{SignalRegistry, SignalSlot};
 
 /// The `adapter` value that selects this backend.
@@ -645,7 +690,9 @@ pub fn connection_binding(cfg: &ConnectionConfig) -> std::result::Result<(String
         match cfg.extra.get(key).and_then(Value::as_str) {
             Some(v) if !v.trim().is_empty() => Ok(v.to_string()),
             Some(_) => Err(format!("connection.{key} must not be empty")),
-            None => Err(format!("connection.{key} is required for the `{KIND}` adapter")),
+            None => Err(format!(
+                "connection.{key} is required for the `{KIND}` adapter"
+            )),
         }
     };
     Ok((field("agentId")?, field("deviceUuid")?))
@@ -711,7 +758,11 @@ impl MtcBackend {
             .into_iter()
             .map(|d| (binding_key(&d.agent_id, &d.device_uuid), d))
             .collect();
-        Self { agents, devices, signals }
+        Self {
+            agents,
+            devices,
+            signals,
+        }
     }
 
     /// The live signal registry a reload swaps into (LLD §8) — the same slots the sessions read.
@@ -720,14 +771,19 @@ impl MtcBackend {
         Arc::clone(&self.signals)
     }
 
-    fn binding(&self, cfg: &ConnectionConfig) -> std::result::Result<&MtcDeviceConfig, DeviceError> {
+    fn binding(
+        &self,
+        cfg: &ConnectionConfig,
+    ) -> std::result::Result<&MtcDeviceConfig, DeviceError> {
         let (agent_id, uuid) =
             connection_binding(cfg).map_err(|e| DeviceError::Permanent(anyhow::anyhow!(e)))?;
-        self.devices.get(&binding_key(&agent_id, &uuid)).ok_or_else(|| {
-            DeviceError::Permanent(anyhow::anyhow!(
-                "no configured device `{uuid}` on agent `{agent_id}`"
-            ))
-        })
+        self.devices
+            .get(&binding_key(&agent_id, &uuid))
+            .ok_or_else(|| {
+                DeviceError::Permanent(anyhow::anyhow!(
+                    "no configured device `{uuid}` on agent `{agent_id}`"
+                ))
+            })
     }
 }
 
@@ -754,7 +810,10 @@ impl DeviceBackend for MtcBackend {
                     served_set(&live.signals, live.selection.as_ref(), model.as_deref())
                         .signals
                         .into_iter()
-                        .map(|s| SignalInfo { id: s.signal.id, name: s.signal.name })
+                        .map(|s| SignalInfo {
+                            id: s.signal.id,
+                            name: s.signal.name,
+                        })
                         .collect()
                 }
                 None => Vec::new(),
@@ -776,8 +835,24 @@ impl DeviceBackend for MtcBackend {
             })?
             .clone();
 
-        // "Connected" means the agent answered AND this device is really in its probe.
-        let model = agent.ensure_model(&device.device_uuid).await.map_err(to_device_error)?;
+        // "Connected" means the agent is DELIVERING (HLD §5.1 state 1: reachable, probe verified,
+        // AND delivering) — not merely that a model was cached once. `ensure_model` answers from
+        // that cache without touching the network, so treating it as proof of liveness is what let
+        // an instance report ONLINE, emit `device-connected` and clear `device-unreachable` against
+        // a dead agent, forever. The shared runtime's own published state is the only authority
+        // (D-R1); an instance stays CONNECTING/BACKOFF until acquisition has really delivered.
+        if !agent.info().connected {
+            return Err(DeviceError::Transient(anyhow::anyhow!(
+                "agent `{}` is not delivering ({})",
+                device.agent_id,
+                agent.last_down_reason()
+            )));
+        }
+        // ...and that this device is really in the agent's probe.
+        let model = agent
+            .ensure_model(&device.device_uuid)
+            .await
+            .map_err(to_device_error)?;
         let slot = self.signals.slot(&device.id).ok_or_else(|| {
             DeviceError::Permanent(anyhow::anyhow!(
                 "instance `{}` has no signal slot; it was not in the compiled configuration",
@@ -785,7 +860,9 @@ impl DeviceBackend for MtcBackend {
             ))
         })?;
         let handle = agent.attach(&device.device_uuid);
-        Ok(Box::new(MtcSession::with_slot(agent, device, model, handle.rx, slot)))
+        Ok(Box::new(MtcSession::with_slot(
+            agent, device, model, handle.rx, slot,
+        )))
     }
 }
 
@@ -837,13 +914,16 @@ pub fn resolve_agent_credentials(
 
     let auth = match &cfg.auth {
         None => None,
-        Some(AuthRef::Basic { username, secret_ref }) => Some(AuthMaterial::Basic {
+        Some(AuthRef::Basic {
+            username,
+            secret_ref,
+        }) => Some(AuthMaterial::Basic {
             username: username.clone(),
             password: fetch(secret_ref)?,
         }),
-        Some(AuthRef::Bearer { secret_ref }) => {
-            Some(AuthMaterial::Bearer { token: fetch(secret_ref)? })
-        }
+        Some(AuthRef::Bearer { secret_ref }) => Some(AuthMaterial::Bearer {
+            token: fetch(secret_ref)?,
+        }),
     };
 
     let tls = match &cfg.tls {
@@ -872,10 +952,11 @@ pub struct MtcSession {
     /// The generation currently compiled — compared against the slot to notice a reload.
     generation: String,
     model: Arc<ProbeModel>,
-    rx: mpsc::Receiver<InstanceEvent>,
-    /// The latest state of every CONDITION data item this device published, with its native code —
-    /// what `conditionBinding` degrades against.
-    conditions: HashMap<String, (CondState, Option<String>)>,
+    rx: InstanceReceiver,
+    /// The live condition ledger of every CONDITION data item this device published — the
+    /// concurrent activations MTConnect permits on one data item, keyed by activation identity.
+    /// This is what a condition signal publishes and what `conditionBinding` degrades against.
+    conditions: HashMap<String, ConditionLedger>,
     /// The served union (R1.1): the explicit signals merged with the selection-derived set against
     /// the current model. This is what publishes, answers `sb/read`, and scopes a repoll.
     served: Vec<ServedSignal>,
@@ -906,7 +987,7 @@ impl MtcSession {
         agent: Arc<AgentRuntime>,
         device: MtcDeviceConfig,
         model: Arc<ProbeModel>,
-        rx: mpsc::Receiver<InstanceEvent>,
+        rx: InstanceReceiver,
     ) -> Self {
         let generation = crate::reload::generation_of(&device.signals, device.selection.as_ref());
         let mut session = Self {
@@ -936,7 +1017,7 @@ impl MtcSession {
         agent: Arc<AgentRuntime>,
         device: MtcDeviceConfig,
         model: Arc<ProbeModel>,
-        rx: mpsc::Receiver<InstanceEvent>,
+        rx: InstanceReceiver,
         slot: Arc<SignalSlot>,
     ) -> Self {
         let mut session = Self::new(agent, device, model, rx);
@@ -970,8 +1051,11 @@ impl MtcSession {
 
     /// The served data item ids of this device — the scope of a forced `/current` snapshot.
     fn configured_data_items(&self) -> Vec<String> {
-        let mut ids: Vec<String> =
-            self.served.iter().map(|s| s.signal.data_item_id.clone()).collect();
+        let mut ids: Vec<String> = self
+            .served
+            .iter()
+            .map(|s| s.signal.data_item_id.clone())
+            .collect();
         ids.sort();
         ids.dedup();
         ids
@@ -982,7 +1066,8 @@ impl MtcSession {
         match self.last_condition_event.get(data_item_id) {
             Some(last) if now.saturating_duration_since(*last) < CONDITION_EVENT_INTERVAL => false,
             _ => {
-                self.last_condition_event.insert(data_item_id.to_string(), now);
+                self.last_condition_event
+                    .insert(data_item_id.to_string(), now);
                 true
             }
         }
@@ -1070,7 +1155,11 @@ impl MtcSession {
     /// the model — a removed item simply stops publishing, and the change is announced as a
     /// set-change event with counts, never a lingering BAD and never silence.
     fn recompile(&mut self) {
-        let set = served_set(&self.device.signals, self.device.selection.as_ref(), Some(&self.model));
+        let set = served_set(
+            &self.device.signals,
+            self.device.selection.as_ref(),
+            Some(&self.model),
+        );
 
         // Explicit signals keep the strict permanent-BAD missing-item contract.
         self.unbound = self
@@ -1201,47 +1290,75 @@ impl MtcSession {
             .map(|s| &s.signal)
     }
 
-    /// Fold a batch of observations into readings: condition states are recorded **first**, so a
-    /// value observed in the same batch as the fault that invalidates it is already degraded.
+    /// Fold a batch of observations into readings: condition activations are folded into their
+    /// ledgers **first**, so a value observed in the same batch as the fault that invalidates it is
+    /// already degraded.
     fn map_batch(&mut self, observations: &[Observation]) -> Vec<Reading> {
         self.map_batch_at(observations, Instant::now())
     }
 
     /// [`Self::map_batch`] with an explicit clock, so the condition-event rate limit is testable.
+    ///
+    /// Two passes, and the split is what makes the outcome order-independent (P1-3): the first
+    /// applies every condition transition to its data item's ledger, recording what that data item
+    /// aggregated to **at that observation**; the second maps every observation against the ledgers
+    /// as they stand at the end of the batch. A condition sample therefore publishes the concurrent
+    /// truth, and a bound value sees every condition the same batch carried, whatever order the
+    /// agent wrote them in.
     fn map_batch_at(&mut self, observations: &[Observation], now: Instant) -> Vec<Reading> {
-        for obs in observations {
-            if let Some(state) = obs.condition_state() {
-                let code = obs.extra("nativeCode").and_then(Value::as_str).map(str::to_string);
-                let previous = self
-                    .conditions
-                    .insert(obs.data_item_id.clone(), (state, code.clone()))
-                    .map(|(s, _)| s);
-                // A latching Fault is the event an operator wants; a Fault that is merely still
-                // asserted is not, so only the TRANSITION into Fault raises one (rate-limited).
-                if state == CondState::Fault
-                    && previous != Some(CondState::Fault)
-                    && self.allow_condition_event(&obs.data_item_id, now)
-                {
-                    self.notices.push(Notice {
-                        event_type: EVENT_CONDITION,
-                        level: NoticeLevel::Critical,
-                        message: format!("condition `{}` went to Fault", obs.data_item_id),
-                        context: json!({
-                            "instance": self.device.id,
-                            "dataItemId": obs.data_item_id,
-                            "state": "FAULT",
-                            "previousState": previous.map(condition_state_name),
-                            "nativeCode": code,
-                            "timestamp": obs.timestamp,
-                        }),
-                    });
-                }
+        // Pass 1, in document order: fold each transition in and snapshot its result.
+        let mut snapshots: Vec<Option<ConditionSnapshot>> = vec![None; observations.len()];
+        for (i, obs) in observations.iter().enumerate() {
+            if obs.condition_state().is_none() {
+                continue;
+            }
+            // Whether this data item was ever observed, so a first-ever Fault still reports a null
+            // `previousState` rather than claiming it used to be NORMAL.
+            let known = self.conditions.contains_key(&obs.data_item_id);
+            let ledger = self.conditions.entry(obs.data_item_id.clone()).or_default();
+            let previous = ledger.aggregate().0;
+            ledger.apply(obs);
+            let snapshot = ledger.snapshot();
+            let (state, active) = (snapshot.state, snapshot.active);
+            snapshots[i] = Some(snapshot);
+
+            // A latching Fault is the event an operator wants; a Fault that is merely still
+            // asserted is not, so only the TRANSITION into Fault raises one (rate-limited). The
+            // transition is of the AGGREGATE: a second concurrent Fault on an already-faulted data
+            // item is not a new alarm, and clearing one of two is not a recovery.
+            if state == CondState::Fault
+                && previous != CondState::Fault
+                && self.allow_condition_event(&obs.data_item_id, now)
+            {
+                self.notices.push(Notice {
+                    event_type: EVENT_CONDITION,
+                    level: NoticeLevel::Critical,
+                    message: format!("condition `{}` went to Fault", obs.data_item_id),
+                    context: json!({
+                        "instance": self.device.id,
+                        "dataItemId": obs.data_item_id,
+                        "state": "FAULT",
+                        "previousState": known.then(|| condition_state_name(previous)),
+                        "nativeCode": obs.extra("nativeCode"),
+                        "conditionId": obs.extra("conditionId"),
+                        "activeConditions": active,
+                        "timestamp": obs.timestamp,
+                    }),
+                });
             }
         }
+
+        // Pass 2: map everything against the ledgers.
         let mut out = Vec::new();
-        for obs in observations {
+        for (i, obs) in observations.iter().enumerate() {
             for sig in self.signals_for(&obs.data_item_id) {
-                out.push(reading_from_observation(obs, sig, &self.model, &self.conditions));
+                out.push(reading_from_observation(
+                    obs,
+                    sig,
+                    &self.model,
+                    &self.conditions,
+                    snapshots[i].as_ref(),
+                ));
             }
         }
         out
@@ -1275,10 +1392,10 @@ impl DeviceSession for MtcSession {
     async fn read_signals(&mut self) -> Result<Vec<Reading>> {
         self.adopt_current_signals();
         let mut observations = Vec::new();
-        let mut down: Option<String> = None;
         let mut drifted = false;
 
-        while let Ok(event) = self.rx.try_recv() {
+        let events = self.rx.drain();
+        for event in events {
             self.note(&event);
             match event {
                 InstanceEvent::Obs(obs) => observations.push(*obs),
@@ -1289,8 +1406,8 @@ impl DeviceSession for MtcSession {
                     observations.extend(batch);
                 }
                 InstanceEvent::ModelDrift { .. } => drifted = true,
-                InstanceEvent::AgentDown(reason) => down = Some(reason),
-                InstanceEvent::AgentUp(_)
+                InstanceEvent::AgentDown(_)
+                | InstanceEvent::AgentUp(_)
                 | InstanceEvent::DataLoss { .. }
                 | InstanceEvent::StreamDegraded { .. } => {}
             }
@@ -1298,9 +1415,16 @@ impl DeviceSession for MtcSession {
         if drifted {
             self.adopt_current_model();
         }
-        // The agent went away: the supervisor's reconnect ladder owns what happens next.
-        if let Some(reason) = down {
-            return Err(DeviceError::Transient(anyhow::anyhow!("agent unreachable: {reason}")));
+        // ONE connectivity authority, consulted EVERY drain: the shared runtime's own published
+        // state, never a remembered event. A drained `AgentDown` becomes its operator event above,
+        // but it is this check that moves the supervisor — so a session that attached after the
+        // agent went down, or that missed the transition entirely, cannot stay ONLINE against a
+        // runtime that is not delivering.
+        if !self.agent.info().connected {
+            return Err(DeviceError::Transient(anyhow::anyhow!(
+                "agent unreachable: {}",
+                self.agent.last_down_reason()
+            )));
         }
 
         let mut readings = self.map_batch(&observations);
@@ -1337,7 +1461,9 @@ impl DeviceSession for MtcSession {
             .filter(|r| ids.iter().any(|id| id == &r.signal_id))
             .collect();
         readings.extend(
-            self.unbound_readings().into_iter().filter(|r| ids.iter().any(|id| id == &r.signal_id)),
+            self.unbound_readings()
+                .into_iter()
+                .filter(|r| ids.iter().any(|id| id == &r.signal_id)),
         );
         Ok(readings)
     }
@@ -1385,7 +1511,10 @@ impl DeviceSession for MtcSession {
     /// right half, a model drift moves the left — and both change what
     /// [`shaping_policies`](DeviceSession::shaping_policies) says, so both must rebuild the table.
     fn shaping_generation(&self) -> Option<String> {
-        Some(crate::reload::view_generation(&self.model.digest_hex(), &self.generation))
+        Some(crate::reload::view_generation(
+            &self.model.digest_hex(),
+            &self.generation,
+        ))
     }
 
     /// The served set's effective publish policies (HLD §5.3): each served signal's `publish`
@@ -1393,6 +1522,12 @@ impl DeviceSession for MtcSession {
     /// only to a **SAMPLE**-category data item (the documented contract); on any other category —
     /// or a data item the model does not have — it is dropped from the policy, so an EVENT's
     /// state strings and a CONDITION's transitions are never numerically gated.
+    ///
+    /// Each policy also carries where the signal publishes — its effective channel and name, and
+    /// the model's canonical component path — because routing is part of the policy's **identity**
+    /// (D-R16). A reload or a model drift that moves a signal to a new channel/path/name therefore
+    /// flushes its open window with the readings the old route collected, instead of letting one
+    /// update mix two routing generations.
     fn shaping_policies(&self) -> HashMap<String, crate::shaping::PublishPolicy> {
         let mut out = HashMap::new();
         for served in &self.served {
@@ -1406,6 +1541,14 @@ impl DeviceSession for MtcSession {
                 batch_ms: p.batch_ms,
                 latest_only: p.mode == PublishMode::Interval,
                 deadband: if is_sample { p.deadband } else { None },
+                route: crate::shaping::SignalRoute {
+                    channel: sig.channel.clone(),
+                    component_path: self
+                        .model
+                        .component_path_of(&sig.data_item_id)
+                        .map(str::to_string),
+                    name: sig.name.clone(),
+                },
             };
             if !policy.is_trivial() {
                 out.insert(sig.id.clone(), policy);
@@ -1416,6 +1559,18 @@ impl DeviceSession for MtcSession {
 
     fn take_resync(&mut self) -> bool {
         std::mem::take(&mut self.resynced)
+    }
+
+    /// The link half of passive quality: this instance's acquisition is **mediated** by a shared
+    /// agent runtime, so a value can be held long after the link that produced it went quiet. The
+    /// facts come from the one connectivity authority and its liveness clock — never re-derived
+    /// here.
+    fn passive_input(&self) -> Option<crate::staleness::PassiveLink> {
+        Some(crate::staleness::PassiveLink {
+            unreachable: !self.agent.info().connected,
+            liveness_age: self.agent.liveness_age(Instant::now()),
+            liveness_window: self.agent.liveness_window(),
+        })
     }
 
     /// `sb/browse`: the probe tree, paged out of the cached model — so the address space stays
@@ -1474,6 +1629,160 @@ pub fn condition_state_name(state: CondState) -> &'static str {
     }
 }
 
+// =================================================================================================
+// The condition ledger (P1-3): one data item, many concurrent activations
+// =================================================================================================
+
+/// One active condition activation on a data item.
+///
+/// MTConnect's Condition model is **not** one state per data item. A single condition — say a
+/// controller's `system` condition — may be asserted several times concurrently, each activation
+/// identified across its own `Warning`/`Fault`/`Normal` transitions by `conditionId` (or, for
+/// agents that predate it, by `nativeCode`). Collapsing them to a single `(state, code)` slot makes
+/// clearing ONE activation promote the whole signal to GOOD while another Fault is still asserted,
+/// and makes the outcome of a mixed Fault/Warning batch depend on XML document order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Activation {
+    /// `Warning` or `Fault` — a cleared or unavailable activation is not stored, it is removed.
+    pub state: CondState,
+    pub native_code: Option<String>,
+    pub condition_id: Option<String>,
+}
+
+/// The concurrent activations of ONE condition data item.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConditionLedger {
+    /// Keyed by activation identity: `conditionId`, else `nativeCode`, else `""` — the documented
+    /// single-activation fallback for agents that send neither (D-R7). A `BTreeMap` so the
+    /// aggregate is a deterministic function of the SET of activations, never of arrival order.
+    active: BTreeMap<String, Activation>,
+    /// The data item reported `UNAVAILABLE` and nothing has superseded it.
+    unavailable: bool,
+}
+
+/// What one condition data item aggregated to right after one observation was folded into its
+/// ledger: the truth the signal publishes, and how many activations stand behind it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConditionSnapshot {
+    /// The worst state across the concurrent activations.
+    pub state: CondState,
+    /// The worst activation's native code — the alarm an operator is told about.
+    pub native_code: Option<String>,
+    /// How many activations are asserted (0 for a cleared or unavailable data item).
+    pub active: usize,
+}
+
+impl ConditionSnapshot {
+    /// The single-activation view of one observation: what a caller with no ledger can know, and
+    /// exactly the pre-2.x behavior for an agent that sends one condition at a time.
+    #[must_use]
+    pub fn of_observation(obs: &Observation) -> Self {
+        let state = obs.condition_state().unwrap_or(CondState::Unavailable);
+        Self {
+            state,
+            native_code: obs
+                .extra("nativeCode")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            active: usize::from(matches!(state, CondState::Warning | CondState::Fault)),
+        }
+    }
+}
+
+impl ConditionLedger {
+    /// The activation identity of one condition observation: `conditionId` ▷ `nativeCode` ▷ `""`
+    /// (D-R7). The empty key is a real key — it is the single slot an agent that identifies
+    /// nothing gets, which preserves the one-condition-per-data-item behavior exactly.
+    fn activation_key(obs: &Observation) -> String {
+        for key in ["conditionId", "nativeCode"] {
+            if let Some(v) = obs.extra(key).and_then(Value::as_str) {
+                if !v.is_empty() {
+                    return v.to_string();
+                }
+            }
+        }
+        String::new()
+    }
+
+    /// Fold one condition observation in.
+    ///
+    /// * `Warning`/`Fault` → upsert the activation under its identity; the data item is no longer
+    ///   unavailable.
+    /// * `Normal` with a real key → clear **that** activation only; the others stand.
+    /// * `Normal` with no key → the standard's normal sweep: clear ALL activations.
+    /// * `Unavailable` → clear all activations and mark the data item unavailable.
+    ///
+    /// A non-condition observation is ignored.
+    pub fn apply(&mut self, obs: &Observation) {
+        let Some(state) = obs.condition_state() else {
+            return;
+        };
+        let key = Self::activation_key(obs);
+        match state {
+            CondState::Warning | CondState::Fault => {
+                self.unavailable = false;
+                self.active.insert(
+                    key,
+                    Activation {
+                        state,
+                        native_code: obs
+                            .extra("nativeCode")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        condition_id: obs
+                            .extra("conditionId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    },
+                );
+            }
+            CondState::Normal => {
+                self.unavailable = false;
+                if key.is_empty() {
+                    self.active.clear();
+                } else {
+                    self.active.remove(&key);
+                }
+            }
+            CondState::Unavailable => {
+                self.active.clear();
+                self.unavailable = true;
+            }
+        }
+    }
+
+    /// The worst state across the concurrent activations, with that activation's native code.
+    /// `(Normal, None)` when nothing is asserted; `(Unavailable, None)` when the agent reported the
+    /// data item unavailable.
+    #[must_use]
+    pub fn aggregate(&self) -> (CondState, Option<String>) {
+        if let Some(worst) = self.active.values().max_by_key(|a| a.state.severity()) {
+            return (worst.state, worst.native_code.clone());
+        }
+        if self.unavailable {
+            return (CondState::Unavailable, None);
+        }
+        (CondState::Normal, None)
+    }
+
+    /// The aggregate plus the activation count — what one condition sample publishes.
+    #[must_use]
+    pub fn snapshot(&self) -> ConditionSnapshot {
+        let (state, native_code) = self.aggregate();
+        ConditionSnapshot {
+            state,
+            native_code,
+            active: self.active.len(),
+        }
+    }
+
+    /// How many activations are currently asserted.
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.active.len()
+    }
+}
+
 /// Map one observation onto one configured signal.
 ///
 /// * **Samples** publish numbers (or arrays for `TIME_SERIES`/`*_3D`), **Events** their string or
@@ -1484,26 +1793,52 @@ pub fn condition_state_name(state: CondState) -> &'static str {
 ///   native code in `qualityRaw` so an operator sees *which* alarm did it.
 /// * The observation timestamp is the agent's **capture** stamp (→ `serverTs`); `sourceTs` stays
 ///   absent (MTConnect does not distinguish a device-authored time), and the adapter's receive
-///   moment is stamped by the worker.
+///   moment is the observation's own **arrival** stamp, taken when the runtime ingested the
+///   document that carried it (C-6).
 /// * The `sequence` always rides as an extra: exact once-only ordering across reconnects.
+///
+/// `condition` is the ledger snapshot taken right after this observation was folded in, and is what
+/// a CONDITION observation publishes: its **aggregate** value and quality, so clearing one of two
+/// concurrent activations cannot promote the signal to GOOD while the other is still asserted
+/// (D-R8). The observation's own transition survives in the extras (`conditionId`, `nativeCode`,
+/// `conditionText`, …) beside `activeConditions`. `None` means "this observation is the only
+/// activation" — what a caller with no ledger can know, and exactly the single-activation shape.
 #[must_use]
 pub fn reading_from_observation(
     obs: &Observation,
     sig: &SignalConfig,
     model: &ProbeModel,
-    conditions: &HashMap<String, (CondState, Option<String>)>,
+    conditions: &HashMap<String, ConditionLedger>,
+    condition: Option<&ConditionSnapshot>,
 ) -> Reading {
-    let (value, mut quality, mut quality_raw) = match &obs.value {
-        ObsValue::Unavailable => (None, Quality::Bad, QUALITY_UNAVAILABLE.to_string()),
-        ObsValue::Condition(CondState::Unavailable) => {
+    let own;
+    let aggregate = match (obs.condition_state(), condition) {
+        (None, _) => None,
+        (Some(_), Some(snapshot)) => Some(snapshot),
+        (Some(_), None) => {
+            own = ConditionSnapshot::of_observation(obs);
+            Some(&own)
+        }
+    };
+
+    let (value, mut quality, mut quality_raw) = match (&obs.value, aggregate) {
+        (ObsValue::Unavailable, _) => (None, Quality::Bad, QUALITY_UNAVAILABLE.to_string()),
+        // A condition data item the agent reports unavailable publishes an explicit null, exactly
+        // as an unavailable value does — "no state" is not the string "UNAVAILABLE".
+        (ObsValue::Condition(_), Some(agg)) if agg.state == CondState::Unavailable => {
             (None, Quality::Bad, QUALITY_UNAVAILABLE.to_string())
         }
-        ObsValue::Condition(state) => {
-            let native = obs.extra("nativeCode").and_then(Value::as_str);
-            let (q, raw) = condition_quality(*state, native);
+        (ObsValue::Condition(_), Some(agg)) => {
+            let (q, raw) = condition_quality(agg.state, agg.native_code.as_deref());
+            (Some(Value::String(agg.state.as_str().to_string())), q, raw)
+        }
+        (ObsValue::Condition(state), None) => {
+            // Unreachable in practice (a condition observation always has an aggregate above), kept
+            // total rather than panicking on a shape the compiler cannot rule out.
+            let (q, raw) = condition_quality(*state, None);
             (Some(Value::String(state.as_str().to_string())), q, raw)
         }
-        ObsValue::Scalar(v) => (Some(v.clone()), Quality::Good, QUALITY_OK.to_string()),
+        (ObsValue::Scalar(v), _) => (Some(v.clone()), Quality::Good, QUALITY_OK.to_string()),
     };
 
     // A bound condition can only make a reading worse, never better.
@@ -1522,6 +1857,14 @@ pub fn reading_from_observation(
     for (key, value) in &obs.extras {
         extra.insert((*key).to_string(), value.clone());
     }
+    if let Some(agg) = aggregate {
+        // How many activations stand behind the published state — the count that tells a consumer
+        // a still-asserted Fault is why a cleared Warning did not make the signal GOOD (D-R8).
+        extra.insert(
+            "activeConditions".to_string(),
+            Value::from(agg.active as u64),
+        );
+    }
 
     Reading {
         signal_id: sig.id.clone(),
@@ -1536,13 +1879,17 @@ pub fn reading_from_observation(
         // MTConnect has no device-authored time: the agent's stamp is a CAPTURE stamp.
         source_ts: None,
         capture_ts: (!obs.timestamp.is_empty()).then(|| obs.timestamp.clone()),
-        // The worker stamps the receive moment for the whole batch at read completion.
-        received_ts: None,
+        // The ARRIVAL moment, stamped by the runtime when the agent's document was ingested
+        // (C-6) — not the moment this session drained it. `None` only for an observation nobody
+        // stamped, and the worker's read-completion fallback then fills it.
+        received_ts: obs.received.clone(),
         extra: Some(extra),
         channel: sig.channel.clone(),
         // The canonical path, straight from the model that serves `sb/signals` — the derived
         // channel above may be truncated to the topic budget, this never is (L12/L13).
-        component_path: model.component_path_of(&obs.data_item_id).map(str::to_string),
+        component_path: model
+            .component_path_of(&obs.data_item_id)
+            .map(str::to_string),
     }
 }
 
@@ -1563,16 +1910,20 @@ pub fn condition_quality(state: CondState, native_code: Option<&str>) -> (Qualit
 
 /// The worst state among the conditions a signal is bound to (D-MTC-8). `None` when the signal
 /// binds no conditions, or none of them has been observed yet.
+///
+/// Each bound data item contributes its ledger's **aggregate**, so a binding degrades by the whole
+/// concurrent truth: clearing one of two activations on a bound condition leaves the signal
+/// degraded by the other.
 #[must_use]
 pub fn worst_bound_condition(
     sig: &SignalConfig,
-    conditions: &HashMap<String, (CondState, Option<String>)>,
+    conditions: &HashMap<String, ConditionLedger>,
 ) -> Option<(CondState, Option<String>)> {
     sig.condition_bindings()
         .iter()
         .filter_map(|id| conditions.get(id))
+        .map(ConditionLedger::aggregate)
         .max_by_key(|(state, _)| state.severity())
-        .cloned()
 }
 
 fn severity_of(q: Quality) -> u8 {
@@ -1587,14 +1938,30 @@ fn severity_of(q: Quality) -> u8 {
 mod mtconnect_seam_tests {
     use super::*;
     use crate::app::ChannelBudgets;
-    use crate::mtconnect::config::{parse_agents, AgentCredentials};
+    use crate::mtconnect::config::{AgentCredentials, parse_agents};
     use crate::mtconnect::model::Category;
-    use crate::mtconnect::xml::{parse_devices, parse_streams};
+    use crate::mtconnect::xml::{StreamEntry, XmlElem, parse_devices, parse_streams};
+    use crate::mtconnect::{InstanceSender, instance_queue};
     use serde_json::json;
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     const DEVICES_2_7: &str = include_str!("../tests/fixtures/devices_2.7.xml");
     const CURRENT_2_7: &str = include_str!("../tests/fixtures/current_2.7.xml");
+
+    /// A test clock: fixed, so nothing in these tests reads the wall clock.
+    fn clock() -> crate::mtconnect::ClockFn {
+        Arc::new(|| "2026-01-01T00:00:00Z".to_string())
+    }
+
+    /// Bring a runtime up the way production does — by ingesting a document. `connect` and every
+    /// drain consult `info().connected`, so a test that wants a live session must deliver first.
+    async fn deliver(agent: &Arc<AgentRuntime>) {
+        agent
+            .ingest_streams(CURRENT_2_7, false)
+            .await
+            .expect("the fixture parses");
+    }
 
     fn model() -> Arc<ProbeModel> {
         Arc::new(
@@ -1613,13 +1980,68 @@ mod mtconnect_seam_tests {
             .iter()
             .filter_map(|e| {
                 let id = e.elem.attr("dataItemId")?;
-                crate::mtconnect::observations::decode(e, m.item(id))
+                crate::mtconnect::observations::decode(e, m.item(id)).ok()
             })
             .collect()
     }
 
     fn obs(id: &str) -> Observation {
-        observations().into_iter().find(|o| o.data_item_id == id).expect("observation")
+        observations()
+            .into_iter()
+            .find(|o| o.data_item_id == id)
+            .expect("observation")
+    }
+
+    /// One condition transition, built through the real decoder so the activation identity travels
+    /// the way it does in production (element name = state, `conditionId`/`nativeCode` as extras).
+    fn cond(
+        data_item_id: &str,
+        element: &str,
+        condition_id: Option<&str>,
+        native_code: Option<&str>,
+    ) -> Observation {
+        let mut elem = XmlElem {
+            name: element.into(),
+            ..XmlElem::default()
+        };
+        elem.attrs.insert("dataItemId".into(), data_item_id.into());
+        elem.attrs.insert("sequence".into(), "9".into());
+        elem.attrs
+            .insert("timestamp".into(), "2026-07-27T10:00:00Z".into());
+        if let Some(id) = condition_id {
+            elem.attrs.insert("conditionId".into(), id.into());
+        }
+        if let Some(code) = native_code {
+            elem.attrs.insert("nativeCode".into(), code.into());
+        }
+        crate::mtconnect::observations::decode(
+            &StreamEntry {
+                category: Category::Condition,
+                elem,
+                component: None,
+            },
+            None,
+        )
+        .expect("a complete condition observation")
+    }
+
+    /// The ledger a sequence of condition transitions leaves behind.
+    fn ledger_of(transitions: &[Observation]) -> ConditionLedger {
+        let mut ledger = ConditionLedger::default();
+        for obs in transitions {
+            ledger.apply(obs);
+        }
+        ledger
+    }
+
+    /// The ledger map one data item's transitions produce — what a binding degrades against.
+    fn ledgers(
+        data_item_id: &str,
+        transitions: &[Observation],
+    ) -> HashMap<String, ConditionLedger> {
+        let mut map = HashMap::new();
+        map.insert(data_item_id.to_string(), ledger_of(transitions));
+        map
     }
 
     fn signal(id: &str, data_item_id: &str) -> SignalConfig {
@@ -1655,14 +2077,17 @@ mod mtconnect_seam_tests {
             "requestTimeoutMs": 300 }] }))
         .unwrap()
         .remove(0);
-        AgentRuntime::new(cfg, &AgentCredentials::default()).unwrap()
+        AgentRuntime::new(cfg, &AgentCredentials::default(), clock()).unwrap()
     }
 
     fn connection(agent: &str, uuid: &str) -> ConnectionConfig {
         let mut extra = serde_json::Map::new();
         extra.insert("agentId".into(), json!(agent));
         extra.insert("deviceUuid".into(), json!(uuid));
-        ConnectionConfig { endpoint: String::new(), extra }
+        ConnectionConfig {
+            endpoint: String::new(),
+            extra,
+        }
     }
 
     // --- the mapping ------------------------------------------------------------------------
@@ -1674,6 +2099,7 @@ mod mtconnect_seam_tests {
             &signal("x-position", "Xabs"),
             &model(),
             &HashMap::new(),
+            None,
         );
         assert_eq!(r.signal_id, "x-position");
         assert_eq!(r.value, Some(json!(123.456)));
@@ -1681,8 +2107,30 @@ mod mtconnect_seam_tests {
         assert_eq!(r.quality_raw.as_deref(), Some("MTC_OK"));
         // The observation timestamp is the AGENT's capture stamp -> serverTs (crate::app maps it).
         assert_eq!(r.capture_ts.as_deref(), Some("2026-07-27T10:00:04.250000Z"));
-        assert!(r.source_ts.is_none(), "MTConnect distinguishes no device-authored time");
-        assert!(r.received_ts.is_none(), "the worker stamps the receive moment");
+        assert!(
+            r.source_ts.is_none(),
+            "MTConnect distinguishes no device-authored time"
+        );
+        assert!(
+            r.received_ts.is_none(),
+            "nobody stamped this observation's arrival, so the worker's fallback still owns it"
+        );
+        // Stamped at ingest, the ARRIVAL moment travels onto the reading verbatim (C-6): the
+        // drain that produced this reading contributes nothing to it.
+        let arrived = reading_from_observation(
+            &Observation {
+                received: Some("2026-07-27T10:00:04.300000Z".into()),
+                ..obs("Xabs")
+            },
+            &signal("x-position", "Xabs"),
+            &model(),
+            &HashMap::new(),
+            None,
+        );
+        assert_eq!(
+            arrived.received_ts.as_deref(),
+            Some("2026-07-27T10:00:04.300000Z")
+        );
         assert_eq!(r.extra.as_ref().unwrap()["sequence"], json!(37));
         // The label falls back to the agent's own name for the data item.
         assert_eq!(r.name.as_deref(), Some("Xabs"));
@@ -1700,6 +2148,7 @@ mod mtconnect_seam_tests {
             &signal("x-load", "Xload"),
             &model(),
             &HashMap::new(),
+            None,
         );
         assert_eq!(r.value, None, "no value - not a zero, not an empty string");
         assert_eq!(r.quality, Quality::Bad);
@@ -1711,60 +2160,96 @@ mod mtconnect_seam_tests {
 
     #[test]
     fn a_condition_publishes_its_state_as_the_value() {
+        let fault = obs("Xtravel");
+        let snapshot = ledger_of(std::slice::from_ref(&fault)).snapshot();
         let r = reading_from_observation(
-            &obs("Xtravel"),
+            &fault,
             &signal("x-travel", "Xtravel"),
             &model(),
             &HashMap::new(),
+            Some(&snapshot),
         );
         assert_eq!(r.value, Some(json!("FAULT")));
         assert_eq!(r.quality, Quality::Bad);
-        assert_eq!(r.quality_raw.as_deref(), Some("MTC_CONDITION:FAULT:ALM-1041"));
+        assert_eq!(
+            r.quality_raw.as_deref(),
+            Some("MTC_CONDITION:FAULT:ALM-1041")
+        );
         let extra = r.extra.unwrap();
         assert_eq!(extra["nativeCode"], json!("ALM-1041"));
-        assert_eq!(extra["conditionText"], json!("X axis travel limit exceeded"));
+        assert_eq!(
+            extra["conditionText"],
+            json!("X axis travel limit exceeded")
+        );
+        assert_eq!(extra["activeConditions"], json!(1));
 
         // A Normal condition is GOOD, and says which state it is.
+        let normal = obs("logic");
+        let snapshot = ledger_of(std::slice::from_ref(&normal)).snapshot();
         let r = reading_from_observation(
-            &obs("logic"),
+            &normal,
             &signal("logic", "logic"),
             &model(),
             &HashMap::new(),
+            Some(&snapshot),
         );
         assert_eq!(r.value, Some(json!("NORMAL")));
         assert_eq!(r.quality, Quality::Good);
         assert_eq!(r.quality_raw.as_deref(), Some("MTC_OK:NORMAL"));
+        assert_eq!(r.extra.unwrap()["activeConditions"], json!(0));
     }
 
     #[test]
     fn a_bound_condition_degrades_the_signal_it_guards() {
         let mut sig = signal("x-position", "Xabs");
         sig.condition_binding = Some(vec!["Xtravel".into()]);
-        let mut conditions = HashMap::new();
 
         // Nothing observed yet: the value stands on its own.
-        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &conditions);
+        let none = HashMap::new();
+        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &none, None);
         assert_eq!(r.quality, Quality::Good);
 
         // A warning makes the value UNCERTAIN — it is still a value, and the alarm says why.
-        conditions.insert("Xtravel".to_string(), (CondState::Warning, Some("ALM-7".into())));
-        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &conditions);
+        let warned = ledgers(
+            "Xtravel",
+            &[cond("Xtravel", "Warning", None, Some("ALM-7"))],
+        );
+        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &warned, None);
         assert_eq!(r.quality, Quality::Uncertain);
-        assert_eq!(r.quality_raw.as_deref(), Some("MTC_CONDITION:WARNING:ALM-7"));
-        assert_eq!(r.value, Some(json!(123.456)), "a warned value is still published");
+        assert_eq!(
+            r.quality_raw.as_deref(),
+            Some("MTC_CONDITION:WARNING:ALM-7")
+        );
+        assert_eq!(
+            r.value,
+            Some(json!(123.456)),
+            "a warned value is still published"
+        );
 
         // A fault makes it BAD.
-        conditions.insert("Xtravel".to_string(), (CondState::Fault, Some("ALM-1041".into())));
-        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &conditions);
+        let faulted = ledgers(
+            "Xtravel",
+            &[cond("Xtravel", "Fault", None, Some("ALM-1041"))],
+        );
+        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &faulted, None);
         assert_eq!(r.quality, Quality::Bad);
-        assert_eq!(r.quality_raw.as_deref(), Some("MTC_CONDITION:FAULT:ALM-1041"));
+        assert_eq!(
+            r.quality_raw.as_deref(),
+            Some("MTC_CONDITION:FAULT:ALM-1041")
+        );
 
         // An UNAVAILABLE value stays UNAVAILABLE: a binding cannot make a reading look better.
-        let r = reading_from_observation(&obs("Xload"), &{
-            let mut s = signal("x-load", "Xload");
-            s.condition_binding = Some(vec!["Xtravel".into()]);
-            s
-        }, &model(), &conditions);
+        let r = reading_from_observation(
+            &obs("Xload"),
+            &{
+                let mut s = signal("x-load", "Xload");
+                s.condition_binding = Some(vec!["Xtravel".into()]);
+                s
+            },
+            &model(),
+            &faulted,
+            None,
+        );
         assert_eq!(r.quality_raw.as_deref(), Some("UNAVAILABLE"));
 
         // An unbound condition affects only its own signal.
@@ -1772,7 +2257,8 @@ mod mtconnect_seam_tests {
             &obs("Xabs"),
             &signal("x-position", "Xabs"),
             &model(),
-            &conditions,
+            &faulted,
+            None,
         );
         assert_eq!(r.quality, Quality::Good);
     }
@@ -1781,25 +2267,52 @@ mod mtconnect_seam_tests {
     fn the_worst_bound_condition_wins() {
         let mut sig = signal("s", "Xabs");
         sig.condition_binding = Some(vec!["c1".into(), "c2".into(), "c3".into()]);
-        let mut conditions = HashMap::new();
+        let mut conditions: HashMap<String, ConditionLedger> = HashMap::new();
         assert!(worst_bound_condition(&sig, &conditions).is_none());
 
-        conditions.insert("c1".to_string(), (CondState::Normal, None));
-        conditions.insert("c2".to_string(), (CondState::Warning, Some("W".into())));
+        conditions.insert("c1".into(), ledger_of(&[cond("c1", "Normal", None, None)]));
+        conditions.insert(
+            "c2".into(),
+            ledger_of(&[cond("c2", "Warning", None, Some("W"))]),
+        );
         assert_eq!(
             worst_bound_condition(&sig, &conditions),
             Some((CondState::Warning, Some("W".into())))
         );
-        conditions.insert("c3".to_string(), (CondState::Fault, Some("F".into())));
+        conditions.insert(
+            "c3".into(),
+            ledger_of(&[cond("c3", "Fault", None, Some("F"))]),
+        );
         assert_eq!(
             worst_bound_condition(&sig, &conditions),
             Some((CondState::Fault, Some("F".into())))
         );
         // A condition nobody bound is invisible here.
-        conditions.insert("other".to_string(), (CondState::Fault, Some("X".into())));
+        conditions.insert(
+            "other".into(),
+            ledger_of(&[cond("other", "Fault", None, Some("X"))]),
+        );
         assert_eq!(
             worst_bound_condition(&signal("s", "Xabs"), &conditions),
             None
+        );
+
+        // A binding degrades by the bound item's whole CONCURRENT truth, not by its last
+        // transition: clearing one of two activations leaves the other one degrading the signal.
+        conditions.insert(
+            "c2".into(),
+            ledger_of(&[
+                cond("c2", "Fault", Some("a"), Some("F1")),
+                cond("c2", "Warning", Some("b"), Some("W1")),
+                cond("c2", "Normal", Some("a"), None),
+            ]),
+        );
+        let mut one = signal("s", "Xabs");
+        one.condition_binding = Some(vec!["c2".into()]);
+        assert_eq!(
+            worst_bound_condition(&one, &conditions),
+            Some((CondState::Warning, Some("W1".into()))),
+            "the Warning activation is still asserted"
         );
     }
 
@@ -1807,7 +2320,10 @@ mod mtconnect_seam_tests {
     fn condition_quality_names_the_alarm_when_the_agent_gave_one() {
         assert_eq!(
             condition_quality(CondState::Warning, Some("ALM-9")),
-            (Quality::Uncertain, "MTC_CONDITION:WARNING:ALM-9".to_string())
+            (
+                Quality::Uncertain,
+                "MTC_CONDITION:WARNING:ALM-9".to_string()
+            )
         );
         assert_eq!(
             condition_quality(CondState::Warning, None),
@@ -1828,7 +2344,7 @@ mod mtconnect_seam_tests {
     fn several_signals_may_share_one_data_item() {
         let device = device(vec![signal("x-a", "Xabs"), signal("x-b", "Xabs")]);
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let mut session = MtcSession::new(agent, device, model(), rx);
         let readings = session.map_batch(&[obs("Xabs")]);
         assert_eq!(readings.len(), 2);
@@ -1840,7 +2356,7 @@ mod mtconnect_seam_tests {
     fn a_configured_channel_overrides_the_published_signal_path() {
         let mut sig = signal("x-position", "Xabs");
         sig.channel = Some("axes/x".into());
-        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &HashMap::new());
+        let r = reading_from_observation(&obs("Xabs"), &sig, &model(), &HashMap::new(), None);
         assert_eq!(r.channel.as_deref(), Some("axes/x"));
     }
 
@@ -1849,14 +2365,21 @@ mod mtconnect_seam_tests {
         // R1.1 at the seam: the session's served set is the explicit signals merged with the
         // selection-derived half against its cached model.
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let mut session = MtcSession::new(
             agent,
-            selecting(vec![signal("x-position", "Xabs")], serde_json::json!({ "mode": "all" })),
+            selecting(
+                vec![signal("x-position", "Xabs")],
+                serde_json::json!({ "mode": "all" }),
+            ),
             model(),
             rx,
         );
-        assert_eq!(session.served_signals(), Some(14), "1 explicit (merged) + 13 derived");
+        assert_eq!(
+            session.served_signals(),
+            Some(14),
+            "1 explicit (merged) + 13 derived"
+        );
 
         // A derived signal maps a batch onto its derived identity — id and channel included.
         let readings = session.map_batch(&[obs("Sspeed")]);
@@ -1883,9 +2406,11 @@ mod mtconnect_seam_tests {
                 &signal(signal_id, data_item_id),
                 &m,
                 &HashMap::new(),
+                None,
             );
-            let served = m.address_of("line-a-agent", data_item_id).expect("an address")
-                ["componentPath"]
+            let served = m
+                .address_of("line-a-agent", data_item_id)
+                .expect("an address")["componentPath"]
                 .clone();
             assert_eq!(
                 serde_json::Value::from(r.component_path.clone()),
@@ -1902,15 +2427,20 @@ mod mtconnect_seam_tests {
             &signal("availability", "avail"),
             &model(),
             &HashMap::new(),
+            None,
         );
-        assert_eq!(r.component_path.as_deref(), Some(""), "known, and hanging off no component");
+        assert_eq!(
+            r.component_path.as_deref(),
+            Some(""),
+            "known, and hanging off no component"
+        );
     }
 
     #[test]
     fn a_derived_signal_carries_the_untruncated_path_its_channel_was_shortened_from() {
         // L12 shortens the *channel* to the topic budget; the stamped path is never shortened.
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let mut session = MtcSession::new(
             agent,
             selecting(vec![], serde_json::json!({ "mode": "all" })),
@@ -1932,11 +2462,19 @@ mod mtconnect_seam_tests {
         // The permanent-BAD case. `sb/signals` answers `address.componentPath: null` for it
         // (`unlearned_address`), and the reading agrees by carrying `None`.
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
-        let session =
-            MtcSession::new(agent, device(vec![signal("ghost", "no-such-item")]), model(), rx);
+        let (_tx, rx) = instance_queue();
+        let session = MtcSession::new(
+            agent,
+            device(vec![signal("ghost", "no-such-item")]),
+            model(),
+            rx,
+        );
         let unbound = session.unbound_readings();
-        assert_eq!(unbound.len(), 1, "the explicit signal is unbound against this model");
+        assert_eq!(
+            unbound.len(),
+            1,
+            "the explicit signal is unbound against this model"
+        );
         assert_eq!(unbound[0].signal_id, "ghost");
         assert_eq!(unbound[0].quality, Quality::Bad);
         assert_eq!(unbound[0].component_path, None);
@@ -1951,18 +2489,20 @@ mod mtconnect_seam_tests {
     #[test]
     fn shaping_policies_grant_a_deadband_only_to_sample_category_items() {
         let mut sample = signal("x-position", "Xabs"); // SAMPLE in the fixture model
-        sample.publish = Some(serde_json::from_value(json!({ "batchMs": 250, "deadband": 0.5 })).unwrap());
+        sample.publish =
+            Some(serde_json::from_value(json!({ "batchMs": 250, "deadband": 0.5 })).unwrap());
         let mut event = signal("execution", "execution"); // EVENT in the fixture model
         event.publish = Some(serde_json::from_value(json!({ "deadband": 0.5 })).unwrap());
         let mut condition = signal("x-travel", "Xtravel"); // CONDITION in the fixture model
-        condition.publish = Some(serde_json::from_value(json!({ "deadband": 1.0, "batchMs": 100 })).unwrap());
+        condition.publish =
+            Some(serde_json::from_value(json!({ "deadband": 1.0, "batchMs": 100 })).unwrap());
         let mut unbound = signal("ghost", "no-such-item"); // not in the model at all
         unbound.publish =
             Some(serde_json::from_value(json!({ "deadband": 1.0, "batchMs": 50 })).unwrap());
         let plain = signal("x-load", "Xload"); // no publish block: not worth a table entry
 
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let session = MtcSession::new(
             agent,
             device(vec![sample, event, condition, unbound, plain]),
@@ -1981,10 +2521,19 @@ mod mtconnect_seam_tests {
             "an EVENT's deadband is dropped, leaving a trivial policy - no entry"
         );
         let c = &policies["x-travel"];
-        assert_eq!(c.deadband, None, "a CONDITION's states are never numerically gated");
+        assert_eq!(
+            c.deadband, None,
+            "a CONDITION's states are never numerically gated"
+        );
         assert_eq!(c.batch_ms, 100, "but its window still applies");
-        assert_eq!(policies["ghost"].deadband, None, "no model item, no category, no deadband");
-        assert!(!policies.contains_key("x-load"), "the default policy is not worth an entry");
+        assert_eq!(
+            policies["ghost"].deadband, None,
+            "no model item, no category, no deadband"
+        );
+        assert!(
+            !policies.contains_key("x-load"),
+            "the default policy is not worth an entry"
+        );
     }
 
     #[test]
@@ -1993,7 +2542,7 @@ mod mtconnect_seam_tests {
         sig.publish =
             Some(serde_json::from_value(json!({ "mode": "interval", "batchMs": 500 })).unwrap());
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let session = MtcSession::new(agent, device(vec![sig]), model(), rx);
         assert!(session.shaping_policies()["x-position"].latest_only);
     }
@@ -2008,53 +2557,257 @@ mod mtconnect_seam_tests {
             sel.default_publish_mode = PublishMode::Interval;
         }
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
+        let (_tx, rx) = instance_queue();
         let session = MtcSession::new(agent, dev, model(), rx);
         let policies = session.shaping_policies();
-        assert_eq!(policies["xabs"].batch_ms, 250, "derived SAMPLE: the defaults window");
-        assert!(policies["xabs"].latest_only, "derived SAMPLE: the defaults mode");
-        assert_eq!(policies["xabs"].deadband, None, "no derived deadband, ever (L10)");
-        assert!(!policies.contains_key("execution"), "derived EVENT: immediate, no entry");
+        assert_eq!(
+            policies["xabs"].batch_ms, 250,
+            "derived SAMPLE: the defaults window"
+        );
+        assert!(
+            policies["xabs"].latest_only,
+            "derived SAMPLE: the defaults mode"
+        );
+        assert_eq!(
+            policies["xabs"].deadband, None,
+            "no derived deadband, ever (L10)"
+        );
+        assert!(
+            !policies.contains_key("execution"),
+            "derived EVENT: immediate, no entry"
+        );
+    }
+
+    #[test]
+    fn a_compiled_policy_carries_where_the_signal_publishes() {
+        // D-R16: the session knows the route — the served signal's effective channel and name, and
+        // the model's canonical component path — so the policy can carry it and a move can be seen
+        // as the policy change it is.
+        let agent = runtime("http://127.0.0.1:9");
+        let (_tx, rx) = instance_queue();
+        let mut explicit = signal("x-position", "Xabs");
+        explicit.channel = Some("line-a/x-position".into());
+        explicit.name = Some("X position".into());
+        explicit.publish = Some(serde_json::from_value(json!({ "batchMs": 500 })).unwrap());
+        let session = MtcSession::new(agent, device(vec![explicit]), model(), rx);
+
+        assert_eq!(
+            session.shaping_policies()["x-position"].route,
+            crate::shaping::SignalRoute {
+                channel: Some("line-a/x-position".into()),
+                component_path: model().component_path_of("Xabs").map(str::to_string),
+                name: Some("X position".into()),
+            },
+            "the compiled route is the one `publish_shaped` will mint the topic from"
+        );
+    }
+
+    #[test]
+    fn a_route_only_reload_is_a_policy_change_so_the_open_window_flushes() {
+        // P1-8 at the seam. A reload that moves a signal's channel and leaves its batching alone
+        // used to leave the window open, so the readings the old route collected published
+        // together with post-reload ones - one update, two routing generations. The route is part
+        // of the policy identity now, so the swap flushes the old window first.
+        let agent = runtime("http://127.0.0.1:9");
+        let (_tx, rx) = instance_queue();
+        let batched = |channel: &str| {
+            let mut sig = signal("x-position", "Xabs");
+            sig.channel = Some(channel.to_string());
+            sig.publish = Some(serde_json::from_value(json!({ "batchMs": 500 })).unwrap());
+            sig
+        };
+        let mut session = MtcSession::new(
+            Arc::clone(&agent),
+            device(vec![batched("line-a/x-position")]),
+            model(),
+            rx,
+        );
+
+        let mut shaper = crate::shaping::Shaper::new();
+        shaper.set_policies(session.shaping_policies());
+        let start = Instant::now();
+        assert!(
+            shaper
+                .offer(
+                    Reading {
+                        channel: Some("line-a/x-position".into()),
+                        ..Reading::good("x-position", json!(1.0))
+                    },
+                    start
+                )
+                .is_empty(),
+            "buffered under the old route"
+        );
+
+        // The reload: the same window, a new channel.
+        session.device.signals = vec![batched("line-b/x-position")];
+        session.generation = crate::reload::generation_of(
+            &session.device.signals,
+            session.device.selection.as_ref(),
+        );
+        session.recompile();
+
+        let flushed = shaper.set_policies(session.shaping_policies());
+        assert_eq!(flushed.len(), 1, "the moved signal's window flushed");
+        assert_eq!(
+            flushed[0][0].channel.as_deref(),
+            Some("line-a/x-position"),
+            "with its readings, on the route they were captured under"
+        );
+        assert_eq!(shaper.next_deadline(), None, "and the old window is closed");
     }
 
     #[test]
     fn the_shaping_generation_moves_with_the_signal_set_and_the_model() {
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
-        let mut session =
-            MtcSession::new(Arc::clone(&agent), device(vec![signal("x", "Xabs")]), model(), rx);
-        let before = session.shaping_generation().expect("an MTConnect session has a generation");
+        let (_tx, rx) = instance_queue();
+        let mut session = MtcSession::new(
+            Arc::clone(&agent),
+            device(vec![signal("x", "Xabs")]),
+            model(),
+            rx,
+        );
+        let before = session
+            .shaping_generation()
+            .expect("an MTConnect session has a generation");
 
         // A publish-policy edit moves the generation (the reload swap re-arms the shaper).
         let mut edited = signal("x", "Xabs");
         edited.publish = Some(serde_json::from_value(json!({ "batchMs": 100 })).unwrap());
         session.device.signals = vec![edited];
-        session.generation =
-            crate::reload::generation_of(&session.device.signals, session.device.selection.as_ref());
+        session.generation = crate::reload::generation_of(
+            &session.device.signals,
+            session.device.selection.as_ref(),
+        );
         session.recompile();
         let after = session.shaping_generation().unwrap();
         assert_ne!(before, after, "a policy edit is a new shaping generation");
 
         // The generation composes the probe digest too: a model drift recompiles categories.
-        assert!(after.starts_with(&session.model.digest_hex()), "probe digest leads the token");
+        assert!(
+            after.starts_with(&session.model.digest_hex()),
+            "probe digest leads the token"
+        );
+    }
+
+    #[tokio::test]
+    async fn consecutive_ordinary_cycles_never_resync_the_session_but_a_republish_does() {
+        // The F-N1 rule stated directly: `take_resync` is what makes the supervisor re-arm the
+        // deadband, so only a genuine re-baseline may raise it.
+        let agent = runtime("http://127.0.0.1:9");
+        deliver(&agent).await;
+        let handle = agent.attach("OKUMA.123456");
+        let mut session = MtcSession::new(
+            Arc::clone(&agent),
+            device(vec![signal("x", "Xabs")]),
+            model(),
+            handle.rx,
+        );
+
+        agent.ingest_streams(CURRENT_2_7, false).await.unwrap();
+        assert!(!session.read_signals().await.unwrap().is_empty());
+        assert!(
+            !session.take_resync(),
+            "an ordinary cycle is on-change flow, not a re-baseline"
+        );
+
+        let moved = CURRENT_2_7
+            .replace("sequence=\"37\"", "sequence=\"43\"")
+            .replace("123.456", "200.0");
+        agent.ingest_streams(&moved, false).await.unwrap();
+        assert!(!session.read_signals().await.unwrap().is_empty());
+        assert!(!session.take_resync(), "...and neither is the one after it");
+
+        let again = moved.replace("sequence=\"43\"", "sequence=\"44\"");
+        agent.ingest_streams(&again, true).await.unwrap();
+        assert!(!session.read_signals().await.unwrap().is_empty());
+        assert!(
+            session.take_resync(),
+            "a forced republish rebuilds the whole view and says so"
+        );
+    }
+
+    /// One supervisor tick, exactly as `run_polling` does it: drain, re-arm the deadband if the
+    /// drain re-baselined the view, then shape. Returns how many updates reached the wire.
+    async fn supervisor_tick(
+        session: &mut MtcSession,
+        shaper: &mut crate::shaping::Shaper,
+    ) -> usize {
+        let readings = session
+            .read_signals()
+            .await
+            .expect("the agent is delivering");
+        if session.take_resync() {
+            shaper.reset_deadband();
+        }
+        let now = Instant::now();
+        readings
+            .into_iter()
+            .map(|reading| shaper.offer(reading, now).len())
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn the_deadband_survives_between_poll_cycles_because_ordinary_flow_is_not_a_re_baseline()
+    {
+        // F-N1, end to end at the seam. Every ordinary delivery used to arrive as a `Snapshot`,
+        // which marks the session resynced, which makes the supervisor re-arm the deadband on
+        // EVERY tick - so the deadband could never suppress anything across cycles and was inert
+        // in production. Ordinary flow is per observation now, and only a genuine re-baseline says
+        // it is one.
+        let agent = runtime("http://127.0.0.1:9");
+        deliver(&agent).await;
+        let handle = agent.attach("OKUMA.123456");
+        let mut sig = signal("x-position", "Xabs");
+        sig.publish = Some(serde_json::from_value(json!({ "deadband": 0.5 })).unwrap());
+        let mut session =
+            MtcSession::new(Arc::clone(&agent), device(vec![sig]), model(), handle.rx);
+        let mut shaper = crate::shaping::Shaper::new();
+        assert!(shaper.set_policies(session.shaping_policies()).is_empty());
+
+        // Cycle 1: Xabs = 123.456 @ seq 37. The first reading always passes.
+        agent.ingest_streams(CURRENT_2_7, false).await.unwrap();
+        assert_eq!(supervisor_tick(&mut session, &mut shaper).await, 1);
+
+        // Cycle 2: a sub-deadband move (0.1 against a 0.5 band) in the NEXT cycle.
+        let nudged = CURRENT_2_7
+            .replace("sequence=\"37\"", "sequence=\"43\"")
+            .replace("123.456", "123.556");
+        agent.ingest_streams(&nudged, false).await.unwrap();
+        assert_eq!(
+            supervisor_tick(&mut session, &mut shaper).await,
+            0,
+            "a sub-deadband change is suppressed across cycles - the deadband is real"
+        );
+
+        // A genuine re-baseline still re-arms it: the same sub-deadband value republishes.
+        let republished = nudged.replace("sequence=\"43\"", "sequence=\"44\"");
+        agent.ingest_streams(&republished, true).await.unwrap();
+        assert_eq!(
+            supervisor_tick(&mut session, &mut shaper).await,
+            1,
+            "a re-baseline says the whole current view again, deadband or not"
+        );
     }
 
     #[tokio::test]
     async fn a_drained_snapshot_marks_the_session_resynced_once() {
         let agent = runtime("http://127.0.0.1:9");
-        let (tx, rx) = mpsc::channel(8);
-        let mut session =
-            MtcSession::new(agent, device(vec![signal("x", "Xabs")]), model(), rx);
+        deliver(&agent).await;
+        let cancel = CancellationToken::new();
+        let (tx, rx) = instance_queue();
+        let mut session = MtcSession::new(agent, device(vec![signal("x", "Xabs")]), model(), rx);
         assert!(!session.take_resync(), "nothing drained yet");
 
-        tx.send(InstanceEvent::Snapshot(vec![obs("Xabs")])).await.unwrap();
+        tx.send_critical(InstanceEvent::Snapshot(vec![obs("Xabs")]), &cancel)
+            .await;
         let readings = session.read_signals().await.unwrap();
         assert!(!readings.is_empty());
         assert!(session.take_resync(), "the snapshot re-baselined the view");
         assert!(!session.take_resync(), "draining it resets it");
 
         // A plain observation is NOT a resync.
-        tx.send(InstanceEvent::Obs(Box::new(obs("Xabs")))).await.unwrap();
+        tx.send_data(Box::new(obs("Xabs")));
         session.read_signals().await.unwrap();
         assert!(!session.take_resync());
     }
@@ -2071,10 +2824,18 @@ mod mtconnect_seam_tests {
 
         let mut missing = connection("line-a-agent", "X");
         missing.extra.remove("deviceUuid");
-        assert!(connection_binding(&missing).unwrap_err().contains("deviceUuid"));
+        assert!(
+            connection_binding(&missing)
+                .unwrap_err()
+                .contains("deviceUuid")
+        );
 
         let blank = connection("line-a-agent", "   ");
-        assert!(connection_binding(&blank).unwrap_err().contains("must not be empty"));
+        assert!(
+            connection_binding(&blank)
+                .unwrap_err()
+                .contains("must not be empty")
+        );
     }
 
     #[test]
@@ -2096,11 +2857,17 @@ mod mtconnect_seam_tests {
 
     #[tokio::test]
     async fn a_missing_binding_is_a_permanent_configuration_failure() {
-        let backend = MtcBackend::new(HashMap::new(), vec![device(vec![])], ChannelBudgets::default());
+        let backend = MtcBackend::new(
+            HashMap::new(),
+            vec![device(vec![])],
+            ChannelBudgets::default(),
+        );
         // An instance whose connection names nothing.
         let mut bare = connection("line-a-agent", "OKUMA.123456");
         bare.extra.remove("agentId");
-        let Err(e) = backend.connect(&bare).await else { panic!("must fail") };
+        let Err(e) = backend.connect(&bare).await else {
+            panic!("must fail")
+        };
         assert!(!e.is_transient());
 
         // A device that is not configured on that agent.
@@ -2110,10 +2877,16 @@ mod mtconnect_seam_tests {
         assert!(!e.is_transient());
 
         // A device whose agent runtime does not exist.
-        let Err(e) = backend.connect(&connection("line-a-agent", "OKUMA.123456")).await else {
+        let Err(e) = backend
+            .connect(&connection("line-a-agent", "OKUMA.123456"))
+            .await
+        else {
             panic!("must fail")
         };
-        assert!(!e.is_transient(), "an unconfigured agent will not appear by retrying");
+        assert!(
+            !e.is_transient(),
+            "an unconfigured agent will not appear by retrying"
+        );
         assert_eq!(backend.kind(), KIND);
     }
 
@@ -2122,7 +2895,10 @@ mod mtconnect_seam_tests {
         let backend = MtcBackend::new(
             HashMap::new(),
             vec![device(vec![
-                SignalConfig { name: Some("X position".into()), ..signal("x-position", "Xabs") },
+                SignalConfig {
+                    name: Some("X position".into()),
+                    ..signal("x-position", "Xabs")
+                },
                 signal("x-load", "Xload"),
             ])],
             ChannelBudgets::default(),
@@ -2133,35 +2909,53 @@ mod mtconnect_seam_tests {
         assert_eq!(inv[0].name.as_deref(), Some("X position"));
         assert_eq!(inv[1].name, None);
         // An unknown device has no inventory, and asking is not an error.
-        assert!(backend.inventory(&connection("line-a-agent", "NOPE")).is_empty());
+        assert!(
+            backend
+                .inventory(&connection("line-a-agent", "NOPE"))
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn reading_drains_what_the_agent_delivered_and_says_nothing_when_nothing_changed() {
         let agent = runtime("http://127.0.0.1:9");
+        // The agent is delivering before the instance attaches — a device link is only ever opened
+        // behind that gate. (Nothing was attached, so no dedupe floor was recorded.)
+        deliver(&agent).await;
         let handle = agent.attach("OKUMA.123456");
-        let device = device(vec![signal("x-position", "Xabs"), signal("x-load", "Xload")]);
+        let device = device(vec![
+            signal("x-position", "Xabs"),
+            signal("x-load", "Xload"),
+        ]);
         let mut session = MtcSession::new(Arc::clone(&agent), device, model(), handle.rx);
 
-        // Nothing delivered yet: an empty read, not a failure.
+        // Nothing delivered to THIS instance yet: an empty read, not a failure.
         assert!(session.read_signals().await.unwrap().is_empty());
 
-        agent.ingest_streams(CURRENT_2_7, false).unwrap();
+        agent.ingest_streams(CURRENT_2_7, false).await.unwrap();
         let readings = session.read_signals().await.unwrap();
-        assert_eq!(readings.len(), 2, "both configured signals, and nothing else");
-        let x = readings.iter().find(|r| r.signal_id == "x-position").unwrap();
+        assert_eq!(
+            readings.len(),
+            2,
+            "both configured signals, and nothing else"
+        );
+        let x = readings
+            .iter()
+            .find(|r| r.signal_id == "x-position")
+            .unwrap();
         assert_eq!(x.value, Some(json!(123.456)));
         let load = readings.iter().find(|r| r.signal_id == "x-load").unwrap();
         assert_eq!(load.quality, Quality::Bad);
 
         // The same document again publishes nothing: `/current` repeats itself, an update does not.
-        agent.ingest_streams(CURRENT_2_7, false).unwrap();
+        agent.ingest_streams(CURRENT_2_7, false).await.unwrap();
         assert!(session.read_signals().await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn an_unbound_signal_is_reported_bad_every_cycle_rather_than_dropped() {
         let agent = runtime("http://127.0.0.1:9");
+        deliver(&agent).await;
         let handle = agent.attach("OKUMA.123456");
         let device = device(vec![signal("ghost", "NOT-IN-MODEL")]);
         let mut session = MtcSession::new(agent, device, model(), handle.rx);
@@ -2170,7 +2964,10 @@ mod mtconnect_seam_tests {
         assert_eq!(readings.len(), 1);
         assert_eq!(readings[0].signal_id, "ghost");
         assert_eq!(readings[0].quality, Quality::Bad);
-        assert_eq!(readings[0].quality_raw.as_deref(), Some("MTC_NO_SUCH_DATAITEM"));
+        assert_eq!(
+            readings[0].quality_raw.as_deref(),
+            Some("MTC_NO_SUCH_DATAITEM")
+        );
         assert_eq!(readings[0].value, None);
     }
 
@@ -2178,33 +2975,243 @@ mod mtconnect_seam_tests {
     async fn a_lost_agent_is_a_transient_error_so_the_supervisor_reconnects() {
         let agent = runtime("http://127.0.0.1:9");
         let handle = agent.attach("OKUMA.123456");
-        let mut session =
-            MtcSession::new(Arc::clone(&agent), device(vec![signal("x", "Xabs")]), model(), handle.rx);
+        let mut session = MtcSession::new(
+            Arc::clone(&agent),
+            device(vec![signal("x", "Xabs")]),
+            model(),
+            handle.rx,
+        );
 
         // Bring it up, then knock it down.
-        agent.ingest_streams(CURRENT_2_7, false).unwrap();
+        agent.ingest_streams(CURRENT_2_7, false).await.unwrap();
         session.read_signals().await.unwrap();
-        assert!(agent.poll_once().await.is_err(), "the agent is not listening");
+        assert!(
+            agent.poll_once().await.is_err(),
+            "the agent is not listening"
+        );
 
-        let Err(e) = session.read_signals().await else { panic!("a lost agent must surface") };
-        assert!(e.is_transient(), "reconnecting is exactly the right response");
+        let Err(e) = session.read_signals().await else {
+            panic!("a lost agent must surface")
+        };
+        assert!(
+            e.is_transient(),
+            "reconnecting is exactly the right response"
+        );
+        assert!(
+            e.to_string().contains(&agent.last_down_reason()),
+            "the session reports the authority's latched reason: {e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_that_attaches_after_the_agent_died_cannot_report_online() {
+        // The P1-1 scenario at the seam. The agent delivered once, then died; a session created
+        // AFTER the AgentDown transition never saw the broadcast — and used to keep reporting
+        // ONLINE forever, because nothing else ever asked.
+        let agent = runtime("http://127.0.0.1:9");
+        deliver(&agent).await;
+        assert!(
+            agent.poll_once().await.is_err(),
+            "the agent is not listening"
+        );
+        assert!(!agent.info().connected);
+
+        let handle = agent.attach("OKUMA.123456");
+        let mut session = MtcSession::new(
+            Arc::clone(&agent),
+            device(vec![signal("x", "Xabs")]),
+            model(),
+            handle.rx,
+        );
+
+        // (a) The newborn queue was seeded with the current truth, so the operator event still
+        //     fires even though this session missed the transition...
+        let Err(e) = session.read_signals().await else {
+            panic!("a session must never read OK against a runtime that is not delivering")
+        };
+        // (b) ...and the read fails Transient, so the supervisor's reconnect ladder owns it.
+        assert!(e.is_transient(), "{e}");
+        let notices = session.take_notices();
+        assert_eq!(
+            notices.len(),
+            1,
+            "the seeded AgentDown became its event: {notices:?}"
+        );
+        assert_eq!(notices[0].context["state"], json!("down"));
+        assert_eq!(
+            notices[0].context["reason"],
+            json!(agent.last_down_reason())
+        );
+
+        // ...and it stays that way on every subsequent drain, with nothing left in the queue to
+        // remember: the authority is re-consulted, not a remembered event.
+        assert!(
+            session.read_signals().await.is_err(),
+            "stickiness is structurally impossible"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_passive_link_facts_mirror_the_connectivity_authority() {
+        let agent = runtime("http://127.0.0.1:9");
+        let handle = agent.attach("OKUMA.123456");
+        let session = MtcSession::new(Arc::clone(&agent), device(vec![]), model(), handle.rx);
+
+        // Before first contact: unreachable, and no age to judge.
+        let cold = session
+            .passive_input()
+            .expect("an agent-mediated session has link facts");
+        assert!(cold.unreachable);
+        assert_eq!(cold.liveness_age, None);
+        // Poll mode: two missed polls (the config default is 1000 ms).
+        assert_eq!(cold.liveness_window, Duration::from_millis(2_000));
+
+        deliver(&agent).await;
+        let live = session.passive_input().expect("link facts");
+        assert!(!live.unreachable, "the authority says it is delivering");
+        assert!(
+            live.liveness_age
+                .is_some_and(|age| age < Duration::from_secs(1))
+        );
+
+        // The simulator's read IS its liveness: there is nothing for a watchdog to observe.
+        let sim_conn: ConnectionConfig =
+            serde_json::from_value(json!({ "endpoint": "sim://plc-1" })).unwrap();
+        let sim = SimBackend.connect(&sim_conn).await.unwrap();
+        assert!(sim.passive_input().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_delivered_value_stops_reading_good_once_the_agent_stops_vouching_for_it() {
+        // The P1-5 scenario, end to end at the seam: real runtime, real session, real liveness
+        // clock. MTConnect is on-change, so nothing about the DATA changes here — what changes is
+        // whether the agent is still saying the data is current. Without the watchdog, the fleet's
+        // last word on `x-position` would remain the GOOD sample below, forever.
+        let agent = runtime("http://127.0.0.1:9");
+        let handle = agent.attach("OKUMA.123456");
+        let mut session = MtcSession::new(
+            Arc::clone(&agent),
+            device(vec![
+                signal("x-position", "Xabs"),
+                signal("x-load", "Xload"),
+            ]),
+            model(),
+            handle.rx,
+        );
+        deliver(&agent).await;
+
+        // What the tick published, and therefore what the instance is holding.
+        let published = session
+            .read_signals()
+            .await
+            .expect("the agent is delivering");
+        assert_eq!(published.len(), 2);
+        let held = published
+            .iter()
+            .find(|r| r.signal_id == "x-position")
+            .expect("the good one");
+        assert_eq!(held.quality, Quality::Good);
+        assert_eq!(held.value, Some(json!(123.456)));
+
+        let t0 = Instant::now();
+        let mut watchdog = crate::staleness::QualityWatchdog::default();
+        for reading in &published {
+            watchdog.on_published(reading, t0);
+        }
+
+        // The link facts a poll tick reads, but on an instant the test chooses — the authority's
+        // own liveness clock takes `now` as an argument precisely so this needs no sleeping.
+        let link_at = |now: Instant| crate::staleness::PassiveLink {
+            unreachable: !agent.info().connected,
+            liveness_age: agent.liveness_age(now),
+            liveness_window: agent.liveness_window(),
+        };
+        let stale_after = Duration::from_secs(30);
+
+        // Inside the window (two missed polls = 2 s here) nothing moves: an unchanged value under a
+        // live agent is CURRENT, not silent.
+        assert!(watchdog.evaluate(link_at(t0), stale_after, t0).is_empty());
+
+        // One missed poll later the agent has stopped vouching: the held value republishes as
+        // UNCERTAIN, and the UNAVAILABLE one — already BAD with the agent's own reason — does not.
+        let quiet = t0 + Duration::from_secs(5);
+        let stale = watchdog.evaluate(link_at(quiet), stale_after, quiet);
+        assert_eq!(stale.len(), 1, "only the signal that had something to lose");
+        assert_eq!(stale[0].signal_id, "x-position");
+        assert_eq!(stale[0].value, Some(json!(123.456)), "the value is HELD");
+        assert_eq!(stale[0].quality, Quality::Uncertain);
+        let raw = stale[0].quality_raw.clone().expect("a stale marker");
+        let age_ms: u64 = raw
+            .strip_prefix("MTC_STALE:")
+            .expect("MTC_STALE:<ageMs>")
+            .parse()
+            .expect("whole milliseconds");
+        assert!(
+            (5_000..5_500).contains(&age_ms),
+            "the age is the LIVENESS age, from the runtime's own clock: {raw}"
+        );
+        assert_eq!(
+            stale[0].extra.as_ref().unwrap()["sequence"],
+            json!(37),
+            "the synthetic sample still names the observation it describes (D-MTC-6)"
+        );
+        assert_eq!(
+            stale[0].extra.as_ref().unwrap()[crate::staleness::PASSIVE_EXTRA_KEY],
+            json!("stale")
+        );
+
+        // Past `staleSignalSecs` a held value may not stand in at all.
+        let expired = t0 + Duration::from_secs(31);
+        let bad = watchdog.evaluate(link_at(expired), stale_after, expired);
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].quality, Quality::Bad);
+        assert!(
+            bad[0]
+                .quality_raw
+                .as_deref()
+                .is_some_and(|raw| raw.starts_with("MTC_STALE:"))
+        );
+
+        // And when the authority loses the agent outright, the reason names the link. (This is the
+        // verdict the device task publishes on its way out of the poll loop.)
+        assert!(agent.poll_once().await.is_err(), "nothing is listening");
+        assert!(!agent.info().connected);
+        let lost = watchdog.evaluate(link_at(expired), stale_after, expired);
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].quality, Quality::Bad);
+        assert_eq!(
+            lost[0].quality_raw.as_deref(),
+            Some(crate::staleness::QUALITY_AGENT_UNREACHABLE)
+        );
+        assert_eq!(
+            lost[0].extra.as_ref().unwrap()[crate::staleness::PASSIVE_EXTRA_KEY],
+            json!("unreachable")
+        );
     }
 
     // --- protocol notices -> UNS events (HLD §9) ------------------------------------------------
 
-    /// A session fed from a channel the test owns, so every runtime event can be delivered
-    /// deliberately — including the ones a fake agent could not be made to produce on demand.
+    /// A session fed from a queue the test owns, so every runtime event can be delivered
+    /// deliberately — including the ones a fake agent could not be made to produce on demand. The
+    /// runtime is returned too: connectivity is ITS state, never the queue's, so a test that wants
+    /// a successful read has to bring the runtime up.
     fn scripted_session(
         signals: Vec<SignalConfig>,
-    ) -> (MtcSession, mpsc::Sender<InstanceEvent>) {
+    ) -> (MtcSession, InstanceSender, Arc<AgentRuntime>) {
         let agent = runtime("http://127.0.0.1:9");
-        let (tx, rx) = mpsc::channel(32);
-        (MtcSession::new(agent, device(signals), model(), rx), tx)
+        let (tx, rx) = instance_queue();
+        (
+            MtcSession::new(Arc::clone(&agent), device(signals), model(), rx),
+            tx,
+            agent,
+        )
     }
 
     #[tokio::test]
     async fn every_runtime_event_becomes_the_operator_event_it_deserves() {
-        let (mut session, tx) = scripted_session(vec![signal("x", "Xabs")]);
+        let (mut session, tx, agent) = scripted_session(vec![signal("x", "Xabs")]);
+        deliver(&agent).await;
+        let cancel = CancellationToken::new();
 
         let info = Arc::new(crate::mtconnect::AgentInfo {
             agent_id: "line-a-agent".into(),
@@ -2213,15 +3220,28 @@ mod mtconnect_seam_tests {
             agent_version: Some("2.7.0.12".into()),
             ..Default::default()
         });
-        tx.send(InstanceEvent::AgentUp(info)).await.unwrap();
-        tx.send(InstanceEvent::DataLoss { skipped: 12 }).await.unwrap();
-        tx.send(InstanceEvent::ModelDrift { old: "aa".into(), new: "bb".into() }).await.unwrap();
-        tx.send(InstanceEvent::StreamDegraded { failures: 3 }).await.unwrap();
+        tx.send_critical(InstanceEvent::AgentUp(info), &cancel)
+            .await;
+        tx.send_critical(InstanceEvent::DataLoss { skipped: 12 }, &cancel)
+            .await;
+        tx.send_critical(
+            InstanceEvent::ModelDrift {
+                old: "aa".into(),
+                new: "bb".into(),
+            },
+            &cancel,
+        )
+        .await;
+        tx.send_critical(InstanceEvent::StreamDegraded { failures: 3 }, &cancel)
+            .await;
         session.read_signals().await.expect("drain");
 
         let notices = session.take_notices();
         assert_eq!(notices.len(), 4);
-        assert!(session.take_notices().is_empty(), "a drain empties the queue");
+        assert!(
+            session.take_notices().is_empty(),
+            "a drain empties the queue"
+        );
 
         let up = &notices[0];
         assert_eq!(up.event_type, EVENT_AGENT);
@@ -2254,15 +3274,23 @@ mod mtconnect_seam_tests {
         // No notice carries anything that came out of a vault.
         for n in &notices {
             let rendered = n.context.to_string();
-            assert!(!rendered.contains("secret") && !rendered.contains("password"), "{rendered}");
+            assert!(
+                !rendered.contains("secret") && !rendered.contains("password"),
+                "{rendered}"
+            );
         }
     }
 
     #[tokio::test]
     async fn a_lost_agent_still_reports_its_event_even_though_the_read_fails() {
-        let (mut session, tx) = scripted_session(vec![signal("x", "Xabs")]);
-        tx.send(InstanceEvent::AgentDown("connect refused".into())).await.unwrap();
-        assert!(session.read_signals().await.is_err(), "the supervisor must reconnect");
+        let (mut session, tx, _agent) = scripted_session(vec![signal("x", "Xabs")]);
+        let cancel = CancellationToken::new();
+        tx.send_critical(InstanceEvent::AgentDown("connect refused".into()), &cancel)
+            .await;
+        assert!(
+            session.read_signals().await.is_err(),
+            "the supervisor must reconnect"
+        );
 
         let notices = session.take_notices();
         assert_eq!(notices.len(), 1);
@@ -2275,14 +3303,14 @@ mod mtconnect_seam_tests {
     #[test]
     fn only_the_transition_into_fault_raises_a_condition_event_and_at_most_once_a_minute() {
         let agent = runtime("http://127.0.0.1:9");
-        let (_tx, rx) = mpsc::channel(4);
-        let mut session =
-            MtcSession::new(agent, device(vec![signal("x", "Xabs")]), model(), rx);
+        let (_tx, rx) = instance_queue();
+        let mut session = MtcSession::new(agent, device(vec![signal("x", "Xabs")]), model(), rx);
 
         let cond = |state: CondState, seq: u64| Observation {
             data_item_id: "Xtravel".into(),
             sequence: seq,
             timestamp: "2026-07-27T10:00:00Z".into(),
+            received: None,
             name: None,
             value: ObsValue::Condition(state),
             extras: smallvec::smallvec![("nativeCode", json!("ALM-2"))],
@@ -2293,7 +3321,10 @@ mod mtconnect_seam_tests {
 
         let t0 = Instant::now();
         session.map_batch_at(&[cond(CondState::Normal, 1)], t0);
-        assert!(session.take_notices().is_empty(), "a healthy condition is not an event");
+        assert!(
+            session.take_notices().is_empty(),
+            "a healthy condition is not an event"
+        );
 
         session.map_batch_at(&[cond(CondState::Fault, 2)], t0);
         let raised = session.take_notices();
@@ -2307,12 +3338,18 @@ mod mtconnect_seam_tests {
 
         // Still faulted: the state keeps publishing as the signal's value, the EVENT does not repeat.
         session.map_batch_at(&[cond(CondState::Fault, 3)], t0 + Duration::from_secs(1));
-        assert!(session.take_notices().is_empty(), "a still-asserted fault is not a new event");
+        assert!(
+            session.take_notices().is_empty(),
+            "a still-asserted fault is not a new event"
+        );
 
         // A fault that clears and re-latches inside the window is still rate-limited.
         session.map_batch_at(&[cond(CondState::Normal, 4)], t0 + Duration::from_secs(2));
         session.map_batch_at(&[cond(CondState::Fault, 5)], t0 + Duration::from_secs(3));
-        assert!(session.take_notices().is_empty(), "one condition event per data item per minute");
+        assert!(
+            session.take_notices().is_empty(),
+            "one condition event per data item per minute"
+        );
 
         // Past the window, a re-latch is news again.
         session.map_batch_at(&[cond(CondState::Normal, 6)], t0 + Duration::from_secs(61));
@@ -2320,19 +3357,343 @@ mod mtconnect_seam_tests {
         assert_eq!(session.take_notices().len(), 1);
     }
 
+    // --- concurrent condition activations (P1-3) -------------------------------------------------
+
+    /// A session over the CNC model with the given signals — enough to drive `map_batch_at`.
+    fn condition_session(signals: Vec<SignalConfig>) -> (MtcSession, InstanceSender) {
+        let agent = runtime("http://127.0.0.1:9");
+        let (tx, rx) = instance_queue();
+        (MtcSession::new(agent, device(signals), model(), rx), tx)
+    }
+
+    /// The `activeConditions` extra of one reading.
+    fn active_of(r: &Reading) -> Value {
+        r.extra
+            .as_ref()
+            .expect("every reading carries extras")
+            .get("activeConditions")
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    #[test]
+    fn clearing_one_of_two_concurrent_activations_does_not_promote_the_signal_to_good() {
+        // P1-3, the headline case. MTConnect permits several conditions to be asserted on ONE data
+        // item concurrently, each identified across its transitions by `conditionId`. Keying the
+        // session's state by `dataItemId` alone made the LAST transition the whole truth, so
+        // clearing one activation published GOOD while another Fault was still asserted.
+        let (mut session, _tx) = condition_session(vec![signal("x-travel", "Xtravel")]);
+        let t0 = Instant::now();
+
+        let r = session.map_batch_at(&[cond("Xtravel", "Fault", Some("c1"), Some("ALM-1"))], t0);
+        assert_eq!(r[0].value, Some(json!("FAULT")));
+        assert_eq!(r[0].quality, Quality::Bad);
+        assert_eq!(active_of(&r[0]), json!(1));
+
+        // A second, DIFFERENT activation: two conditions now stand on one data item.
+        let r = session.map_batch_at(&[cond("Xtravel", "Warning", Some("c2"), Some("ALM-2"))], t0);
+        assert_eq!(
+            r[0].value,
+            Some(json!("FAULT")),
+            "the aggregate is the worst activation, not this transition"
+        );
+        assert_eq!(r[0].quality, Quality::Bad);
+        assert_eq!(
+            r[0].quality_raw.as_deref(),
+            Some("MTC_CONDITION:FAULT:ALM-1"),
+            "the alarm an operator must act on"
+        );
+        assert_eq!(active_of(&r[0]), json!(2));
+        // The sample still carries its OWN transition, so nothing is lost (D-R8).
+        let extra = r[0].extra.as_ref().unwrap();
+        assert_eq!(extra["conditionId"], json!("c2"));
+        assert_eq!(extra["nativeCode"], json!("ALM-2"));
+
+        // Clear the FAULT. The Warning is still asserted, so the signal is UNCERTAIN — never GOOD.
+        let r = session.map_batch_at(&[cond("Xtravel", "Normal", Some("c1"), None)], t0);
+        assert_eq!(r[0].value, Some(json!("WARNING")));
+        assert_eq!(r[0].quality, Quality::Uncertain);
+        assert_eq!(
+            r[0].quality_raw.as_deref(),
+            Some("MTC_CONDITION:WARNING:ALM-2")
+        );
+        assert_eq!(active_of(&r[0]), json!(1));
+
+        // Clearing the last activation is the recovery.
+        let r = session.map_batch_at(&[cond("Xtravel", "Normal", Some("c2"), None)], t0);
+        assert_eq!(r[0].value, Some(json!("NORMAL")));
+        assert_eq!(r[0].quality, Quality::Good);
+        assert_eq!(r[0].quality_raw.as_deref(), Some("MTC_OK:NORMAL"));
+        assert_eq!(active_of(&r[0]), json!(0));
+    }
+
+    #[test]
+    fn activation_identity_falls_back_to_the_native_code_and_then_to_one_slot() {
+        // D-R7: `conditionId` ▷ `nativeCode` ▷ `""`. An agent that predates `conditionId` still
+        // gets concurrent activations, keyed by the alarm code it does send.
+        let (mut session, _tx) = condition_session(vec![signal("x-travel", "Xtravel")]);
+        let t0 = Instant::now();
+        session.map_batch_at(&[cond("Xtravel", "Fault", None, Some("ALM-1"))], t0);
+        let r = session.map_batch_at(&[cond("Xtravel", "Warning", None, Some("ALM-2"))], t0);
+        assert_eq!(r[0].value, Some(json!("FAULT")));
+        assert_eq!(active_of(&r[0]), json!(2));
+
+        let r = session.map_batch_at(&[cond("Xtravel", "Normal", None, Some("ALM-1"))], t0);
+        assert_eq!(r[0].value, Some(json!("WARNING")), "ALM-2 still stands");
+        let r = session.map_batch_at(&[cond("Xtravel", "Normal", None, Some("ALM-2"))], t0);
+        assert_eq!(r[0].value, Some(json!("NORMAL")));
+
+        // An agent that identifies NOTHING gets exactly one slot — the pre-2.x behavior, preserved
+        // exactly: the newest transition IS the state.
+        let (mut session, _tx) = condition_session(vec![signal("x-travel", "Xtravel")]);
+        session.map_batch_at(&[cond("Xtravel", "Fault", None, None)], t0);
+        let r = session.map_batch_at(&[cond("Xtravel", "Warning", None, None)], t0);
+        assert_eq!(r[0].value, Some(json!("WARNING")));
+        assert_eq!(active_of(&r[0]), json!(1), "one slot, replaced in place");
+    }
+
+    #[test]
+    fn a_mixed_batch_settles_the_same_way_in_either_document_order() {
+        // The order-dependence half of P1-3: with one slot per data item, `[Fault, Warning]` ended
+        // WARNING and `[Warning, Fault]` ended FAULT — the same facts, two answers.
+        let fault = cond("Xtravel", "Fault", Some("c1"), Some("ALM-1"));
+        let warning = cond("Xtravel", "Warning", Some("c2"), Some("ALM-2"));
+        for batch in [
+            vec![fault.clone(), warning.clone()],
+            vec![warning.clone(), fault.clone()],
+        ] {
+            let (mut session, _tx) = condition_session(vec![signal("x-travel", "Xtravel")]);
+            let readings = session.map_batch_at(&batch, Instant::now());
+            assert_eq!(readings.len(), 2, "one reading per observation");
+
+            // The state the data item settles on does not depend on the order they arrived in.
+            assert_eq!(
+                session.conditions["Xtravel"].aggregate(),
+                (CondState::Fault, Some("ALM-1".to_string()))
+            );
+            assert_eq!(session.conditions["Xtravel"].active_count(), 2);
+            let last = readings.last().unwrap();
+            assert_eq!(last.value, Some(json!("FAULT")));
+            assert_eq!(last.quality, Quality::Bad);
+            assert_eq!(active_of(last), json!(2));
+        }
+    }
+
+    #[test]
+    fn a_keyless_normal_is_the_standards_normal_sweep() {
+        // D-R7: a `Normal` that names no activation clears the data item entirely — that is what
+        // the standard's normal sweep means, and a keyed `Normal` must NOT do it.
+        let (mut session, _tx) = condition_session(vec![signal("x-travel", "Xtravel")]);
+        let t0 = Instant::now();
+        session.map_batch_at(
+            &[
+                cond("Xtravel", "Fault", Some("c1"), Some("ALM-1")),
+                cond("Xtravel", "Warning", Some("c2"), Some("ALM-2")),
+            ],
+            t0,
+        );
+        assert_eq!(session.conditions["Xtravel"].active_count(), 2);
+
+        let r = session.map_batch_at(&[cond("Xtravel", "Normal", None, None)], t0);
+        assert_eq!(r[0].value, Some(json!("NORMAL")));
+        assert_eq!(r[0].quality, Quality::Good);
+        assert_eq!(active_of(&r[0]), json!(0), "every activation swept");
+    }
+
+    #[test]
+    fn an_unavailable_condition_clears_every_activation_and_publishes_an_explicit_null() {
+        let (mut session, _tx) = condition_session(vec![signal("x-travel", "Xtravel")]);
+        let t0 = Instant::now();
+        session.map_batch_at(
+            &[
+                cond("Xtravel", "Fault", Some("c1"), Some("ALM-1")),
+                cond("Xtravel", "Warning", Some("c2"), Some("ALM-2")),
+            ],
+            t0,
+        );
+
+        let r = session.map_batch_at(&[cond("Xtravel", "Unavailable", None, None)], t0);
+        assert_eq!(r[0].value, None, "no state is not the string UNAVAILABLE");
+        assert_eq!(r[0].quality, Quality::Bad);
+        assert_eq!(r[0].quality_raw.as_deref(), Some("UNAVAILABLE"));
+        assert_eq!(active_of(&r[0]), json!(0));
+        assert_eq!(
+            session.conditions["Xtravel"].aggregate(),
+            (CondState::Unavailable, None)
+        );
+
+        // A new activation supersedes the unavailability.
+        let r = session.map_batch_at(&[cond("Xtravel", "Warning", Some("c3"), Some("W"))], t0);
+        assert_eq!(r[0].value, Some(json!("WARNING")));
+        assert_eq!(r[0].quality, Quality::Uncertain);
+    }
+
+    #[test]
+    fn a_bound_signal_degrades_by_the_whole_concurrent_truth() {
+        // The `conditionBinding` half of P1-3: a guarded value must see every activation on the
+        // condition it is bound to, so clearing one of two does not un-degrade it.
+        let mut guarded = signal("x-position", "Xabs");
+        guarded.condition_binding = Some(vec!["Xtravel".into()]);
+        let (mut session, _tx) = condition_session(vec![guarded, signal("x-travel", "Xtravel")]);
+        let t0 = Instant::now();
+
+        let readings = session.map_batch_at(
+            &[
+                cond("Xtravel", "Fault", Some("c1"), Some("ALM-1")),
+                cond("Xtravel", "Warning", Some("c2"), Some("ALM-2")),
+                obs("Xabs"),
+            ],
+            t0,
+        );
+        let guarded_reading = readings
+            .iter()
+            .find(|r| r.signal_id == "x-position")
+            .expect("the guarded signal");
+        assert_eq!(guarded_reading.quality, Quality::Bad);
+        assert_eq!(
+            guarded_reading.quality_raw.as_deref(),
+            Some("MTC_CONDITION:FAULT:ALM-1")
+        );
+        assert_eq!(
+            guarded_reading.value,
+            Some(json!(123.456)),
+            "a degraded value is still published"
+        );
+
+        // Clear the Fault only: the Warning still degrades the bound signal to UNCERTAIN.
+        let readings = session.map_batch_at(
+            &[cond("Xtravel", "Normal", Some("c1"), None), obs("Xabs")],
+            t0,
+        );
+        let guarded_reading = readings
+            .iter()
+            .find(|r| r.signal_id == "x-position")
+            .expect("the guarded signal");
+        assert_eq!(
+            guarded_reading.quality,
+            Quality::Uncertain,
+            "one activation cleared, one still asserted"
+        );
+        assert_eq!(
+            guarded_reading.quality_raw.as_deref(),
+            Some("MTC_CONDITION:WARNING:ALM-2")
+        );
+
+        // Clear the last one and the guard is lifted.
+        let readings = session.map_batch_at(
+            &[cond("Xtravel", "Normal", Some("c2"), None), obs("Xabs")],
+            t0,
+        );
+        let guarded_reading = readings
+            .iter()
+            .find(|r| r.signal_id == "x-position")
+            .expect("the guarded signal");
+        assert_eq!(guarded_reading.quality, Quality::Good);
+        assert_eq!(guarded_reading.quality_raw.as_deref(), Some("MTC_OK"));
+    }
+
+    #[test]
+    fn the_condition_event_follows_the_aggregate_and_names_the_activation() {
+        // The event is about the DATA ITEM going into Fault, not about each activation: a second
+        // concurrent Fault is not a new alarm, and clearing one of two is not a recovery.
+        let (mut session, _tx) = condition_session(vec![signal("x-travel", "Xtravel")]);
+        let t0 = Instant::now();
+
+        session.map_batch_at(&[cond("Xtravel", "Fault", Some("c1"), Some("ALM-1"))], t0);
+        let raised = session.take_notices();
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].event_type, EVENT_CONDITION);
+        assert_eq!(raised[0].context["conditionId"], json!("c1"));
+        assert_eq!(raised[0].context["nativeCode"], json!("ALM-1"));
+        assert_eq!(raised[0].context["activeConditions"], json!(1));
+        assert_eq!(
+            raised[0].context["previousState"],
+            json!(null),
+            "never observed before"
+        );
+
+        // A second concurrent Fault, well past the rate-limit window: still not a new alarm,
+        // because the data item was already faulted.
+        session.map_batch_at(
+            &[cond("Xtravel", "Fault", Some("c2"), Some("ALM-2"))],
+            t0 + Duration::from_secs(300),
+        );
+        assert!(
+            session.take_notices().is_empty(),
+            "the aggregate never left Fault"
+        );
+
+        // Clearing one of two is not a recovery either — and re-faulting from a WARNING aggregate
+        // is a genuine new transition into Fault.
+        session.map_batch_at(
+            &[
+                cond("Xtravel", "Normal", Some("c1"), None),
+                cond("Xtravel", "Normal", Some("c2"), None),
+                cond("Xtravel", "Warning", Some("c3"), Some("W")),
+            ],
+            t0 + Duration::from_secs(600),
+        );
+        assert!(session.take_notices().is_empty(), "no fault was entered");
+        session.map_batch_at(
+            &[cond("Xtravel", "Fault", Some("c4"), Some("ALM-9"))],
+            t0 + Duration::from_secs(900),
+        );
+        let raised = session.take_notices();
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].context["previousState"], json!("WARNING"));
+        assert_eq!(raised[0].context["activeConditions"], json!(2));
+    }
+
+    #[test]
+    fn the_ledger_is_a_pure_fold_over_activations() {
+        // The unit-level contract, independent of any session.
+        let mut ledger = ConditionLedger::default();
+        assert_eq!(ledger.aggregate(), (CondState::Normal, None));
+        assert_eq!(ledger.active_count(), 0);
+
+        ledger.apply(&cond("c", "Warning", Some("a"), Some("W1")));
+        ledger.apply(&cond("c", "Fault", Some("b"), Some("F1")));
+        assert_eq!(
+            ledger.aggregate(),
+            (CondState::Fault, Some("F1".to_string()))
+        );
+        assert_eq!(ledger.snapshot().active, 2);
+
+        // An upsert on the SAME identity replaces that activation rather than adding one.
+        ledger.apply(&cond("c", "Warning", Some("b"), Some("W2")));
+        assert_eq!(ledger.active_count(), 2);
+        assert_eq!(
+            ledger.aggregate(),
+            (CondState::Warning, Some("W2".to_string())),
+            "the worst is now a Warning"
+        );
+
+        // A non-condition observation is not the ledger's business.
+        ledger.apply(&obs("Xabs"));
+        assert_eq!(ledger.active_count(), 2);
+
+        // The single-activation view a caller with no ledger falls back to.
+        let single = ConditionSnapshot::of_observation(&cond("c", "Fault", None, Some("F")));
+        assert_eq!(single.state, CondState::Fault);
+        assert_eq!(single.native_code.as_deref(), Some("F"));
+        assert_eq!(single.active, 1);
+        let cleared = ConditionSnapshot::of_observation(&cond("c", "Normal", None, None));
+        assert_eq!(cleared.active, 0);
+    }
+
     #[tokio::test]
     async fn signals_subscribed_counts_what_is_served_not_what_was_configured() {
         // Two signals bind real data items, one binds a data item the device does not have: the
         // gauge must report the two that are really delivered, in stream mode and poll mode alike
         // (the compiled set is what is served; the mode only decides how it arrives).
-        let (session, _tx) = scripted_session(vec![
+        let (session, _tx, _agent) = scripted_session(vec![
             signal("x-position", "Xabs"),
             signal("x-load", "Xload"),
             signal("ghost", "NOT-IN-MODEL"),
         ]);
         assert_eq!(session.served_signals(), Some(2));
 
-        let (empty, _tx) = scripted_session(vec![]);
+        let (empty, _tx, _agent2) = scripted_session(vec![]);
         assert_eq!(empty.served_signals(), Some(0));
 
         // The template simulator compiles nothing, so it keeps the configured inventory size.
@@ -2369,7 +3730,10 @@ mod mtconnect_seam_tests {
 
         let page = session.browse(page.next_cursor, 100).await.unwrap();
         assert_eq!(page.entries[0].id, "mtc:/component/Axes");
-        assert!(page.next_cursor.is_none(), "the last page ends the enumeration");
+        assert!(
+            page.next_cursor.is_none(),
+            "the last page ends the enumeration"
+        );
 
         assert!(matches!(
             session.browse(Some("not-a-number".into()), 10).await,
@@ -2395,7 +3759,10 @@ mod mtconnect_seam_tests {
     struct FakeVault(HashMap<String, String>);
 
     impl edgecommons::credentials::CredentialService for FakeVault {
-        fn get(&self, _name: &str) -> edgecommons::Result<Option<edgecommons::credentials::Secret>> {
+        fn get(
+            &self,
+            _name: &str,
+        ) -> edgecommons::Result<Option<edgecommons::credentials::Secret>> {
             Ok(None)
         }
         fn get_version(
@@ -2438,7 +3805,9 @@ mod mtconnect_seam_tests {
         for (k, v) in extra.as_object().cloned().unwrap_or_default() {
             entry[k] = v;
         }
-        parse_agents(&json!({ "agents": [entry] })).unwrap().remove(0)
+        parse_agents(&json!({ "agents": [entry] }))
+            .unwrap()
+            .remove(0)
     }
 
     #[test]
@@ -2451,7 +3820,10 @@ mod mtconnect_seam_tests {
     fn references_resolve_into_material_the_client_can_use() {
         let vault = FakeVault(HashMap::from([
             ("mtc/agent-pw".to_string(), "s3cret".to_string()),
-            ("mtc/ca".to_string(), "-----BEGIN CERTIFICATE-----".to_string()),
+            (
+                "mtc/ca".to_string(),
+                "-----BEGIN CERTIFICATE-----".to_string(),
+            ),
         ]));
         let cfg = agent_with(json!({
             "auth": { "type": "basic", "username": "reader", "secretRef": "mtc/agent-pw" },
@@ -2490,9 +3862,19 @@ mod mtconnect_seam_tests {
     async fn read_named_of_an_unknown_signal_asks_the_agent_for_nothing() {
         let agent = runtime("http://127.0.0.1:9");
         let handle = agent.attach("OKUMA.123456");
-        let mut session =
-            MtcSession::new(agent, device(vec![signal("x-position", "Xabs")]), model(), handle.rx);
+        let mut session = MtcSession::new(
+            agent,
+            device(vec![signal("x-position", "Xabs")]),
+            model(),
+            handle.rx,
+        );
         // No configured signal matches, so there is nothing to read and no request to make.
-        assert!(session.read_named(&["nope".to_string()]).await.unwrap().is_empty());
+        assert!(
+            session
+                .read_named(&["nope".to_string()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

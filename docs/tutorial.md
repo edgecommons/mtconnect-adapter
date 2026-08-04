@@ -8,7 +8,7 @@ agent's own capability, and seeing a bound condition degrade a signal's quality.
 
 ## 1. Prerequisites
 
-- A Rust toolchain (edition 2021, `rust-version = "1.85"` — matches the `edgecommons` library's MSRV).
+- A Rust toolchain (edition 2024, `rust-version = "1.85"` — matches the `edgecommons` library's MSRV).
 - A local MQTT broker on `localhost:1883` (`docker run -d -p 1883:1883 emqx/emqx`, or
   `docker compose up -d` from this repo's own `compose.yaml`).
 - For the second half: Docker, to run a real MTConnect agent.
@@ -56,7 +56,7 @@ Also try:
 
 ```bash
 mosquitto_sub -t 'ecv1/+/+/+/state' -v      # the keepalive, with per-device connectivity
-mosquitto_sub -t 'ecv1/+/+/+/metric/#' -v   # southbound_health + the two operational families
+mosquitto_sub -t 'ecv1/+/+/+/metric/#' -v   # southbound_health + the operational families
 ```
 
 The `state` keepalive's `instances[]` array carries one entry for `device-1` —
@@ -162,7 +162,9 @@ isolation rule (`tests/isolation.rs`), and the full `sb/*` command surface throu
 `CommandInbox` (`tests/scoped_delivery.rs`) — no network, no broker, no live agent required.
 `tests/agent_integration.rs` additionally drives the real cppagent container from step 7 (probe,
 stream, restart/`instanceId` resync, buffer-wrap recovery) when `EC_MTC_AGENT` is set; it self-skips
-otherwise, so the ordinary gate stays green with no Docker.
+otherwise, so the ordinary gate stays green with no Docker. In a run that is *supposed* to reach the
+live agent, set `EC_REQUIRE_LIVE=1` as well — the self-skip then becomes a hard failure instead of a
+silently green gate.
 
 Next: the [how-to guides](how-to-guides.md) for tuning streaming/polling, binding conditions, and
 deploying; the [reference](reference/) for every option, topic, and metric; the

@@ -107,7 +107,7 @@ running it.
 | `agents[0].streaming: "poll-only"` | This particular agent is read on a fixed cadence, never via a multipart stream — a deliberate, simple choice for this fixture. Omit the key (or set `"prefer"`) to stream instead. |
 | `agents[0].pollIntervalMs` | How often `line-a-agent`'s `/current` is read on the polling path. |
 | `agents[0].heartbeatMs` | The streaming liveness window (unused while this agent is `poll-only`, but validated regardless). |
-| `component.global.healthThresholds.staleSignalSecs` | A signal with no update for longer than this counts toward `southbound_health.staleSignals`. |
+| `component.global.healthThresholds.staleSignalSecs` | A signal with no value update for longer than this counts toward `southbound_health.staleSignals`; it is also how long a held value may stand in for a silent agent before it republishes `BAD`/`MTC_STALE` ([reference/configuration.md](reference/configuration.md)). |
 | `instances[0].connection.agentId` / `.deviceUuid` | Which agent, and which `Device/@uuid` on it, this instance represents. The published endpoint (`mtconnect://127.0.0.1:5000/OKUMA.123456`) is **derived** from these two — never itself configured. |
 | `instances[0].pollIntervalMs` | Per-device override of the drain-and-publish cadence (independent of the agent's own `pollIntervalMs` above). |
 | `signals[].dataItemId` | The MTConnect `DataItem/@id` each signal reads. `x-position`'s value comes from `Xabs`; its quality also reflects `Xtravel`'s condition state (next row). |
@@ -186,7 +186,8 @@ Two devices behind one TLS/authenticated agent, one polling and one streaming:
   `pollIntervalMs` set at the instance level for `skid-1`, which falls back to
   `component.global.defaults.pollIntervalMs`, `5000` by built-in default).
 - **A shorter staleness window** (`staleSignalSecs: 15`) trips `southbound_health.staleSignals` sooner
-  if a device stops updating.
+  if a device stops updating, and expires held values to `BAD`/`MTC_STALE` sooner if the agent goes
+  silent.
 - **`metricEmission.target: "messaging"`** puts `southbound_health` and the operational families on
   the UNS `metric` class instead of a log file, so `mosquitto_sub -t 'ecv1/+/+/+/metric/#' -v` shows
   them directly.

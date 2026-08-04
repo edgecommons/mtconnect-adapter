@@ -17,7 +17,8 @@ and this component consumes it, the way the OPC UA adapter consumes a Kepware se
 ## The device seam, and why the MTConnect client sits below it
 
 [`crate::device::DeviceSession`] is one live connection to one device; [`crate::device::DeviceBackend`]
-opens sessions. Everything above the seam — `src/app.rs`, `src/supervisor.rs`, `src/commands.rs`,
+opens sessions. Everything above the seam — `src/app.rs`, `src/driver.rs`, `src/supervisor.rs`,
+`src/commands.rs`,
 `src/metrics.rs` — is written against the trait pair and calls `read_signals`/`write_signal`/`browse`,
 never a protocol-specific API. Two backends implement it: the built-in `SimBackend` (kept so the
 component runs on a laptop with no agent) and `MtcBackend`, which is a thin adapter over the owned
@@ -41,7 +42,7 @@ rather than opening its own socket. Concretely, two things start:
   lock-free through an `ArcSwap`, read directly by `sb/status` — never a control-channel
   round-trip), one cached `ProbeModel` per attached device uuid, and the one `SequenceState` that
   tracks the agent's `instanceId` and sequence bookkeeping for its whole connection.
-- One `tokio` task per **device** (`run_device` in `src/supervisor.rs`), which does not talk to the
+- One `tokio` task per **device** (`run_device` in `src/driver.rs`), which does not talk to the
   network itself — it drains the `InstanceEvent` queue the agent runtime fans out to it, publishes
   what it reads, and owns that device's own control channel for commands.
 
@@ -49,6 +50,29 @@ This split is what makes "a hundred devices, one agent" cheap and correct: the a
 connection and its stream/poll cycle exist exactly once, no matter how many devices attach to it, and
 one device's failure — a bad `dataItemId`, a paused publish — can never tear down another device's
 session, because they only ever share *read* access to the agent's published state.
+
+## Two delivery lanes: what may be dropped, and what may not
+
+The per-instance queue between the agent runtime and a device task carries two kinds of traffic
+with opposite loss tolerances, so it is two lanes, not one. **Coalescible data** — ordinary
+observations — rides a lane where a full queue coalesces to the latest value per `dataItemId` and,
+past capacity, drops the oldest: for on-change telemetry the newest value *is* the current truth,
+and a slow consumer should cost freshness, not correctness. **Loss-intolerant events** — condition
+observations, agent lifecycle transitions, model drift, data-loss reports, and snapshots — ride a
+reserved lane that data volume can never squeeze: a burst of samples cannot evict the Fault that
+explains them. Only the data lane drops, and every drop is counted and logged — never silent.
+
+The critical lane is bounded too, deliberately: past its capacity the sender waits a bounded few
+seconds and then drops-and-counts rather than blocking forever, because the shared publish path is
+the one coupling every device task has in common — an unbounded wait against a dead broker would
+freeze all acquisition indefinitely while the waiting events could not be published anyway.
+Real consumer lag backpressures properly inside the bound; only a genuinely wedged consumer is cut
+loose, loudly.
+
+Ordinary flow is delivered **per observation**; a snapshot means a genuine re-baseline (connect,
+resync, resume). The distinction is what makes `publish.deadband` meaningful: the deadband anchor
+survives across cycles and only re-arms on a true re-baseline, so a noisy signal is suppressed
+across polls, not merely within one.
 
 ## Streaming, polling, and the resync ladder
 
@@ -71,16 +95,36 @@ client:
    data-loss event.
 3. **The agent's `instanceId` changes.** This means the agent itself restarted — its sequence
    numbering has reset from zero, and its device model *might* have changed too (a configuration
-   reload, a different Devices.xml). The client re-probes every device attached to that agent,
-   compares the new probe's content digest against the cached one, and only if it actually changed
-   does it surface a model-drift event and recompile which signals bind — a data item that
-   disappeared publishes as a permanent `BAD`/`MTC_NO_SUCH_DATAITEM` rather than being silently
-   dropped or remapped to something else. Either way, acquisition then resumes with a fresh snapshot.
+   reload, a different Devices.xml). **Nothing from the restarted agent's document is published**
+   until the client has re-probed every device attached to that agent and recompiled the signal
+   sets — publishing first would route observations through a model the restart may have
+   invalidated. The re-probe compares the new content digest against the cached one, and only if it
+   actually changed does it surface a model-drift event — a data item that disappeared publishes as
+   a permanent `BAD`/`MTC_NO_SUCH_DATAITEM` rather than being silently dropped or remapped to
+   something else. A probe that fails during this recovery fails the whole cycle rather than
+   letting stale bindings serve new data. Acquisition then resumes with a fresh snapshot, which
+   republishes everything as current.
 
 Deduplication is **per data item**, not one global counter: `SequenceState` tracks the last-published
 sequence number for each `dataItemId` independently, because a `/current` snapshot taken to recover
 from step 2 or 3 overlaps the stream's own window, and a single global floor would let one data
 item's higher sequence number silently suppress a different, still-unpublished, lower-sequence item.
+
+Two accounting rules keep the ladder honest. **Only ladder-1 exits mark the agent down** — a missed
+heartbeat, a lost transport, malformed framing, or a closed stream mean the agent stopped
+delivering, while the documents that trigger steps 2 and 3 prove the agent alive (their recovery
+I/O marks down by itself if it fails), so a buffer wrap against a healthy agent never emits a false
+down/up pair. And **a stream only counts as established once it has delivered a first liveness
+part**: one that opens and immediately ends counts as an establish failure and waits out the
+backoff, so a flapping agent cannot trap acquisition in a tight open/close loop. After three
+consecutive establish failures, acquisition degrades to `/current` polling — announced as an
+`MtconnectAgentEvent` (`state: "degraded"`) — and keeps retrying the stream on the reconnect
+backoff.
+
+A reachable agent can still be useless: an HTTP-200 `MTConnectErrors` answer to `/current` surfaces
+on `sb/read` as `MTC_AGENT_ERROR:<code>`, refreshes no liveness, and the **third consecutive**
+erroring poll cycle marks the agent down — reachable-but-erroring degrades through staleness first
+and connectivity second, in that order.
 
 ## The probe model and `sb/browse`
 
@@ -169,15 +213,38 @@ into a *different* signal's quality without touching its value — `Warning` deg
 `UNCERTAIN`, `Fault` to `BAD`, and when more than one bound condition is active the worst one always
 wins.
 
-## Metrics: one canonical floor, two worked families
+Condition state itself is kept per **activation**, not per data item: one condition may be asserted
+several times concurrently, and what publishes — as the condition signal's value and through every
+binding — is the aggregate across the set of activations. That is why clearing one of two faults
+does not promote anything to `GOOD`, and why the outcome of a mixed batch cannot depend on the
+order the agent wrote the XML. The details and the extras that ride along (`conditionId`,
+`activeConditions`) are in [reference/data-types.md](reference/data-types.md#conditions-state-as-value-and-as-a-quality-modifier).
+
+## Passive quality: a silent agent cannot leave GOOD values behind
+
+MTConnect is on-change, so a value's own age proves nothing — an unchanged reading under a live
+agent is simply a machine that is not moving. What a consumer must never be left with is a `GOOD`
+value whose agent has stopped vouching for it. The adapter therefore judges held values against the
+**liveness clock** — time since the agent last delivered a Streams document or answered a
+`/current` — and republishes them with degraded verdicts as that clock crosses thresholds:
+`UNCERTAIN` past one missed heartbeat or two missed polls, `BAD` past
+`healthThresholds.staleSignalSecs`, `BAD` immediately when the connectivity authority says the link
+is gone, and a verbatim restoration of the held verdict when liveness returns. Each synthetic
+reading carries a `passive` marker so it can never be mistaken for agent data, and the transitions
+bypass batch windows — quality motion is news. The full ladder and its tokens
+(`MTC_STALE:<ageMs>`, `MTC_AGENT_UNREACHABLE`) are specified in
+[reference/data-types.md](reference/data-types.md#passive-quality--held-values-under-a-silent-agent).
+
+## Metrics: one canonical floor, the worked families on top
 
 Every adapter — whatever the protocol — emits `southbound_health` with the **exact** canonical
 measure set (`connectionState`, `publishLatencyMs`, `pollLatencyMs`, `readErrors`, `staleSignals`,
 `reconnects`, `writeErrors`, `signalsSubscribed`), so a fleet dashboard has one health metric that
 means the same thing everywhere; `writeErrors` is structurally always `0` here, since there is no
 device write path, and stays only for cross-adapter dashboard uniformity. On top of that floor,
-`src/metrics.rs` ships the connect/reconnect lifecycle (`MtconnectAdapterConnection`) and the `sb/*`
-command surface (`MtconnectAdapterCommand`), plus three MTConnect-specific families (HLD §9):
+`src/metrics.rs` ships the connect/reconnect lifecycle (`MtconnectAdapterConnection`), the `sb/*`
+command surface (`MtconnectAdapterCommand`), and the publish-shaping engine's activity
+(`MtconnectAdapterShaping`), plus three MTConnect-specific families (HLD §9):
 `MtconnectStream` and `MtconnectProbe`, each emitted **once per configured agent** rather than once
 per device (an agent's own connection and document flow exist exactly once no matter how many
 devices attach to it), and `MtconnectParse`, emitted per device instance. See
@@ -194,6 +261,25 @@ and a console that asks `sb/status` cannot get different answers, because there 
 The `connected` field is the **normalized** flag every console renders a health dot from; `state` is
 this adapter's own richer vocabulary (`CONNECTING` / `ONLINE` / `BACKOFF`, and `PAUSED` when paused
 while online) — a boolean alone cannot distinguish "still trying" from "administratively paused".
+
+Behind both surfaces sits **one connectivity authority**: the agent runtime's own connected flag,
+written only by the acquisition path when it ingests documents or marks the agent down. An
+`mtconnect`-adapter instance reports `CONNECTING` (or `BACKOFF`) — not `ONLINE` — until the shared
+acquisition has ingested its first Streams document, because a cached probe model proves the agent
+answered once, not that it is delivering now. `sb/status`, the keepalive's `instances[]`, and the
+`device-connected` event all mirror that one flag; nothing above the runtime re-derives liveness
+from its own bookkeeping, so the surfaces cannot disagree. A command-path snapshot that succeeds
+refreshes the liveness clock — the agent vouched for currency — but never flips `connected` on its
+own.
+
+## Lifecycle: shutdown is structured and bounded
+
+Stopping the component is a staged drain, not an abort: device tasks flush their open shaping
+windows, publish, and detach first; then the agent runtimes and the metric tickers stop; then the
+final metric flush runs. Each stage has its own budget (6 s + 4 s + 2 s — 12 s worst case), every
+spawned task's handle is joined under it, and whatever overruns is aborted **and named** in the
+log, so a wedged task is a diagnosis rather than a hang. A clean stop is not an incident: it raises
+no `device-unreachable` event and counts no reconnect.
 
 ## Command routing, and why nothing is writable
 
@@ -214,3 +300,10 @@ advertised through command availability (`unsupported`) so a console never rende
 `writes.allow` is pinned to the empty array by the configuration schema, so no configuration can
 disagree with the protocol. There is no `sb/discover` either — the address space is read from the
 cached probe model above, never mutated.
+
+## Appendix — revision history
+
+| Date | Change |
+|---|---|
+| 2026-08-03 | The delivery-lanes, connectivity-authority, passive-quality, and bounded-shutdown models; resync-before-publish, mark-down scope, and establish-failure accounting in the ladder; condition-activation aggregation. |
+| 2026-07-28 | Initial version. |

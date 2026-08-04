@@ -16,14 +16,15 @@ use std::time::Duration;
 
 use edgecommons::messaging::{Message, MessageBuilder};
 use mtconnect_adapter::app::{build_sample, stamp_component_path};
-use mtconnect_adapter::device::{
-    ConnectionConfig, DeviceBackend, MtcBackend, Quality, Reading,
-};
-use mtconnect_adapter::mtconnect::config::{parse_agents, AgentCredentials, DeviceConfig, SignalConfig};
+use mtconnect_adapter::device::{ConnectionConfig, DeviceBackend, MtcBackend, Quality, Reading};
 use mtconnect_adapter::mtconnect::AgentRuntime;
+use mtconnect_adapter::mtconnect::config::{
+    AgentCredentials, DeviceConfig, SignalConfig, parse_agents,
+};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 const PROBE: &str = include_str!("fixtures/devices_2.7.xml");
 const CURRENT: &str = include_str!("fixtures/current_2.7.xml");
@@ -53,7 +54,9 @@ impl FakeAgent {
         let seen = Arc::clone(&requests);
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 let docs = Arc::clone(&docs);
                 let seen = Arc::clone(&seen);
                 tokio::spawn(async move {
@@ -84,7 +87,11 @@ impl FakeAgent {
             }
         });
 
-        Self { addr, documents, requests }
+        Self {
+            addr,
+            documents,
+            requests,
+        }
     }
 
     fn url(&self) -> String {
@@ -96,7 +103,12 @@ impl FakeAgent {
     }
 
     fn request_count(&self, endpoint: &str) -> usize {
-        self.requests.lock().unwrap().iter().filter(|p| p.starts_with(endpoint)).count()
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with(endpoint))
+            .count()
     }
 }
 
@@ -132,7 +144,11 @@ fn connection() -> ConnectionConfig {
 
 /// A runtime pointed at the fake agent, with the configured devices bound to it.
 fn wire(agent: &FakeAgent, devices: Vec<DeviceConfig>) -> (Arc<AgentRuntime>, MtcBackend) {
-    wire_with(agent, devices, mtconnect_adapter::app::ChannelBudgets::default())
+    wire_with(
+        agent,
+        devices,
+        mtconnect_adapter::app::ChannelBudgets::default(),
+    )
 }
 
 /// [`wire`] with explicit per-instance UNS channel budgets — what shapes a deep path's channel.
@@ -150,7 +166,12 @@ fn wire_with(
     }] }))
     .unwrap()
     .remove(0);
-    let runtime = AgentRuntime::new(cfg, &AgentCredentials::default()).unwrap();
+    let runtime = AgentRuntime::new(
+        cfg,
+        &AgentCredentials::default(),
+        Arc::new(|| "2026-01-01T00:00:00Z".to_string()),
+    )
+    .unwrap();
     let backend = MtcBackend::new(
         HashMap::from([("line-a-agent".to_string(), Arc::clone(&runtime))]),
         devices,
@@ -160,7 +181,25 @@ fn wire_with(
 }
 
 fn reading<'a>(readings: &'a [Reading], id: &str) -> &'a Reading {
-    readings.iter().find(|r| r.signal_id == id).unwrap_or_else(|| panic!("no reading `{id}`"))
+    readings
+        .iter()
+        .find(|r| r.signal_id == id)
+        .unwrap_or_else(|| panic!("no reading `{id}`"))
+}
+
+/// Bring the shared runtime up before an instance connects.
+///
+/// A device link is only ever opened behind the connectivity gate: `connect` refuses until the
+/// agent runtime is **delivering** (D-R1), because a cached probe model is not liveness. Production
+/// gets there through the acquisition task's first successful cycle; a test that drives acquisition
+/// by hand says so here. Nothing is attached yet, so no dedupe floor is recorded and the first
+/// post-connect cycle still publishes everything.
+async fn deliver(runtime: &Arc<AgentRuntime>) {
+    runtime
+        .snapshot_cycle(false)
+        .await
+        .expect("the fake agent answers /current");
+    assert!(runtime.info().connected);
 }
 
 #[tokio::test]
@@ -180,13 +219,22 @@ async fn a_configured_device_probes_polls_and_publishes_its_signals() {
     );
 
     // Connecting verifies the device is really in the agent's probe.
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
-    assert_eq!(agent.request_count("/probe"), 1, "the model is fetched once and cached");
+    assert_eq!(
+        agent.request_count("/probe"),
+        1,
+        "the model is fetched once and cached"
+    );
 
     // One acquisition cycle, then the instance drains what arrived.
     runtime.poll_once().await.expect("poll");
     let readings = session.read_signals().await.expect("read");
-    assert_eq!(readings.len(), 7, "every configured signal that the agent reported");
+    assert_eq!(
+        readings.len(),
+        7,
+        "every configured signal that the agent reported"
+    );
 
     // --- a Sample: value, quality, the agent's capture stamp, and the sequence extra ---
     let x = reading(&readings, "x-position");
@@ -194,15 +242,25 @@ async fn a_configured_device_probes_polls_and_publishes_its_signals() {
     assert_eq!(x.quality, Quality::Good);
     assert_eq!(x.quality_raw.as_deref(), Some("MTC_OK"));
     assert_eq!(x.capture_ts.as_deref(), Some("2026-07-27T10:00:04.250000Z"));
-    assert!(x.source_ts.is_none(), "MTConnect has no device-authored time");
+    assert!(
+        x.source_ts.is_none(),
+        "MTConnect has no device-authored time"
+    );
     assert_eq!(x.extra.as_ref().unwrap()["sequence"], json!(37));
 
     // ... and the published sample maps capture -> serverTs, with the extras riding along.
     let sample = build_sample(x);
-    assert_eq!(sample.server_ts.as_deref(), Some("2026-07-27T10:00:04.250000Z"));
+    assert_eq!(
+        sample.server_ts.as_deref(),
+        Some("2026-07-27T10:00:04.250000Z")
+    );
     assert_eq!(sample.value, Some(json!(123.456)));
     let extra = sample.extra.expect("extras");
-    assert_eq!(extra["sequence"], json!(37), "exact once-only ordering, on every sample");
+    assert_eq!(
+        extra["sequence"],
+        json!(37),
+        "exact once-only ordering, on every sample"
+    );
 
     // --- UNAVAILABLE: an explicit null with BAD quality, never a zero ---
     let load = reading(&readings, "x-load");
@@ -215,7 +273,10 @@ async fn a_configured_device_probes_polls_and_publishes_its_signals() {
 
     // --- an Event stays verbatim; a vector sample becomes an array; a data set an object ---
     assert_eq!(reading(&readings, "execution").value, Some(json!("ACTIVE")));
-    assert_eq!(reading(&readings, "path-position").value, Some(json!([10.5, 20.25, 30])));
+    assert_eq!(
+        reading(&readings, "path-position").value,
+        Some(json!([10.5, 20.25, 30]))
+    );
     assert_eq!(
         reading(&readings, "tool-offsets").value,
         Some(json!({ "T1": 12.5, "T2": 7.25 }))
@@ -225,7 +286,10 @@ async fn a_configured_device_probes_polls_and_publishes_its_signals() {
     let cond = reading(&readings, "x-travel-condition");
     assert_eq!(cond.value, Some(json!("FAULT")));
     assert_eq!(cond.quality, Quality::Bad);
-    assert_eq!(cond.quality_raw.as_deref(), Some("MTC_CONDITION:FAULT:ALM-1041"));
+    assert_eq!(
+        cond.quality_raw.as_deref(),
+        Some("MTC_CONDITION:FAULT:ALM-1041")
+    );
 
     // --- per-sample extras the agent sent ---
     let spindle = reading(&readings, "spindle-speed");
@@ -243,21 +307,30 @@ async fn a_bound_condition_degrades_the_value_it_guards() {
     guarded.condition_binding = Some(vec!["Xtravel".into()]);
     let (runtime, backend) = wire(&agent, vec![device(vec![guarded])]);
 
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     runtime.poll_once().await.expect("poll");
     let readings = session.read_signals().await.expect("read");
 
     // The fixture's X axis is in Fault, so the position it guards is BAD — with the alarm named.
     let x = reading(&readings, "x-position");
-    assert_eq!(x.value, Some(json!(123.456)), "the value is still published");
+    assert_eq!(
+        x.value,
+        Some(json!(123.456)),
+        "the value is still published"
+    );
     assert_eq!(x.quality, Quality::Bad);
-    assert_eq!(x.quality_raw.as_deref(), Some("MTC_CONDITION:FAULT:ALM-1041"));
+    assert_eq!(
+        x.quality_raw.as_deref(),
+        Some("MTC_CONDITION:FAULT:ALM-1041")
+    );
 }
 
 #[tokio::test]
 async fn only_changed_observations_are_published_and_a_new_one_is() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     runtime.poll_once().await.unwrap();
@@ -270,15 +343,19 @@ async fn only_changed_observations_are_published_and_a_new_one_is() {
     // The machine moved: a new sequence, a new value, and it is published.
     agent.set(
         "current",
-        CURRENT
-            .replace(r#"sequence="37" timestamp="2026-07-27T10:00:04.250000Z">123.456"#,
-                     r#"sequence="45" timestamp="2026-07-27T10:00:09.750000Z">200.5"#),
+        CURRENT.replace(
+            r#"sequence="37" timestamp="2026-07-27T10:00:04.250000Z">123.456"#,
+            r#"sequence="45" timestamp="2026-07-27T10:00:09.750000Z">200.5"#,
+        ),
     );
     runtime.poll_once().await.unwrap();
     let readings = session.read_signals().await.unwrap();
     assert_eq!(readings.len(), 1);
     assert_eq!(readings[0].value, Some(json!(200.5)));
-    assert_eq!(readings[0].capture_ts.as_deref(), Some("2026-07-27T10:00:09.750000Z"));
+    assert_eq!(
+        readings[0].capture_ts.as_deref(),
+        Some("2026-07-27T10:00:09.750000Z")
+    );
     assert_eq!(readings[0].extra.as_ref().unwrap()["sequence"], json!(45));
 }
 
@@ -286,11 +363,17 @@ async fn only_changed_observations_are_published_and_a_new_one_is() {
 async fn the_acquisition_task_polls_on_its_own_cadence() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     // The shared task drives acquisition; the instance only drains its queue.
-    runtime.spawn().expect("the acquisition task starts once");
-    assert!(runtime.spawn().is_none(), "a second start is a no-op");
+    runtime
+        .spawn(CancellationToken::new())
+        .expect("the acquisition task starts once");
+    assert!(
+        runtime.spawn(CancellationToken::new()).is_none(),
+        "a second start is a no-op"
+    );
 
     let mut readings = Vec::new();
     for _ in 0..50 {
@@ -300,7 +383,11 @@ async fn the_acquisition_task_polls_on_its_own_cadence() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(readings.len(), 1, "the task polled and delivered without being asked");
+    assert_eq!(
+        readings.len(),
+        1,
+        "the task polled and delivered without being asked"
+    );
     assert_eq!(readings[0].value, Some(json!(123.456)));
     assert!(agent.request_count("/current") >= 1);
 
@@ -312,7 +399,11 @@ async fn the_acquisition_task_polls_on_its_own_cadence() {
     assert_eq!(info.next_sequence, Some(42));
     assert_eq!(info.agent_version.as_deref(), Some("2.7.0.12"));
     assert_eq!(info.standard_version.as_deref(), Some("2.7"));
-    assert_eq!(info.probe_digests.len(), 1, "the device's probe digest is published");
+    assert_eq!(
+        info.probe_digests.len(),
+        1,
+        "the device's probe digest is published"
+    );
 
     runtime.shutdown().await;
 }
@@ -320,36 +411,56 @@ async fn the_acquisition_task_polls_on_its_own_cadence() {
 #[tokio::test]
 async fn a_read_is_always_live_and_never_deduplicated() {
     let agent = FakeAgent::start().await;
-    let (runtime, backend) = wire(&agent, vec![device(vec![
-        signal("x-position", "Xabs"),
-        signal("x-load", "Xload"),
-    ])]);
+    let (runtime, backend) = wire(
+        &agent,
+        vec![device(vec![
+            signal("x-position", "Xabs"),
+            signal("x-load", "Xload"),
+        ])],
+    );
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     // Drain the poll path first, so a deduplicating read would answer with nothing.
     runtime.poll_once().await.unwrap();
     session.read_signals().await.unwrap();
 
-    let readings = session.read_named(&["x-position".to_string()]).await.expect("read");
+    let readings = session
+        .read_named(&["x-position".to_string()])
+        .await
+        .expect("read");
     assert_eq!(readings.len(), 1, "only what was asked for");
     assert_eq!(readings[0].signal_id, "x-position");
-    assert_eq!(readings[0].value, Some(json!(123.456)), "a read answers with what the agent has");
+    assert_eq!(
+        readings[0].value,
+        Some(json!(123.456)),
+        "a read answers with what the agent has"
+    );
 }
 
 #[tokio::test]
 async fn a_device_that_is_not_in_the_probe_is_a_permanent_failure() {
     let agent = FakeAgent::start().await;
-    let (_runtime, backend) = wire(
+    let (runtime, backend) = wire(
         &agent,
-        vec![DeviceConfig { device_uuid: "GHOST.1".into(), ..device(vec![]) }],
+        vec![DeviceConfig {
+            device_uuid: "GHOST.1".into(),
+            ..device(vec![])
+        }],
     );
     let cfg: ConnectionConfig = serde_json::from_value(json!({
         "agentId": "line-a-agent", "deviceUuid": "GHOST.1"
     }))
     .unwrap();
 
-    let Err(e) = backend.connect(&cfg).await else { panic!("a device that is not there must fail") };
-    assert!(!e.is_transient(), "a uuid the agent does not serve will not appear by retrying");
+    deliver(&runtime).await;
+    let Err(e) = backend.connect(&cfg).await else {
+        panic!("a device that is not there must fail")
+    };
+    assert!(
+        !e.is_transient(),
+        "a uuid the agent does not serve will not appear by retrying"
+    );
     assert!(e.to_string().contains("GHOST.1"));
 }
 
@@ -357,6 +468,7 @@ async fn a_device_that_is_not_in_the_probe_is_a_permanent_failure() {
 async fn an_agent_that_stops_answering_surfaces_as_a_transient_failure() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     runtime.poll_once().await.unwrap();
     session.read_signals().await.unwrap();
@@ -365,15 +477,72 @@ async fn an_agent_that_stops_answering_surfaces_as_a_transient_failure() {
     agent.documents.lock().unwrap().remove("current");
     assert!(runtime.poll_once().await.is_err());
 
-    let Err(e) = session.read_signals().await else { panic!("the lost agent must surface") };
-    assert!(e.is_transient(), "the supervisor reconnects rather than giving up");
+    let Err(e) = session.read_signals().await else {
+        panic!("the lost agent must surface")
+    };
+    assert!(
+        e.is_transient(),
+        "the supervisor reconnects rather than giving up"
+    );
     assert!(!runtime.info().connected);
+}
+
+#[tokio::test]
+async fn a_cached_model_is_not_liveness_so_connect_refuses_a_dead_agent() {
+    // The P1-1 defect, at the gate: `ensure_model` answers from the cache with no network touch,
+    // so a connect that trusted it reported ONLINE, emitted `device-connected` and cleared the
+    // `device-unreachable` alarm against an agent that had been dead for hours.
+    let agent = FakeAgent::start().await;
+    let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
+    let mut session = backend
+        .connect(&connection())
+        .await
+        .expect("connect while delivering");
+    let probes = agent.request_count("/probe");
+    assert_eq!(probes, 1, "the model was fetched once and cached");
+    session.close().await;
+
+    // The agent goes away entirely — the cached model does not.
+    agent.documents.lock().unwrap().clear();
+    assert!(runtime.poll_once().await.is_err());
+    assert!(
+        runtime.model("OKUMA.123456").is_some(),
+        "the model is still cached"
+    );
+
+    let Err(e) = backend.connect(&connection()).await else {
+        panic!("a cached model must never be mistaken for a live agent")
+    };
+    assert!(
+        e.is_transient(),
+        "the supervisor keeps retrying rather than giving up: {e}"
+    );
+    assert!(e.to_string().contains("is not delivering"), "{e}");
+    assert_eq!(
+        agent.request_count("/probe"),
+        probes,
+        "and it did not even ask"
+    );
+
+    // Once acquisition delivers again, connect succeeds — still from the cache, still with no
+    // network probe: the gate is about liveness, not about re-fetching the model.
+    agent.set("current", CURRENT.to_string());
+    runtime.poll_once().await.expect("the agent answers again");
+    let mut session = backend.connect(&connection()).await.expect("connect");
+    assert_eq!(
+        agent.request_count("/probe"),
+        probes,
+        "a cache hit needs no network probe"
+    );
+    session.close().await;
 }
 
 #[tokio::test]
 async fn a_probe_that_changes_under_us_is_surfaced_as_drift_not_silently_remapped() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     let before = runtime.model("OKUMA.123456").unwrap().digest_hex();
 
@@ -395,14 +564,18 @@ async fn a_probe_that_changes_under_us_is_surfaced_as_drift_not_silently_remappe
     assert_eq!(readings.len(), 1);
     assert_eq!(readings[0].signal_id, "x-position");
     assert_eq!(readings[0].quality, Quality::Bad);
-    assert_eq!(readings[0].quality_raw.as_deref(), Some("MTC_NO_SUCH_DATAITEM"));
+    assert_eq!(
+        readings[0].quality_raw.as_deref(),
+        Some("MTC_NO_SUCH_DATAITEM")
+    );
     assert_eq!(readings[0].value, None);
 }
 
 #[tokio::test]
 async fn browsing_serves_the_cached_probe_while_the_agent_is_unreachable() {
     let agent = FakeAgent::start().await;
-    let (_runtime, backend) = wire(&agent, vec![device(vec![])]);
+    let (runtime, backend) = wire(&agent, vec![device(vec![])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     // The agent goes away entirely; the address space is still browsable.
@@ -417,7 +590,8 @@ async fn browsing_serves_the_cached_probe_while_the_agent_is_unreachable() {
 #[tokio::test]
 async fn writes_are_refused_even_at_the_backend() {
     let agent = FakeAgent::start().await;
-    let (_runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     let Err(e) = session.write_signal("x-position", &json!(1.0)).await else {
         panic!("MTConnect is read-only")
@@ -429,19 +603,26 @@ async fn writes_are_refused_even_at_the_backend() {
 async fn a_read_serializes_with_acquisition_through_the_control_channel() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     // With the acquisition task running, a read rides the control channel rather than opening its
     // own request behind the task's back (the single-owner rule).
-    runtime.spawn().expect("task");
-    let readings = session.read_named(&["x-position".to_string()]).await.expect("read");
+    runtime.spawn(CancellationToken::new()).expect("task");
+    let readings = session
+        .read_named(&["x-position".to_string()])
+        .await
+        .expect("read");
     assert_eq!(readings.len(), 1);
     assert_eq!(readings[0].value, Some(json!(123.456)));
 
     runtime.shutdown().await;
     // The task is gone; a read still answers, by falling back to a direct request.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let readings = session.read_named(&["x-position".to_string()]).await.expect("read");
+    let readings = session
+        .read_named(&["x-position".to_string()])
+        .await
+        .expect("read");
     assert_eq!(readings.len(), 1);
 }
 
@@ -449,16 +630,24 @@ async fn a_read_serializes_with_acquisition_through_the_control_channel() {
 async fn reconnecting_re_probes_and_republishes_everything_as_fresh() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     runtime.poll_once().await.unwrap();
     assert_eq!(session.read_signals().await.unwrap().len(), 1);
     runtime.poll_once().await.unwrap();
-    assert!(session.read_signals().await.unwrap().is_empty(), "nothing changed");
+    assert!(
+        session.read_signals().await.unwrap().is_empty(),
+        "nothing changed"
+    );
 
     let probes_before = agent.request_count("/probe");
     runtime.request_reconnect().await.expect("reconnect");
-    assert_eq!(agent.request_count("/probe"), probes_before + 1, "the model is verified again");
+    assert_eq!(
+        agent.request_count("/probe"),
+        probes_before + 1,
+        "the model is verified again"
+    );
 
     // The dedupe floors are gone, so the same observation is deliberately said again.
     runtime.poll_once().await.unwrap();
@@ -468,14 +657,86 @@ async fn reconnecting_re_probes_and_republishes_everything_as_fresh() {
 }
 
 #[tokio::test]
+async fn a_restarted_agent_reaches_the_session_only_after_the_model_is_re_probed() {
+    // P1-4 at the seam an operator can see. The `/current` of a restarted agent was decoded
+    // against the model of the incarnation that just died: publishing it and re-probing afterwards
+    // hands the fleet readings from one model generation routed by the next. LLD §5 ladder 3 is
+    // re-probe → recompile → THEN snapshot, so the restart cycle publishes nothing at all and the
+    // cycle after it delivers the whole fresh view.
+    let agent = FakeAgent::start().await;
+    let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
+    let mut session = backend.connect(&connection()).await.expect("connect");
+    runtime.poll_once().await.unwrap();
+    assert_eq!(session.read_signals().await.unwrap().len(), 1);
+    let _ = session.take_resync();
+
+    // The agent restarts, and comes back describing a machine that was refitted while it was down.
+    agent.set(
+        "current",
+        CURRENT
+            .replace("instanceId=\"1749000000\"", "instanceId=\"1753000000\"")
+            .replace("nextSequence=\"42\"", "nextSequence=\"6\"")
+            .replace(
+                r#"sequence="37" timestamp="2026-07-27T10:00:04.250000Z">123.456"#,
+                r#"sequence="5" timestamp="2026-07-27T10:00:19.500000Z">200.5"#,
+            ),
+    );
+    agent.set(
+        "probe",
+        PROBE.replace("name=\"OKUMA-CNC\"", "name=\"CNC-REFITTED\""),
+    );
+    let probes_before = agent.request_count("/probe");
+
+    let report = runtime.poll_once().await.unwrap();
+    assert_eq!(report.published, 0, "the restart cycle publishes nothing");
+    assert!(report.deferred, "and says why");
+    assert!(
+        session.read_signals().await.unwrap().is_empty(),
+        "no reading decoded against the dead incarnation's model reached the instance"
+    );
+    assert!(
+        !session.take_resync(),
+        "and nothing claimed to re-baseline the session's view either"
+    );
+    assert_eq!(
+        agent.request_count("/probe"),
+        probes_before,
+        "the re-probe belongs to the NEXT cycle, which takes it before it fetches anything"
+    );
+
+    // The next cycle: re-probe (drift surfaced), then the whole fresh view.
+    let report = runtime.poll_once().await.unwrap();
+    assert!(!report.deferred);
+    assert!(report.published > 0, "everything republishes as fresh");
+    assert_eq!(
+        agent.request_count("/probe"),
+        probes_before + 1,
+        "the model was re-verified before this cycle's document was routed by it"
+    );
+    let readings = session.read_signals().await.unwrap();
+    assert_eq!(readings.len(), 1);
+    assert_eq!(readings[0].value, Some(json!(200.5)));
+    assert_eq!(readings[0].extra.as_ref().unwrap()["sequence"], json!(5));
+    assert!(
+        session.take_resync(),
+        "the recovery is a re-baseline: the session re-arms its deadband"
+    );
+}
+
+#[tokio::test]
 async fn a_reconnect_through_the_running_task_reports_a_probe_failure() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let _session = backend.connect(&connection()).await.expect("connect");
-    runtime.spawn().expect("task");
+    runtime.spawn(CancellationToken::new()).expect("task");
 
     agent.documents.lock().unwrap().remove("probe");
-    let err = runtime.request_reconnect().await.expect_err("the agent cannot be re-probed");
+    let err = runtime
+        .request_reconnect()
+        .await
+        .expect_err("the agent cannot be re-probed");
     // The failure is reported through the control channel verbatim — an agent that answers 404 to
     // /probe is not a link problem to retry blindly.
     assert!(err.to_string().contains("404"), "{err:?}");
@@ -497,6 +758,7 @@ async fn a_repoll_takes_a_fresh_current_and_says_every_configured_signal_again()
             signal("ghost", "NOT-IN-MODEL"),
         ])],
     );
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     // A normal cycle publishes, and a second one publishes nothing: `/current` repeats itself.
@@ -512,11 +774,23 @@ async fn a_repoll_takes_a_fresh_current_and_says_every_configured_signal_again()
     // The repoll goes to the agent regardless, and answers with the whole configured set.
     let before = agent.request_count("/current");
     let readings = session.snapshot_now().await.expect("repoll");
-    assert_eq!(agent.request_count("/current"), before + 1, "a repoll is a fresh /current");
-    assert_eq!(readings.len(), 3, "polled counts published results, BAD ones included");
+    assert_eq!(
+        agent.request_count("/current"),
+        before + 1,
+        "a repoll is a fresh /current"
+    );
+    assert_eq!(
+        readings.len(),
+        3,
+        "polled counts published results, BAD ones included"
+    );
 
     let x = reading(&readings, "x-position");
-    assert_eq!(x.value, Some(json!(123.456)), "said again, though nothing changed");
+    assert_eq!(
+        x.value,
+        Some(json!(123.456)),
+        "said again, though nothing changed"
+    );
     assert_eq!(x.quality, Quality::Good);
     let load = reading(&readings, "x-load");
     assert_eq!(load.value, None);
@@ -528,33 +802,50 @@ async fn a_repoll_takes_a_fresh_current_and_says_every_configured_signal_again()
 #[tokio::test]
 async fn a_repoll_asks_only_for_this_devices_configured_data_items() {
     let agent = FakeAgent::start().await;
-    let (_runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     let readings = session.snapshot_now().await.expect("repoll");
-    assert_eq!(readings.len(), 1, "the scope is this instance's signals, not the whole agent");
+    assert_eq!(
+        readings.len(),
+        1,
+        "the scope is this instance's signals, not the whole agent"
+    );
     assert_eq!(readings[0].signal_id, "x-position");
 
     // A device with no configured signals has nothing to snapshot, and asks the agent for nothing.
-    let (_r2, backend) = wire(&agent, vec![device(vec![])]);
+    let (r2, backend) = wire(&agent, vec![device(vec![])]);
+    deliver(&r2).await;
     let mut empty = backend.connect(&connection()).await.expect("connect");
     let before = agent.request_count("/current");
     assert!(empty.snapshot_now().await.expect("repoll").is_empty());
-    assert_eq!(agent.request_count("/current"), before, "nothing configured, nothing asked");
+    assert_eq!(
+        agent.request_count("/current"),
+        before,
+        "nothing configured, nothing asked"
+    );
 }
 
 #[tokio::test]
 async fn a_repoll_against_an_unreachable_agent_reports_the_failure() {
     let agent = FakeAgent::start().await;
-    let (_runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     agent.documents.lock().unwrap().remove("current");
 
-    let err = session.snapshot_now().await.expect_err("the agent has no /current");
+    let err = session
+        .snapshot_now()
+        .await
+        .expect_err("the agent has no /current");
     // The failure surfaces verbatim rather than being reported as an empty poll: a repoll that
     // could not reach the agent must not look like a machine with nothing to say.
     assert!(err.to_string().contains("404"), "{err}");
-    assert!(!err.is_transient(), "a 404 is a client-side mistake, not a link to retry blindly");
+    assert!(
+        !err.is_transient(),
+        "a 404 is a client-side mistake, not a link to retry blindly"
+    );
 }
 
 #[tokio::test]
@@ -563,6 +854,7 @@ async fn a_reloaded_signal_set_reaches_a_live_session_without_a_reconnect() {
     // The session keeps its socketless attachment; nothing reconnects, nothing re-probes.
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     runtime.poll_once().await.unwrap();
@@ -584,14 +876,21 @@ async fn a_reloaded_signal_set_reaches_a_live_session_without_a_reconnect() {
             }]
         }
     });
-    let changed = backend.signals().apply(&reloaded).expect("the candidate compiles");
+    let changed = backend
+        .signals()
+        .apply(&reloaded)
+        .expect("the candidate compiles");
     assert_eq!(changed, vec!["cnc-1".to_string()]);
 
     // The live session publishes the new signal on its next read, from the cached model.
     let readings = session.snapshot_now().await.expect("repoll");
     assert_eq!(readings.len(), 2);
     assert!(readings.iter().any(|r| r.signal_id == "spindle-speed"));
-    assert_eq!(agent.request_count("/probe"), probes, "a reload re-probes nothing");
+    assert_eq!(
+        agent.request_count("/probe"),
+        probes,
+        "a reload re-probes nothing"
+    );
 
     // And `sb/signals` answers from the same live set.
     let inventory = backend.inventory(&connection());
@@ -610,7 +909,10 @@ async fn a_reloaded_signal_set_reaches_a_live_session_without_a_reconnect() {
             }]
         }
     });
-    backend.signals().apply(&trimmed).expect("the candidate compiles");
+    backend
+        .signals()
+        .apply(&trimmed)
+        .expect("the candidate compiles");
     let readings = session.snapshot_now().await.expect("repoll");
     assert_eq!(readings.len(), 1);
     assert_eq!(readings[0].signal_id, "spindle-speed");
@@ -627,11 +929,16 @@ async fn a_minimal_selection_all_instance_publishes_the_whole_device() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![selecting(vec![], json!({ "mode": "all" }))]);
 
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     runtime.poll_once().await.expect("poll");
     let readings = session.read_signals().await.expect("read");
     // The fixture's /current carries observations for 12 of the probe's 14 items.
-    assert_eq!(readings.len(), 12, "every observed data item published, none configured by hand");
+    assert_eq!(
+        readings.len(),
+        12,
+        "every observed data item published, none configured by hand"
+    );
 
     // Identity derivation: lower-kebab id, probe name, componentPath/id channel.
     let x = reading(&readings, "xabs");
@@ -641,7 +948,10 @@ async fn a_minimal_selection_all_instance_publishes_the_whole_device() {
     // Auto conditionBinding: Xtravel (this component's CONDITION) is in Fault, so the derived
     // x-axis samples are degraded — exactly as a hand-bound signal would be.
     assert_eq!(x.quality, Quality::Bad);
-    assert_eq!(x.quality_raw.as_deref(), Some("MTC_CONDITION:FAULT:ALM-1041"));
+    assert_eq!(
+        x.quality_raw.as_deref(),
+        Some("MTC_CONDITION:FAULT:ALM-1041")
+    );
 
     // The condition itself publishes its state as a derived signal.
     let travel = reading(&readings, "xtravel");
@@ -653,9 +963,14 @@ async fn a_minimal_selection_all_instance_publishes_the_whole_device() {
     assert_eq!(spindle.channel.as_deref(), Some("axes/rotary-c/sspeed"));
 
     // camelCase ids sanitize to kebab; device-level items publish on their id alone.
-    assert_eq!(reading(&readings, "part-count").channel.as_deref(),
-        Some("controller/path-p1/part-count"));
-    assert_eq!(reading(&readings, "avail").channel.as_deref(), Some("avail"));
+    assert_eq!(
+        reading(&readings, "part-count").channel.as_deref(),
+        Some("controller/path-p1/part-count")
+    );
+    assert_eq!(
+        reading(&readings, "avail").channel.as_deref(),
+        Some("avail")
+    );
 
     // signalsSubscribed counts the served union (14 derived, none unbound).
     assert_eq!(session.served_signals(), Some(14));
@@ -674,15 +989,18 @@ async fn selection_matchers_scope_the_derived_set_and_explicit_entries_override(
         &agent,
         vec![selecting(
             // The explicit entry claims Xabs with its own identity and NO condition binding.
-            vec![serde_json::from_value(json!({
-                "id": "x-position", "dataItemId": "Xabs", "conditionBinding": []
-            }))
-            .unwrap()],
+            vec![
+                serde_json::from_value(json!({
+                    "id": "x-position", "dataItemId": "Xabs", "conditionBinding": []
+                }))
+                .unwrap(),
+            ],
             json!({ "mode": "include",
                     "include": [{ "path": "Axes/**", "category": "SAMPLE" }] }),
         )],
     );
 
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     runtime.poll_once().await.expect("poll");
     let readings = session.read_signals().await.expect("read");
@@ -695,23 +1013,31 @@ async fn selection_matchers_scope_the_derived_set_and_explicit_entries_override(
     // The explicit entry overrode the derived one: its id, and its EMPTY conditionBinding beat
     // the auto binding, so the Fault does not degrade it.
     let x = reading(&readings, "x-position");
-    assert_eq!(x.quality, Quality::Good, "conditionBinding: [] cleared the auto binding");
+    assert_eq!(
+        x.quality,
+        Quality::Good,
+        "conditionBinding: [] cleared the auto binding"
+    );
     // A derived sibling in the same component keeps the auto binding and IS degraded.
     let load = reading(&readings, "xload");
     assert_eq!(load.quality, Quality::Bad, "UNAVAILABLE stays BAD");
     let freq = reading(&readings, "xfreq");
     assert_eq!(freq.quality, Quality::Bad);
-    assert_eq!(freq.quality_raw.as_deref(), Some("MTC_CONDITION:FAULT:ALM-1041"));
+    assert_eq!(
+        freq.quality_raw.as_deref(),
+        Some("MTC_CONDITION:FAULT:ALM-1041")
+    );
     session.close().await;
 }
 
 #[tokio::test]
 async fn max_signals_truncates_with_a_warning_event_never_silently() {
     let agent = FakeAgent::start().await;
-    let (_runtime, backend) = wire(
+    let (runtime, backend) = wire(
         &agent,
         vec![selecting(vec![], json!({ "mode": "all", "maxSignals": 3 }))],
     );
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
     let notices = session.take_notices();
@@ -740,14 +1066,22 @@ async fn the_derived_set_follows_the_model_through_drift() {
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(
         &agent,
-        vec![selecting(vec![], json!({ "mode": "include",
-            "include": [{ "category": "SAMPLE", "path": "Axes/**" }] }))],
+        vec![selecting(
+            vec![],
+            json!({ "mode": "include",
+            "include": [{ "category": "SAMPLE", "path": "Axes/**" }] }),
+        )],
     );
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     runtime.poll_once().await.expect("poll");
     let before = session.read_signals().await.expect("read");
     assert!(before.iter().any(|r| r.signal_id == "xabs"));
-    assert_eq!(session.served_signals(), Some(4), "Xabs, Xload, Xfreq, Sspeed");
+    assert_eq!(
+        session.served_signals(),
+        Some(4),
+        "Xabs, Xload, Xfreq, Sspeed"
+    );
     session.take_notices();
 
     // The machine is reconfigured: Xabs is gone, and a new Y axis appears.
@@ -773,7 +1107,11 @@ async fn the_derived_set_follows_the_model_through_drift() {
         readings.iter().all(|r| r.signal_id != "xabs"),
         "a removed derived signal stops publishing rather than lingering BAD: {readings:?}"
     );
-    assert_eq!(session.served_signals(), Some(4), "Xload, Xfreq, Sspeed, and now Yabs");
+    assert_eq!(
+        session.served_signals(),
+        Some(4),
+        "Xload, Xfreq, Sspeed, and now Yabs"
+    );
 
     let notices = session.take_notices();
     let set_change = notices
@@ -806,6 +1144,7 @@ async fn a_reloaded_selection_reaches_a_live_session_atomically() {
     // signals[] edit — no restart, no reconnect, no re-probe.
     let agent = FakeAgent::start().await;
     let (runtime, backend) = wire(&agent, vec![device(vec![signal("x-position", "Xabs")])]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
     runtime.poll_once().await.unwrap();
     assert_eq!(session.read_signals().await.unwrap().len(), 1);
@@ -824,15 +1163,28 @@ async fn a_reloaded_selection_reaches_a_live_session_atomically() {
             }]
         }
     });
-    let changed = backend.signals().apply(&reloaded).expect("the candidate compiles");
+    let changed = backend
+        .signals()
+        .apply(&reloaded)
+        .expect("the candidate compiles");
     assert_eq!(changed, vec!["cnc-1".to_string()]);
 
     // The live session serves the union on its next read, from the cached model.
     let readings = session.snapshot_now().await.expect("repoll");
     assert_eq!(readings.len(), 12, "the whole observed device");
-    assert!(readings.iter().any(|r| r.signal_id == "x-position"), "the explicit id survives");
-    assert!(readings.iter().any(|r| r.signal_id == "sspeed"), "the derived half arrived");
-    assert_eq!(agent.request_count("/probe"), probes, "a reload re-probes nothing");
+    assert!(
+        readings.iter().any(|r| r.signal_id == "x-position"),
+        "the explicit id survives"
+    );
+    assert!(
+        readings.iter().any(|r| r.signal_id == "sspeed"),
+        "the derived half arrived"
+    );
+    assert_eq!(
+        agent.request_count("/probe"),
+        probes,
+        "a reload re-probes nothing"
+    );
     assert_eq!(session.served_signals(), Some(14));
 
     // Dropping the selection again shrinks the served set back to the explicit signal.
@@ -847,7 +1199,10 @@ async fn a_reloaded_selection_reaches_a_live_session_atomically() {
             }]
         }
     });
-    backend.signals().apply(&trimmed).expect("the candidate compiles");
+    backend
+        .signals()
+        .apply(&trimmed)
+        .expect("the candidate compiles");
     let readings = session.snapshot_now().await.expect("repoll");
     assert_eq!(readings.len(), 1);
     assert_eq!(readings[0].signal_id, "x-position");
@@ -858,11 +1213,19 @@ async fn a_reloaded_selection_reaches_a_live_session_atomically() {
 #[tokio::test]
 async fn sb_read_resolves_derived_ids_like_configured_ones() {
     let agent = FakeAgent::start().await;
-    let (_runtime, backend) = wire(&agent, vec![selecting(vec![], json!({ "mode": "all" }))]);
+    let (runtime, backend) = wire(&agent, vec![selecting(vec![], json!({ "mode": "all" }))]);
+    deliver(&runtime).await;
     let mut session = backend.connect(&connection()).await.expect("connect");
 
-    let readings = session.read_named(&["sspeed".to_string()]).await.expect("read");
-    assert_eq!(readings.len(), 1, "a derived signal is readable by its derived id");
+    let readings = session
+        .read_named(&["sspeed".to_string()])
+        .await
+        .expect("read");
+    assert_eq!(
+        readings.len(),
+        1,
+        "a derived signal is readable by its derived id"
+    );
     assert_eq!(readings[0].signal_id, "sspeed");
     assert_eq!(readings[0].value, Some(json!(1200)));
     session.close().await;
@@ -893,7 +1256,10 @@ fn realistic_budgets() -> mtconnect_adapter::app::ChannelBudgets {
     let mut budgets = mtconnect_adapter::app::ChannelBudgets::default();
     budgets.insert(
         "cnc-1",
-        mtconnect_adapter::mtconnect::ChannelBudget { max_tokens: 3, max_bytes: 216 },
+        mtconnect_adapter::mtconnect::ChannelBudget {
+            max_tokens: 3,
+            max_bytes: 216,
+        },
     );
     budgets
 }
@@ -906,9 +1272,13 @@ async fn a_deep_component_path_publishes_on_a_channel_that_fits_the_uns_topic() 
     let agent = FakeAgent::start().await;
     agent.set("probe", PROBE_DEEP.to_string());
     agent.set("current", CURRENT_DEEP.to_string());
-    let (runtime, backend) =
-        wire_with(&agent, vec![deep_device(json!({ "mode": "all" }))], realistic_budgets());
+    let (runtime, backend) = wire_with(
+        &agent,
+        vec![deep_device(json!({ "mode": "all" }))],
+        realistic_budgets(),
+    );
 
+    deliver(&runtime).await;
     let mut session = backend.connect(&deep_connection()).await.expect("connect");
     runtime.poll_once().await.expect("poll");
     let readings = session.read_signals().await.expect("read");
@@ -916,12 +1286,19 @@ async fn a_deep_component_path_publishes_on_a_channel_that_fits_the_uns_topic() 
     // `stock` publishes, and on a channel within the budget.
     let stock = reading(&readings, "stock");
     assert_eq!(stock.value, Some(json!("ALUMINUM-6061")));
-    assert_eq!(stock.channel.as_deref(), Some("materials-materials/stock-stock/stock"));
+    assert_eq!(
+        stock.channel.as_deref(),
+        Some("materials-materials/stock-stock/stock")
+    );
 
     // Every published channel fits — that is the invariant, not just this one signal.
     for r in &readings {
         let channel = r.channel.as_deref().unwrap_or(&r.signal_id);
-        assert!(channel.split('/').count() <= 3, "{} -> {channel}", r.signal_id);
+        assert!(
+            channel.split('/').count() <= 3,
+            "{} -> {channel}",
+            r.signal_id
+        );
         assert!(channel.len() <= 216, "{} -> {channel}", r.signal_id);
     }
 
@@ -930,7 +1307,10 @@ async fn a_deep_component_path_publishes_on_a_channel_that_fits_the_uns_topic() 
         reading(&readings, "ptemp").channel.as_deref(),
         Some("motor-motor/sensor-sensor/ptemp")
     );
-    assert_eq!(reading(&readings, "avail").channel.as_deref(), Some("avail"));
+    assert_eq!(
+        reading(&readings, "avail").channel.as_deref(),
+        Some("avail")
+    );
     assert_eq!(
         reading(&readings, "estop").channel.as_deref(),
         Some("controller-controller/estop")
@@ -938,15 +1318,23 @@ async fn a_deep_component_path_publishes_on_a_channel_that_fits_the_uns_topic() 
 
     // Ordinary shaping is NOT an event: it is normal derivation on a deep machine.
     assert!(
-        session.take_notices().iter().all(|n| n.context["reason"] != json!("channelBudget")),
+        session
+            .take_notices()
+            .iter()
+            .all(|n| n.context["reason"] != json!("channelBudget")),
         "a fitted channel raises no warning"
     );
 
     // Nothing is lost: the untruncated component path is still what `sb/signals` addresses with.
     let model = runtime.model("Mazak").expect("the cached probe model");
-    let served =
-        model.address_of("line-a-agent", "stock").expect("an address")["componentPath"].clone();
-    assert_eq!(served, json!("Resources[resources]/Materials[materials]/Stock[stock]"));
+    let served = model
+        .address_of("line-a-agent", "stock")
+        .expect("an address")["componentPath"]
+        .clone();
+    assert_eq!(
+        served,
+        json!("Resources[resources]/Materials[materials]/Stock[stock]")
+    );
 
     // ...and it rides the wire on every update, so a consumer never has to call `sb/signals` to
     // recover what the derived channel dropped (D-MtconnectAdapter-L13). Asserted on the *decoded*
@@ -966,16 +1354,31 @@ async fn a_deep_component_path_publishes_on_a_channel_that_fits_the_uns_topic() 
         .build()
         .to_vec()
         .expect("the envelope serializes");
-    let decoded = Message::from_slice(&bytes).expect("the envelope deserializes").body;
-    assert_eq!(decoded["componentPath"], served, "the deep path, whole, on the wire");
-    assert!(decoded["samples"][0].get("componentPath").is_none(), "once, at the update level");
+    let decoded = Message::from_slice(&bytes)
+        .expect("the envelope deserializes")
+        .body;
+    assert_eq!(
+        decoded["componentPath"], served,
+        "the deep path, whole, on the wire"
+    );
+    assert!(
+        decoded["samples"][0].get("componentPath").is_none(),
+        "once, at the update level"
+    );
 
     // Every signal of this device carries one — including the device-level `avail`, whose path is
     // the empty string rather than a missing key.
     for r in &readings {
-        assert!(r.component_path.is_some(), "{} carries no path", r.signal_id);
+        assert!(
+            r.component_path.is_some(),
+            "{} carries no path",
+            r.signal_id
+        );
     }
-    assert_eq!(reading(&readings, "avail").component_path.as_deref(), Some(""));
+    assert_eq!(
+        reading(&readings, "avail").component_path.as_deref(),
+        Some("")
+    );
     session.close().await;
 }
 
@@ -989,11 +1392,15 @@ async fn a_budget_that_cannot_fit_even_an_id_warns_rather_than_publishing_silenc
     let mut budgets = mtconnect_adapter::app::ChannelBudgets::default();
     budgets.insert(
         "cnc-1",
-        mtconnect_adapter::mtconnect::ChannelBudget { max_tokens: 0, max_bytes: 0 },
+        mtconnect_adapter::mtconnect::ChannelBudget {
+            max_tokens: 0,
+            max_bytes: 0,
+        },
     );
-    let (_runtime, backend) =
+    let (runtime, backend) =
         wire_with(&agent, vec![deep_device(json!({ "mode": "all" }))], budgets);
 
+    deliver(&runtime).await;
     let mut session = backend.connect(&deep_connection()).await.expect("connect");
     let notices = session.take_notices();
     let warned = notices
@@ -1001,7 +1408,11 @@ async fn a_budget_that_cannot_fit_even_an_id_warns_rather_than_publishing_silenc
         .find(|n| n.context["reason"] == json!("channelBudget"))
         .expect("the pathological-floor warning event");
     assert_eq!(warned.event_type, "MtconnectSignalSetEvent");
-    assert_eq!(warned.context["unfit"], json!(6), "every signal of the device");
+    assert_eq!(
+        warned.context["unfit"],
+        json!(6),
+        "every signal of the device"
+    );
     assert_eq!(warned.context["instance"], json!("cnc-1"));
 
     // The channel is still the bare id: this adapter invents no name, so the library's own topic

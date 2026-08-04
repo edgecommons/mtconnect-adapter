@@ -1,7 +1,7 @@
 [package]
 name = "mtconnect-adapter"
 version = "1.0.0"
-edition = "2021"
+edition = "2024"
 # Matches the edgecommons library's MSRV (edition-2024 crate).
 rust-version = "1.85"
 license = "BUSL-1.1"
@@ -23,6 +23,10 @@ standalone = ["edgecommons/standalone"]
 greengrass = ["edgecommons/greengrass"]
 # Direct CloudWatch metric target (AWS SDK PutMetricData); combine with `greengrass`.
 cloudwatch = ["edgecommons/cloudwatch"]
+# Prometheus pull metrics on :9090. The KUBERNETES platform profile selects this target by
+# default, so the container image builds with it (see Dockerfile) and k8s/deployment.yaml maps
+# the port. Absent the feature the profile's default target is unavailable and metrics are lost.
+metrics-prometheus = ["edgecommons/metrics-prometheus"]
 
 [dependencies]
 # edgecommons Rust library. The dependency form is chosen by `--dep-source` at generation:
@@ -35,6 +39,9 @@ cloudwatch = ["edgecommons/cloudwatch"]
 # `edgecommons component upgrade --to <version>`.
 edgecommons = { git = "https://github.com/edgecommons/edgecommons", rev = "a14a3285573ef2bb6a531e1e1936c6dc40a85ef4", default-features = false, features = ["credentials"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+# `CancellationToken` — the structured-lifecycle primitive used both above and below the device
+# seam. It is not an `edgecommons` import, so `src/mtconnect/**` stays isolated (tests/isolation.rs).
+tokio-util = { version = "0.7", default-features = false }
 serde_json = "1"
 tracing = "0.1"
 anyhow = "1"
@@ -61,3 +68,11 @@ tokio = { version = "1", features = ["test-util"] }
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
+# The local-MQTT wire gate (tests/wire_gate.rs, LLD 12 row "wire | local MQTT"). A RAW subscriber —
+# the same MQTT client the library's standalone provider uses, but driven independently of it — so
+# the gate reads the bytes that actually landed on the broker rather than anything the publishing
+# runtime hands back, and `prost` decodes those bytes straight against the generated
+# `edgecommons.v1` schema (`edgecommons::proto`) instead of through the library's own envelope
+# reader. Both versions match the ones `edgecommons` already resolves, so neither adds a build.
+rumqttc = "0.25"
+prost = "0.13"

@@ -106,7 +106,14 @@ impl AgentStats {
 
     /// One acquisition request's latency, split by whether it answered.
     pub fn record_latency(&self, ms: u64, ok: bool) {
-        bump(if ok { &self.latency_ms } else { &self.error_latency_ms }, ms);
+        bump(
+            if ok {
+                &self.latency_ms
+            } else {
+                &self.error_latency_ms
+            },
+            ms,
+        );
     }
 
     /// One `/probe` outcome and its latency.
@@ -160,7 +167,10 @@ mod tests {
         let snap = s.snapshot();
         assert_eq!(snap.documents, 2, "both documents count");
         assert_eq!(snap.observations, 3);
-        assert_eq!(snap.heartbeats, 1, "only the empty document is the liveness beat");
+        assert_eq!(
+            snap.heartbeats, 1,
+            "only the empty document is the liveness beat"
+        );
     }
 
     #[test]
@@ -185,7 +195,10 @@ mod tests {
         let snap = s.snapshot();
         assert_eq!((snap.latency_ms, snap.error_latency_ms), (40, 9_000));
         assert_eq!((snap.probes, snap.probes_failed), (1, 1));
-        assert_eq!((snap.probe_latency_ms, snap.probe_error_latency_ms), (12, 500));
+        assert_eq!(
+            (snap.probe_latency_ms, snap.probe_error_latency_ms),
+            (12, 500)
+        );
     }
 
     #[test]
@@ -198,8 +211,14 @@ mod tests {
         s.record_model_change();
         let snap = s.snapshot();
         assert_eq!(snap.documents_failed, 1);
-        assert_eq!(snap.reconnects, 2, "the first established stream is not a reconnect");
+        assert_eq!(
+            snap.reconnects, 2,
+            "the first established stream is not a reconnect"
+        );
         assert_eq!(snap.model_changes, 1);
-        assert_eq!(snap.documents, 0, "an undecodable document is not a decoded one");
+        assert_eq!(
+            snap.documents, 0,
+            "an undecodable document is not a decoded one"
+        );
     }
 }

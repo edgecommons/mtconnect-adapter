@@ -81,4 +81,7 @@ Manifests:
     Install:
       Script: chmod +x {artifacts:path}/mtconnect-adapter
     Run:
-      Script: '{artifacts:path}/mtconnect-adapter --platform GREENGRASS -c GG_CONFIG'
+      # `exec` replaces the lifecycle shell with the component, so the Nucleus's termination
+      # signal reaches the process that has to act on it. Without it the binary is a grandchild
+      # of the shell being signalled, and shutdown is cut short instead of flushing and exiting.
+      Script: 'exec {artifacts:path}/mtconnect-adapter --platform GREENGRASS -c GG_CONFIG'

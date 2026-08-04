@@ -1,0 +1,105 @@
+# KUBERNETES release leg — the mounted ConfigMap the pod's CONFIGMAP config source reads.
+#
+# Structurally identical to the shipped k8s/configmap.yaml (a DIRECTORY mount at /etc/edgecommons
+# carrying config.json with BOTH the component config AND the messaging block). Only the endpoints
+# differ: the shipped file ships a `sim` instance and an in-cluster broker Service; this leg points
+# at the live cppagent and the live EMQX on the dev machine's LAN address 192.168.1.224.
+#
+# `metricEmission` is DELIBERATELY absent so the KUBERNETES platform profile default
+# (target=prometheus, served at /metrics) is the one under test.
+# `health` is DELIBERATELY absent so the KUBERNETES profile default (health.enabled=true, :8081) is.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mtconnect-adapter-config
+  labels:
+    app.kubernetes.io/name: mtconnect-adapter
+data:
+  config.json: |-
+    {
+      "logging": {
+        "level": "INFO"
+      },
+      "hierarchy": {
+        "levels": ["site", "device"]
+      },
+      "identity": {
+        "site": "k8s-leg"
+      },
+      "heartbeat": {
+        "enabled": true,
+        "intervalSecs": 1,
+        "measures": { "cpu": true, "memory": true },
+        "destination": "local"
+      },
+      "tags": {
+        "site": "k8s-leg"
+      },
+      "component": {
+        "token": "mtconnect-adapter",
+        "global": {
+          "agents": [
+            {
+              "id": "live-agent",
+              "url": "http://192.168.1.224:5998",
+              "streaming": "prefer",
+              "heartbeatMs": 3000,
+              "pollIntervalMs": 500,
+              "requestTimeoutMs": 3000,
+              "reconnect": { "initialMs": 500, "maxMs": 2000 }
+            }
+          ],
+          "defaults": {
+            "pollIntervalMs": 250,
+            "publishMode": "on-change"
+          },
+          "healthThresholds": {
+            "staleSignalSecs": 4
+          }
+        },
+        "instances": [
+          {
+            "id": "cnc-1",
+            "adapter": "mtconnect",
+            "connection": {
+              "agentId": "live-agent",
+              "deviceUuid": "MTC-E2E-001"
+            },
+            "pollIntervalMs": 250,
+            "signals": [
+              {
+                "id": "x-position",
+                "name": "X axis actual position",
+                "dataItemId": "d1-Xabs",
+                "conditionBinding": ["d1-travel"],
+                "publish": { "mode": "on-change", "batchMs": 5000 }
+              },
+              {
+                "id": "availability",
+                "name": "Device availability",
+                "dataItemId": "d1-avail"
+              },
+              {
+                "id": "execution",
+                "name": "Execution state",
+                "dataItemId": "d1-exec"
+              },
+              {
+                "id": "x-travel",
+                "name": "X axis travel condition",
+                "dataItemId": "d1-travel"
+              }
+            ],
+            "writes": { "allow": [] }
+          }
+        ]
+      },
+      "messaging": {
+        "local": {
+          "type": "mqtt",
+          "host": "192.168.1.224",
+          "port": 1883,
+          "clientId": "mtconnect-adapter-k8s"
+        }
+      }
+    }

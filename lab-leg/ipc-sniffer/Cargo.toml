@@ -1,0 +1,23 @@
+[package]
+name = "mtc-ipc-sniffer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Its own workspace root: this harness is deliberately NOT a target of the component crate, so
+# `cargo test --all-targets`, `cargo fmt` and `cargo clippy` on the component are untouched by it.
+[workspace]
+
+[[bin]]
+name = "mtc-ipc-sniffer"
+path = "src/main.rs"
+
+[dependencies]
+# The SAME pinned revision the deployed component artifact is built against.
+edgecommons = { git = "https://github.com/edgecommons/edgecommons", rev = "a14a3285573ef2bb6a531e1e1936c6dc40a85ef4", default-features = false, features = [
+    "greengrass",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+async-trait = "0.1"
+serde_json = "1"
+anyhow = "1"

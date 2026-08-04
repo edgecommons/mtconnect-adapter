@@ -78,7 +78,7 @@
           "type": "integer",
           "minimum": 1,
           "default": 30,
-          "description": "A signal with no update for longer than this counts toward `southbound_health.staleSignals` (SOUTHBOUND.md §5). A signal that silently stops updating is otherwise indistinguishable from one that is simply not changing — which is why staleness is measured rather than assumed."
+          "description": "Serves two purposes. A signal with no update for longer than this counts toward `southbound_health.staleSignals` (SOUTHBOUND.md §5) — a signal that silently stops updating is otherwise indistinguishable from one that is simply not changing, which is why staleness is measured rather than assumed. It is also the expiry threshold for held values: once the agent has not vouched for currency for this long, held signals are republished `BAD` with `qualityRaw: \"MTC_STALE:<ageMs>\"`, measured on the liveness clock rather than per-signal change age."
         }
       }
     }

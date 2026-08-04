@@ -273,7 +273,9 @@ fn walk(
     if let Some(data_items) = elem.child("DataItems") {
         for di in data_items.children_named("DataItem") {
             let Some(id) = di.attr("id") else { continue };
-            let Some(category) = di.attr("category").and_then(Category::parse) else { continue };
+            let Some(category) = di.attr("category").and_then(Category::parse) else {
+                continue;
+            };
             let meta = DataItemMeta {
                 id: id.to_string(),
                 name: di.attr("name").map(str::to_string),
@@ -283,7 +285,10 @@ fn walk(
                 units: di.attr("units").map(str::to_string),
                 native_units: di.attr("nativeUnits").map(str::to_string),
                 component_path: path.to_string(),
-                representation: di.attr("representation").map(Repr::parse).unwrap_or_default(),
+                representation: di
+                    .attr("representation")
+                    .map(Repr::parse)
+                    .unwrap_or_default(),
             };
             tree.push(BrowseNode {
                 id: format!("mtc:/item/{id}"),
@@ -306,8 +311,11 @@ fn walk(
                 Some(name) => format!("{}[{}]", c.name, name),
                 None => c.name.clone(),
             };
-            let child_path =
-                if path.is_empty() { segment } else { format!("{path}/{segment}") };
+            let child_path = if path.is_empty() {
+                segment
+            } else {
+                format!("{path}/{segment}")
+            };
             let node_id = format!("mtc:/component/{child_path}");
             tree.push(BrowseNode {
                 id: node_id.clone(),
@@ -412,7 +420,10 @@ mod tests {
         assert_eq!(x.sub_type.as_deref(), Some("ACTUAL"));
         assert_eq!(x.units.as_deref(), Some("MILLIMETER"));
         assert_eq!(x.native_units.as_deref(), Some("MILLIMETER"));
-        assert_eq!(x.component_path, "Axes/Linear[X]", "the HLD §5.3 component path");
+        assert_eq!(
+            x.component_path, "Axes/Linear[X]",
+            "the HLD §5.3 component path"
+        );
         assert_eq!(x.representation, Repr::Value);
         assert_eq!(x.name.as_deref(), Some("Xabs"));
 
@@ -420,7 +431,10 @@ mod tests {
         assert_eq!(m.item("avail").unwrap().component_path, "");
         // Representations are read, not assumed.
         assert_eq!(m.item("Xfreq").unwrap().representation, Repr::TimeSeries);
-        assert_eq!(m.item("tool-offsets").unwrap().representation, Repr::DataSet);
+        assert_eq!(
+            m.item("tool-offsets").unwrap().representation,
+            Repr::DataSet
+        );
         assert_eq!(m.item("Xtravel").unwrap().category, Category::Condition);
         assert_eq!(m.item("execution").unwrap().category, Category::Event);
         assert!(m.item("nope").is_none());
@@ -472,7 +486,11 @@ mod tests {
         );
 
         // Parentage and depth make the hierarchical browse mode possible without re-walking.
-        let x_axis = m.tree.iter().find(|n| n.id == "mtc:/component/Axes/Linear[X]").unwrap();
+        let x_axis = m
+            .tree
+            .iter()
+            .find(|n| n.id == "mtc:/component/Axes/Linear[X]")
+            .unwrap();
         assert_eq!(x_axis.parent_id.as_deref(), Some("mtc:/component/Axes"));
         assert_eq!(x_axis.kind, NodeKind::Component);
         assert_eq!(x_axis.type_name, "Linear");
@@ -480,7 +498,10 @@ mod tests {
         assert_eq!(x_axis.depth, 2);
 
         let xabs = m.tree.iter().find(|n| n.id == "mtc:/item/Xabs").unwrap();
-        assert_eq!(xabs.parent_id.as_deref(), Some("mtc:/component/Axes/Linear[X]"));
+        assert_eq!(
+            xabs.parent_id.as_deref(),
+            Some("mtc:/component/Axes/Linear[X]")
+        );
         assert_eq!(xabs.kind, NodeKind::DataItem);
         assert_eq!(xabs.category, Some(Category::Sample));
         assert_eq!(xabs.units.as_deref(), Some("MILLIMETER"));
@@ -504,13 +525,21 @@ mod tests {
             );
         let doc = parse_devices(&reordered).unwrap();
         let m = ProbeModel::from_devices(&doc, "OKUMA.123456").unwrap();
-        assert_eq!(m.raw_digest, a, "attribute order and whitespace are not model content");
+        assert_eq!(
+            m.raw_digest, a,
+            "attribute order and whitespace are not model content"
+        );
 
         // The digest covers the Device subtree ONLY: a different agent header, or another device
         // appearing in the same probe, must not move it.
         let other_header = DEVICES_2_7.replace("instanceId=\"1749000000\"", "instanceId=\"42\"");
         let doc = parse_devices(&other_header).unwrap();
-        assert_eq!(ProbeModel::from_devices(&doc, "OKUMA.123456").unwrap().raw_digest, a);
+        assert_eq!(
+            ProbeModel::from_devices(&doc, "OKUMA.123456")
+                .unwrap()
+                .raw_digest,
+            a
+        );
     }
 
     #[test]
@@ -583,7 +612,11 @@ mod tests {
         assert_eq!(Repr::parse("data_set"), Repr::DataSet);
         assert_eq!(Repr::parse("TABLE"), Repr::Table);
         assert_eq!(Repr::parse("DISCRETE"), Repr::Discrete);
-        assert_eq!(Repr::parse("whatever-2.8-adds"), Repr::Value, "unknown means scalar");
+        assert_eq!(
+            Repr::parse("whatever-2.8-adds"),
+            Repr::Value,
+            "unknown means scalar"
+        );
         assert_eq!(Repr::TimeSeries.as_str(), "TIME_SERIES");
         assert_eq!(Repr::Value.as_str(), "VALUE");
         assert_eq!(Repr::DataSet.as_str(), "DATA_SET");

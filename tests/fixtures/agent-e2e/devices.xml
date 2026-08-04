@@ -1,5 +1,5 @@
-<MTConnectDevices xmlns="urn:mtconnect.org:MTConnectDevices:1.7">
-  <Header creationTime="2026-07-27T00:00:00Z" sender="e2e" instanceId="1" bufferSize="131072" version="1.7.0"/>
+<MTConnectDevices xmlns="urn:mtconnect.org:MTConnectDevices:2.3">
+  <Header creationTime="2026-07-27T00:00:00Z" sender="e2e" instanceId="1" bufferSize="131072" version="2.3.0"/>
   <Devices>
     <Device id="d1" uuid="MTC-E2E-001" name="dev-one">
       <Description manufacturer="EdgeCommons" serialNumber="E2E-1">Simulated CNC one</Description>
@@ -12,6 +12,7 @@
             <Linear id="d1-x" name="X">
               <DataItems>
                 <DataItem category="SAMPLE" id="d1-Xabs" name="Xabs" subType="ACTUAL" type="POSITION" units="MILLIMETER" nativeUnits="MILLIMETER"/>
+                <DataItem category="CONDITION" id="d1-travel" name="Xtravel" type="POSITION"/>
               </DataItems>
             </Linear>
           </Components>

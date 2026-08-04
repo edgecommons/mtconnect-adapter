@@ -11,18 +11,22 @@
 
 use std::path::Path;
 
-use mtconnect_adapter::app::{compile_mtconnect, ChannelBudgets, DeviceConfig, PublishDefaults};
-use mtconnect_adapter::mtconnect::config::{parse_agents, PublishMode};
-use serde_json::{json, Value};
+use mtconnect_adapter::app::{ChannelBudgets, DeviceConfig, PublishDefaults, compile_mtconnect};
+use mtconnect_adapter::mtconnect::config::{PublishMode, parse_agents};
+use serde_json::{Value, json};
 
 fn schema() -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.schema.json");
-    serde_json::from_str(&std::fs::read_to_string(path).expect("read schema")).expect("parse schema")
+    serde_json::from_str(&std::fs::read_to_string(path).expect("read schema"))
+        .expect("parse schema")
 }
 
 fn config(name: &str) -> Value {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-configs").join(name);
-    serde_json::from_str(&std::fs::read_to_string(path).expect("read config")).expect("parse config")
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("test-configs")
+        .join(name);
+    serde_json::from_str(&std::fs::read_to_string(path).expect("read config"))
+        .expect("parse config")
 }
 
 /// Validate one `component.global` object.
@@ -72,13 +76,22 @@ fn the_shipped_mtconnect_configuration_compiles_through_the_semantic_validator()
         .iter()
         .map(|v| serde_json::from_value(v.clone()).expect("instance"))
         .collect();
-    let compiled = compile_mtconnect(&mut devices, &agents, PublishDefaults::default(), &ChannelBudgets::default()).expect("bindings resolve");
+    let compiled = compile_mtconnect(
+        &mut devices,
+        &agents,
+        PublishDefaults::default(),
+        &ChannelBudgets::default(),
+    )
+    .expect("bindings resolve");
 
     assert_eq!(compiled.len(), 1);
     assert_eq!(compiled[0].device_uuid, "OKUMA.123456");
     assert_eq!(compiled[0].signals.len(), 5);
     // The endpoint is derived from the agent + uuid, not configured.
-    assert_eq!(devices[0].connection.endpoint, "mtconnect://127.0.0.1:5000/OKUMA.123456");
+    assert_eq!(
+        devices[0].connection.endpoint,
+        "mtconnect://127.0.0.1:5000/OKUMA.123456"
+    );
 }
 
 #[test]
@@ -94,7 +107,16 @@ fn the_shipped_simulator_configuration_still_works() {
     assert_eq!(devices[0].adapter, "sim");
     assert_eq!(devices[0].connection.endpoint, "sim://device-1");
     // No MTConnect instances, so no agent is needed.
-    assert!(compile_mtconnect(&mut devices, &[], PublishDefaults::default(), &ChannelBudgets::default()).unwrap().is_empty());
+    assert!(
+        compile_mtconnect(
+            &mut devices,
+            &[],
+            PublishDefaults::default(),
+            &ChannelBudgets::default()
+        )
+        .unwrap()
+        .is_empty()
+    );
 }
 
 #[test]
@@ -106,29 +128,37 @@ fn an_mtconnect_instance_must_name_an_agent_and_a_device() {
     validate_instance(&ok).expect("the minimum valid instance");
 
     // No binding at all.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "connection": {}
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "connection": {}
+        }))
+        .is_err()
+    );
     // Half a binding.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "connection": { "agentId": "line-a-agent" }
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "connection": { "agentId": "line-a-agent" }
+        }))
+        .is_err()
+    );
     // A sim instance needs its endpoint instead.
     validate_instance(&json!({
         "id": "cnc-1", "adapter": "sim", "connection": { "endpoint": "sim://cnc-1" }
     }))
     .expect("the simulator's own shape");
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "adapter": "sim", "connection": { "agentId": "a", "deviceUuid": "u" }
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "adapter": "sim", "connection": { "agentId": "a", "deviceUuid": "u" }
+        }))
+        .is_err()
+    );
     // An unknown adapter is not a backend this component has.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "adapter": "opcua", "connection": { "agentId": "a", "deviceUuid": "u" }
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "adapter": "opcua", "connection": { "agentId": "a", "deviceUuid": "u" }
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -167,26 +197,32 @@ fn a_signal_must_bind_a_data_item_and_may_declare_its_conditions() {
     validate_instance(&instance).expect("the full signal shape");
 
     // A signal with no binding is not a signal.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1",
-        "connection": { "agentId": "a", "deviceUuid": "u" },
-        "signals": [{ "id": "x-position" }]
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1",
+            "connection": { "agentId": "a", "deviceUuid": "u" },
+            "signals": [{ "id": "x-position" }]
+        }))
+        .is_err()
+    );
     // A typo'd key is a mistake, not a no-op.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1",
-        "connection": { "agentId": "a", "deviceUuid": "u" },
-        "signals": [{ "id": "x", "dataItemID": "Xabs" }]
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1",
+            "connection": { "agentId": "a", "deviceUuid": "u" },
+            "signals": [{ "id": "x", "dataItemID": "Xabs" }]
+        }))
+        .is_err()
+    );
     // Signal ids are UNS tokens.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1",
-        "connection": { "agentId": "a", "deviceUuid": "u" },
-        "signals": [{ "id": "X_Position", "dataItemId": "Xabs" }]
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1",
+            "connection": { "agentId": "a", "deviceUuid": "u" },
+            "signals": [{ "id": "X_Position", "dataItemId": "Xabs" }]
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -199,20 +235,36 @@ fn the_selection_block_is_additive_closed_and_validated() {
     });
     validate_instance(&minimal).expect("the minimal selection instance");
     // ... and it compiles through the semantic validator too.
-    let agents = parse_agents(&json!({ "agents": [{ "id": "line-a-agent", "url": "http://a:5000" }] }))
-        .unwrap();
+    let agents =
+        parse_agents(&json!({ "agents": [{ "id": "line-a-agent", "url": "http://a:5000" }] }))
+            .unwrap();
     let mut devices: Vec<DeviceConfig> = vec![serde_json::from_value(minimal).unwrap()];
     let compiled = compile_mtconnect(
         &mut devices,
         &agents,
-        PublishDefaults { batch_ms: 250, publish_mode: PublishMode::Interval },
+        PublishDefaults {
+            batch_ms: 250,
+            publish_mode: PublishMode::Interval,
+        },
         &ChannelBudgets::default(),
     )
     .expect("compiles");
-    let selection = compiled[0].selection.as_ref().expect("the selection rides the compile");
-    assert_eq!(selection.max_signals, 500, "the derived-set cap defaults to 500");
-    assert!(selection.auto_condition_binding, "auto conditionBinding defaults on");
-    assert_eq!(selection.default_batch_ms, 250, "defaults.batchMs is stamped in at compile");
+    let selection = compiled[0]
+        .selection
+        .as_ref()
+        .expect("the selection rides the compile");
+    assert_eq!(
+        selection.max_signals, 500,
+        "the derived-set cap defaults to 500"
+    );
+    assert!(
+        selection.auto_condition_binding,
+        "auto conditionBinding defaults on"
+    );
+    assert_eq!(
+        selection.default_batch_ms, 250,
+        "defaults.batchMs is stamped in at compile"
+    );
     assert_eq!(
         selection.default_publish_mode,
         PublishMode::Interval,
@@ -236,53 +288,81 @@ fn the_selection_block_is_additive_closed_and_validated() {
     .expect("the full selection shape");
 
     // Closed objects: a typo'd key is a mistake, not a no-op.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
-        "selection": { "mode": "all", "includes": [] }
-    }))
-    .is_err());
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
-        "selection": { "mode": "include", "include": [{ "types": "POSITION" }] }
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+            "selection": { "mode": "all", "includes": [] }
+        }))
+        .is_err()
+    );
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+            "selection": { "mode": "include", "include": [{ "types": "POSITION" }] }
+        }))
+        .is_err()
+    );
     // An unknown mode, category, or a zero cap is refused by the schema itself.
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
-        "selection": { "mode": "everything" }
-    }))
-    .is_err());
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
-        "selection": { "mode": "include", "include": [{ "category": "sample" }] }
-    }))
-    .is_err());
-    assert!(validate_instance(&json!({
-        "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
-        "selection": { "mode": "all", "maxSignals": 0 }
-    }))
-    .is_err());
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+            "selection": { "mode": "everything" }
+        }))
+        .is_err()
+    );
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+            "selection": { "mode": "include", "include": [{ "category": "sample" }] }
+        }))
+        .is_err()
+    );
+    assert!(
+        validate_instance(&json!({
+            "id": "cnc-1", "connection": { "agentId": "a", "deviceUuid": "u" },
+            "selection": { "mode": "all", "maxSignals": 0 }
+        }))
+        .is_err()
+    );
 
     // A regex the schema cannot judge is refused by the side-effect-free semantic validator.
-    let mut bad: Vec<DeviceConfig> = vec![serde_json::from_value(json!({
-        "id": "cnc-1",
-        "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.1" },
-        "selection": { "mode": "include", "include": [{ "type": "(" }] }
-    }))
-    .unwrap()];
+    let mut bad: Vec<DeviceConfig> = vec![
+        serde_json::from_value(json!({
+            "id": "cnc-1",
+            "connection": { "agentId": "line-a-agent", "deviceUuid": "OKUMA.1" },
+            "selection": { "mode": "include", "include": [{ "type": "(" }] }
+        }))
+        .unwrap(),
+    ];
     assert!(
-        compile_mtconnect(&mut bad, &agents, PublishDefaults::default(), &ChannelBudgets::default()).is_err(),
+        compile_mtconnect(
+            &mut bad,
+            &agents,
+            PublishDefaults::default(),
+            &ChannelBudgets::default()
+        )
+        .is_err(),
         "a bad pattern never commits"
     );
 
     // A `sim` instance has no probe to derive from: selection is refused there.
-    let mut sim: Vec<DeviceConfig> = vec![serde_json::from_value(json!({
-        "id": "plc-1", "adapter": "sim",
-        "connection": { "endpoint": "sim://plc-1" },
-        "selection": { "mode": "all" }
-    }))
-    .unwrap()];
-    assert!(compile_mtconnect(&mut sim, &[], PublishDefaults::default(), &ChannelBudgets::default()).is_err());
+    let mut sim: Vec<DeviceConfig> = vec![
+        serde_json::from_value(json!({
+            "id": "plc-1", "adapter": "sim",
+            "connection": { "endpoint": "sim://plc-1" },
+            "selection": { "mode": "all" }
+        }))
+        .unwrap(),
+    ];
+    assert!(
+        compile_mtconnect(
+            &mut sim,
+            &[],
+            PublishDefaults::default(),
+            &ChannelBudgets::default()
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -306,20 +386,31 @@ fn an_agent_declares_a_reachable_url_and_references_its_secrets() {
     assert!(validate_global(&json!({ "agents": [{ "id": "a", "url": "mqtt://agent" }] })).is_err());
     assert!(validate_global(&json!({ "agents": [{ "id": "a" }] })).is_err());
     // An id that is not a UNS token cannot be a metric dimension.
-    assert!(validate_global(&json!({ "agents": [{ "id": "Line_A", "url": "http://a:5000" }] })).is_err());
+    assert!(
+        validate_global(&json!({ "agents": [{ "id": "Line_A", "url": "http://a:5000" }] }))
+            .is_err()
+    );
     // A password INLINE instead of by reference.
-    assert!(validate_global(&json!({ "agents": [{
+    assert!(
+        validate_global(&json!({ "agents": [{
         "id": "a", "url": "http://a:5000",
         "auth": { "type": "basic", "username": "u", "password": "hunter2" }
     }] }))
-    .is_err(), "secrets are references, never values");
+        .is_err(),
+        "secrets are references, never values"
+    );
     // Half a client identity.
-    assert!(validate_global(&json!({ "agents": [{
+    assert!(
+        validate_global(&json!({ "agents": [{
         "id": "a", "url": "http://a:5000", "tls": { "certSecretRef": "c" }
     }] }))
-    .is_err());
+        .is_err()
+    );
     // An unknown global key is a mistake, not a no-op.
-    assert!(validate_global(&json!({ "agents": [{ "id": "a", "url": "http://a:5000" }], "nope": 1 })).is_err());
+    assert!(
+        validate_global(&json!({ "agents": [{ "id": "a", "url": "http://a:5000" }], "nope": 1 }))
+            .is_err()
+    );
 }
 
 #[test]
@@ -341,5 +432,8 @@ fn the_schema_keeps_every_object_closed() {
     }
     let mut open = Vec::new();
     walk(&schema(), "", &mut open);
-    assert!(open.is_empty(), "these objects accept unknown keys: {open:?}");
+    assert!(
+        open.is_empty(),
+        "these objects accept unknown keys: {open:?}"
+    );
 }

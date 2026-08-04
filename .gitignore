@@ -6,3 +6,11 @@
 /.cargo/
 # Cargo.lock is committed for binary components; the template ships without one so
 # the first build generates it for your crate.
+
+# Release-leg run output. The harness under host-leg/ regenerates these; the captured
+# evidence belongs in the release record, not in the source tree.
+/host-leg/evidence/
+/host-leg/target/
+/k8s-leg/target/
+/k8s-leg/*control.txt
+/lab-leg/ipc-sniffer/target/

@@ -96,8 +96,15 @@ const RESULTS: [&str; 2] = [RESULT_SUCCESS, RESULT_ERROR];
 /// The **closed** `verb` dimension set for [`COMMAND`] — every `sb/*` verb the command surface
 /// registers (`src/commands.rs`). Closed and low-cardinality on purpose (see the module header).
 pub const COMMAND_VERBS: [&str; 9] = [
-    "sb/status", "sb/read", "sb/write", "sb/signals", "sb/browse", "sb/pause", "sb/resume",
-    "reconnect", "repoll",
+    "sb/status",
+    "sb/read",
+    "sb/write",
+    "sb/signals",
+    "sb/browse",
+    "sb/pause",
+    "sb/resume",
+    "reconnect",
+    "repoll",
 ];
 
 /// The **exact** SOUTHBOUND.md §5 measure set of `southbound_health` — `connectionState`,
@@ -107,8 +114,14 @@ pub const COMMAND_VERBS: [&str; 9] = [
 /// with it.
 #[allow(dead_code)] // a documentation + parity anchor, consumed by the metrics test
 pub const HEALTH_MEASURES: [&str; 8] = [
-    "connectionState", "publishLatencyMs", "pollLatencyMs", "readErrors", "staleSignals",
-    "reconnects", "writeErrors", "signalsSubscribed",
+    "connectionState",
+    "publishLatencyMs",
+    "pollLatencyMs",
+    "readErrors",
+    "staleSignals",
+    "reconnects",
+    "writeErrors",
+    "signalsSubscribed",
 ];
 
 const UNIT_COUNT: &str = "Count";
@@ -135,12 +148,19 @@ pub struct FamilyDef {
 }
 
 fn m(name: &str, unit: &str, res: u32) -> MeasureDef {
-    MeasureDef { name: name.to_string(), unit: unit.to_string(), res }
+    MeasureDef {
+        name: name.to_string(),
+        unit: unit.to_string(),
+        res,
+    }
 }
 
 /// A `<prefix>Total` + `<prefix>Interval` counter pair (both `Count`, resolution 60).
 fn pair_defs(prefix: &str) -> Vec<MeasureDef> {
-    vec![m(&format!("{prefix}Total"), UNIT_COUNT, 60), m(&format!("{prefix}Interval"), UNIT_COUNT, 60)]
+    vec![
+        m(&format!("{prefix}Total"), UNIT_COUNT, 60),
+        m(&format!("{prefix}Interval"), UNIT_COUNT, 60),
+    ]
 }
 
 fn dims(keys: &[&str]) -> Vec<String> {
@@ -177,7 +197,11 @@ pub fn family_defs() -> Vec<FamilyDef> {
     conn.extend(pair_defs("reconnectAttempts"));
     conn.extend(pair_defs("connectionDrops"));
     conn.push(m("connectedDurationMs", UNIT_MS, 60));
-    out.push(FamilyDef { name: CONNECTION.to_string(), dimensions: dims(&["instance"]), measures: conn });
+    out.push(FamilyDef {
+        name: CONNECTION.to_string(),
+        dimensions: dims(&["instance"]),
+        measures: conn,
+    });
 
     // MtconnectAdapterCommand — the sb/* surface (dims: instance, verb, result).
     let mut cmd = Vec::new();
@@ -205,7 +229,14 @@ pub fn family_defs() -> Vec<FamilyDef> {
 
     // MtconnectStream — one agent's acquisition (dims: agentId, result).
     let mut stream = Vec::new();
-    for base in ["documents", "observations", "heartbeats", "reconnects", "gaps", "outOfRange"] {
+    for base in [
+        "documents",
+        "observations",
+        "heartbeats",
+        "reconnects",
+        "gaps",
+        "outOfRange",
+    ] {
         stream.extend(pair_defs(base));
     }
     stream.push(m("latencyMs", UNIT_MS, 60));
@@ -230,6 +261,8 @@ pub fn family_defs() -> Vec<FamilyDef> {
     let mut parse = Vec::new();
     parse.extend(pair_defs("documentsParsed"));
     parse.extend(pair_defs("parseErrors"));
+    // Observations the agent sent and this client refused for a missing required field (D-R11).
+    parse.extend(pair_defs("rejectedObservations"));
     out.push(FamilyDef {
         name: PARSE.to_string(),
         dimensions: dims(&["instance", "result"]),
@@ -285,7 +318,8 @@ struct ConnCounters {
 impl ConnCounters {
     fn accrue(&mut self, now: Instant) {
         if let Some(since) = self.connected_since {
-            self.connected_accrued_ms += now.saturating_duration_since(since).as_secs_f64() * 1000.0;
+            self.connected_accrued_ms +=
+                now.saturating_duration_since(since).as_secs_f64() * 1000.0;
             self.connected_since = Some(now);
         }
     }
@@ -296,7 +330,8 @@ impl ConnCounters {
         v.insert("connectionState".to_string(), connection_state);
         self.connect_attempts.drain_into(&mut v, "connectAttempts");
         self.connect_failures.drain_into(&mut v, "connectFailures");
-        self.reconnect_attempts.drain_into(&mut v, "reconnectAttempts");
+        self.reconnect_attempts
+            .drain_into(&mut v, "reconnectAttempts");
         self.connection_drops.drain_into(&mut v, "connectionDrops");
         v.insert("connectedDurationMs".to_string(), self.connected_accrued_ms);
         self.connected_accrued_ms = 0.0;
@@ -379,7 +414,10 @@ impl AgentTelemetry for AgentRuntime {
 /// must not emit a negative interval.
 fn pair_values(out: &mut HashMap<String, f64>, prefix: &str, total: u64, previous: u64) {
     out.insert(format!("{prefix}Total"), total as f64);
-    out.insert(format!("{prefix}Interval"), total.saturating_sub(previous) as f64);
+    out.insert(
+        format!("{prefix}Interval"),
+        total.saturating_sub(previous) as f64,
+    );
 }
 
 /// The [`STREAM`] measures for one `result` cell, from the current totals and the totals at the
@@ -395,7 +433,12 @@ pub fn stream_values(
     let success = result == RESULT_SUCCESS;
     if success {
         pair_values(&mut v, "documents", total.documents, previous.documents);
-        pair_values(&mut v, "observations", total.observations, previous.observations);
+        pair_values(
+            &mut v,
+            "observations",
+            total.observations,
+            previous.observations,
+        );
         pair_values(&mut v, "heartbeats", total.heartbeats, previous.heartbeats);
         pair_values(&mut v, "reconnects", 0, 0);
         pair_values(&mut v, "gaps", 0, 0);
@@ -405,15 +448,27 @@ pub fn stream_values(
             total.latency_ms.saturating_sub(previous.latency_ms) as f64,
         );
     } else {
-        pair_values(&mut v, "documents", total.documents_failed, previous.documents_failed);
+        pair_values(
+            &mut v,
+            "documents",
+            total.documents_failed,
+            previous.documents_failed,
+        );
         pair_values(&mut v, "observations", 0, 0);
         pair_values(&mut v, "heartbeats", 0, 0);
         pair_values(&mut v, "reconnects", total.reconnects, previous.reconnects);
         pair_values(&mut v, "gaps", total.gaps, previous.gaps);
-        pair_values(&mut v, "outOfRange", total.out_of_range, previous.out_of_range);
+        pair_values(
+            &mut v,
+            "outOfRange",
+            total.out_of_range,
+            previous.out_of_range,
+        );
         v.insert(
             "latencyMs".to_string(),
-            total.error_latency_ms.saturating_sub(previous.error_latency_ms) as f64,
+            total
+                .error_latency_ms
+                .saturating_sub(previous.error_latency_ms) as f64,
         );
     }
     v
@@ -430,17 +485,31 @@ pub fn probe_values(
     let mut v = HashMap::new();
     if result == RESULT_SUCCESS {
         pair_values(&mut v, "probes", total.probes, previous.probes);
-        pair_values(&mut v, "modelChanges", total.model_changes, previous.model_changes);
+        pair_values(
+            &mut v,
+            "modelChanges",
+            total.model_changes,
+            previous.model_changes,
+        );
         v.insert(
             "latencyMs".to_string(),
-            total.probe_latency_ms.saturating_sub(previous.probe_latency_ms) as f64,
+            total
+                .probe_latency_ms
+                .saturating_sub(previous.probe_latency_ms) as f64,
         );
     } else {
-        pair_values(&mut v, "probes", total.probes_failed, previous.probes_failed);
+        pair_values(
+            &mut v,
+            "probes",
+            total.probes_failed,
+            previous.probes_failed,
+        );
         pair_values(&mut v, "modelChanges", 0, 0);
         v.insert(
             "latencyMs".to_string(),
-            total.probe_error_latency_ms.saturating_sub(previous.probe_error_latency_ms) as f64,
+            total
+                .probe_error_latency_ms
+                .saturating_sub(previous.probe_error_latency_ms) as f64,
         );
     }
     v
@@ -455,11 +524,30 @@ pub fn parse_values(
 ) -> HashMap<String, f64> {
     let mut v = HashMap::new();
     if result == RESULT_SUCCESS {
-        pair_values(&mut v, "documentsParsed", total.documents_parsed, previous.documents_parsed);
+        pair_values(
+            &mut v,
+            "documentsParsed",
+            total.documents_parsed,
+            previous.documents_parsed,
+        );
         pair_values(&mut v, "parseErrors", 0, 0);
+        pair_values(&mut v, "rejectedObservations", 0, 0);
     } else {
         pair_values(&mut v, "documentsParsed", 0, 0);
-        pair_values(&mut v, "parseErrors", total.parse_errors, previous.parse_errors);
+        pair_values(
+            &mut v,
+            "parseErrors",
+            total.parse_errors,
+            previous.parse_errors,
+        );
+        // A refused observation is a decode FAILURE even though its document parsed, so it belongs
+        // in the failure cell beside the parse errors.
+        pair_values(
+            &mut v,
+            "rejectedObservations",
+            total.rejected_observations,
+            previous.rejected_observations,
+        );
     }
     v
 }
@@ -483,7 +571,12 @@ impl AgentMetrics {
         config: Arc<Config>,
         agent: Arc<dyn AgentTelemetry>,
     ) -> Self {
-        Self { svc, config, agent, previous: Mutex::new(AgentStatsSnapshot::default()) }
+        Self {
+            svc,
+            config,
+            agent,
+            previous: Mutex::new(AgentStatsSnapshot::default()),
+        }
     }
 
     /// Pre-define both families × both `result` cells at startup, so the metric set is fixed and
@@ -664,7 +757,11 @@ impl DeviceMetrics {
 
     /// Note that a signal just updated — feeds the `staleSignals` tracker.
     pub fn on_signal_update(&self, signal_id: &str, now: Instant) {
-        self.inner.lock().unwrap().last_update.insert(signal_id.to_string(), now);
+        self.inner
+            .lock()
+            .unwrap()
+            .last_update
+            .insert(signal_id.to_string(), now);
     }
 
     /// Record what the publish-shaping engine did since it was last drained — feeds the
@@ -718,7 +815,14 @@ impl DeviceMetrics {
         self.define(SHAPING, &[("instance", self.instance())]);
         for verb in COMMAND_VERBS {
             for result in RESULTS {
-                self.define(COMMAND, &[("instance", self.instance()), ("verb", verb), ("result", result)]);
+                self.define(
+                    COMMAND,
+                    &[
+                        ("instance", self.instance()),
+                        ("verb", verb),
+                        ("result", result),
+                    ],
+                );
             }
         }
         if self.agent.is_some() {
@@ -742,7 +846,13 @@ impl DeviceMetrics {
     }
 
     /// Re-define (with the combo's dimensions) then emit one family combo.
-    async fn emit_combo(&self, name: &str, dimensions: &[(&str, &str)], values: HashMap<String, f64>, now: bool) {
+    async fn emit_combo(
+        &self,
+        name: &str,
+        dimensions: &[(&str, &str)],
+        values: HashMap<String, f64>,
+        now: bool,
+    ) {
         self.define(name, dimensions);
         let res = if now {
             self.svc.emit_metric_now(name, values).await
@@ -768,7 +878,8 @@ impl DeviceMetrics {
     /// instance's flow since the previous emit.
     async fn emit_shaping(&self) {
         let values = self.inner.lock().unwrap().shaping.drain();
-        self.emit_combo(SHAPING, &[("instance", self.instance())], values, false).await;
+        self.emit_combo(SHAPING, &[("instance", self.instance())], values, false)
+            .await;
     }
 
     /// The `MtconnectParse` family for this instance: the agent's document-decode totals, diffed
@@ -800,30 +911,67 @@ impl DeviceMetrics {
 
     async fn emit_health(&self, now: bool) {
         let mut v = HashMap::new();
-        v.insert("connectionState".to_string(), self.health.connection_state.load(Ordering::Relaxed) as f64);
-        v.insert("publishLatencyMs".to_string(), self.health.publish_latency_ms.load(Ordering::Relaxed) as f64);
-        v.insert("pollLatencyMs".to_string(), self.health.poll_latency_ms.load(Ordering::Relaxed) as f64);
-        v.insert("readErrors".to_string(), self.health.read_errors.swap(0, Ordering::Relaxed) as f64);
+        v.insert(
+            "connectionState".to_string(),
+            self.health.connection_state.load(Ordering::Relaxed) as f64,
+        );
+        v.insert(
+            "publishLatencyMs".to_string(),
+            self.health.publish_latency_ms.load(Ordering::Relaxed) as f64,
+        );
+        v.insert(
+            "pollLatencyMs".to_string(),
+            self.health.poll_latency_ms.load(Ordering::Relaxed) as f64,
+        );
+        v.insert(
+            "readErrors".to_string(),
+            self.health.read_errors.swap(0, Ordering::Relaxed) as f64,
+        );
         v.insert("staleSignals".to_string(), self.stale_count(Instant::now()));
-        v.insert("reconnects".to_string(), self.health.reconnects.swap(0, Ordering::Relaxed) as f64);
-        v.insert("writeErrors".to_string(), self.health.write_errors.swap(0, Ordering::Relaxed) as f64);
-        v.insert("signalsSubscribed".to_string(), self.health.signals_subscribed() as f64);
-        self.emit_combo(HEALTH, &[("instance", self.instance())], v, now).await;
+        v.insert(
+            "reconnects".to_string(),
+            self.health.reconnects.swap(0, Ordering::Relaxed) as f64,
+        );
+        v.insert(
+            "writeErrors".to_string(),
+            self.health.write_errors.swap(0, Ordering::Relaxed) as f64,
+        );
+        v.insert(
+            "signalsSubscribed".to_string(),
+            self.health.signals_subscribed() as f64,
+        );
+        self.emit_combo(HEALTH, &[("instance", self.instance())], v, now)
+            .await;
     }
 
     async fn emit_connection(&self, now: bool) {
         let state = self.health.connection_state.load(Ordering::Relaxed) as f64;
         let values = self.inner.lock().unwrap().conn.drain(Instant::now(), state);
-        self.emit_combo(CONNECTION, &[("instance", self.instance())], values, now).await;
+        self.emit_combo(CONNECTION, &[("instance", self.instance())], values, now)
+            .await;
     }
 
     async fn emit_command(&self) {
         let rows: Vec<(&'static str, &'static str, HashMap<String, f64>)> = {
             let mut inner = self.inner.lock().unwrap();
-            inner.command.iter_mut().map(|((verb, result), c)| (*verb, *result, c.drain())).collect()
+            inner
+                .command
+                .iter_mut()
+                .map(|((verb, result), c)| (*verb, *result, c.drain()))
+                .collect()
         };
         for (verb, result, values) in rows {
-            self.emit_combo(COMMAND, &[("instance", self.instance()), ("verb", verb), ("result", result)], values, false).await;
+            self.emit_combo(
+                COMMAND,
+                &[
+                    ("instance", self.instance()),
+                    ("verb", verb),
+                    ("result", result),
+                ],
+                values,
+                false,
+            )
+            .await;
         }
     }
 }
@@ -850,10 +998,18 @@ mod tests {
         fn is_metric_defined(&self, _name: &str) -> bool {
             true
         }
-        async fn emit_metric(&self, _name: &str, _values: HashMap<String, f64>) -> edgecommons::Result<()> {
+        async fn emit_metric(
+            &self,
+            _name: &str,
+            _values: HashMap<String, f64>,
+        ) -> edgecommons::Result<()> {
             Ok(())
         }
-        async fn emit_metric_now(&self, _name: &str, _values: HashMap<String, f64>) -> edgecommons::Result<()> {
+        async fn emit_metric_now(
+            &self,
+            _name: &str,
+            _values: HashMap<String, f64>,
+        ) -> edgecommons::Result<()> {
             Ok(())
         }
         async fn flush_metrics(&self) -> edgecommons::Result<()> {
@@ -874,7 +1030,14 @@ mod tests {
     }
 
     fn dm(health: Arc<Health>, stale_secs: u64) -> DeviceMetrics {
-        DeviceMetrics::new(Arc::new(NoopMetrics), config(), "plc-1".to_string(), health, stale_secs, None)
+        DeviceMetrics::new(
+            Arc::new(NoopMetrics),
+            config(),
+            "plc-1".to_string(),
+            health,
+            stale_secs,
+            None,
+        )
     }
 
     #[test]
@@ -885,7 +1048,10 @@ mod tests {
         assert_eq!(inner.command.len(), COMMAND_VERBS.len() * RESULTS.len());
         for verb in COMMAND_VERBS {
             for result in RESULTS {
-                assert!(inner.command.contains_key(&(verb, result)), "{verb}/{result} pre-defined");
+                assert!(
+                    inner.command.contains_key(&(verb, result)),
+                    "{verb}/{result} pre-defined"
+                );
             }
         }
     }
@@ -902,9 +1068,15 @@ mod tests {
 
         let inner = dm.inner.lock().unwrap();
         assert_eq!(inner.conn.connect_attempts.total, 2.0);
-        assert_eq!(inner.conn.reconnect_attempts.total, 1.0, "only the second connect is a reconnect");
+        assert_eq!(
+            inner.conn.reconnect_attempts.total, 1.0,
+            "only the second connect is a reconnect"
+        );
         assert_eq!(inner.conn.connection_drops.total, 1.0);
-        assert!(inner.conn.connected_accrued_ms >= 100.0, "the first session's uptime accrued");
+        assert!(
+            inner.conn.connected_accrued_ms >= 100.0,
+            "the first session's uptime accrued"
+        );
     }
 
     #[test]
@@ -928,7 +1100,10 @@ mod tests {
         assert_eq!(ok.command_requests.total, 1.0);
         assert_eq!(ok.command_errors.total, 0.0, "a success is not an error");
         assert_eq!(err.command_requests.total, 1.0);
-        assert_eq!(err.command_errors.total, 1.0, "a failure counts a request AND an error");
+        assert_eq!(
+            err.command_errors.total, 1.0,
+            "a failure counts a request AND an error"
+        );
         assert_eq!(err.command_latency_ms, 6.0);
     }
 
@@ -949,7 +1124,11 @@ mod tests {
         let now = Instant::now();
         dm.on_signal_update("fresh", now);
         dm.on_signal_update("stale", now - Duration::from_secs(120));
-        assert_eq!(dm.stale_count(now), 1.0, "only the signal older than staleSignalSecs is stale");
+        assert_eq!(
+            dm.stale_count(now),
+            1.0,
+            "only the signal older than staleSignalSecs is stale"
+        );
     }
 
     #[test]
@@ -988,7 +1167,10 @@ mod tests {
         let inner = dm.inner.lock().unwrap();
         let ok = &inner.command[&("sb/status", RESULT_SUCCESS)];
         assert_eq!(ok.command_requests.total, 1.0);
-        assert_eq!(ok.command_requests.interval, 0.0, "the periodic emit drained the interval");
+        assert_eq!(
+            ok.command_requests.interval, 0.0,
+            "the periodic emit drained the interval"
+        );
     }
 
     /// `southbound_health` emits EXACTLY the SOUTHBOUND.md §5 set — asserted against an independent
@@ -1009,14 +1191,23 @@ mod tests {
         .into_iter()
         .collect();
 
-        let health = family_defs().into_iter().find(|f| f.name == HEALTH).expect("health family");
+        let health = family_defs()
+            .into_iter()
+            .find(|f| f.name == HEALTH)
+            .expect("health family");
         let emitted: std::collections::BTreeSet<&str> =
             health.measures.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(emitted, section_5, "southbound_health must be the exact §5 set — no more, no less");
+        assert_eq!(
+            emitted, section_5,
+            "southbound_health must be the exact §5 set — no more, no less"
+        );
 
         // The advertised const must agree with what family_defs emits.
         let advertised: std::collections::BTreeSet<&str> = HEALTH_MEASURES.into_iter().collect();
-        assert_eq!(advertised, section_5, "HEALTH_MEASURES must equal the §5 set");
+        assert_eq!(
+            advertised, section_5,
+            "HEALTH_MEASURES must equal the §5 set"
+        );
     }
 
     #[tokio::test]
@@ -1027,7 +1218,11 @@ mod tests {
         health.write_errors.fetch_add(2, Ordering::Relaxed);
         let dm = dm(Arc::clone(&health), 30);
 
-        assert_eq!(health.signals_subscribed(), 2, "the sb/signals inventory size while connected");
+        assert_eq!(
+            health.signals_subscribed(),
+            2,
+            "the sb/signals inventory size while connected"
+        );
         dm.emit_periodic().await;
         assert_eq!(
             health.write_errors.load(Ordering::Relaxed),
@@ -1044,36 +1239,67 @@ mod tests {
     fn operational_families_are_named_from_the_component_and_low_cardinality() {
         let defs = family_defs();
         let names: Vec<&str> = defs.iter().map(|f| f.name.as_str()).collect();
-        assert!(names.contains(&CONNECTION), "the Connection family is present");
+        assert!(
+            names.contains(&CONNECTION),
+            "the Connection family is present"
+        );
         assert!(names.contains(&COMMAND), "the Command family is present");
         // Named from the component token — a fleet view separates adapters by name.
         assert!(CONNECTION.ends_with("Connection") && CONNECTION != "Connection");
         assert!(COMMAND.ends_with("Command") && COMMAND != "Command");
 
         let cmd = defs.iter().find(|f| f.name == COMMAND).unwrap();
-        assert_eq!(cmd.dimensions, vec!["instance", "verb", "result"], "closed, low-cardinality dims only");
+        assert_eq!(
+            cmd.dimensions,
+            vec!["instance", "verb", "result"],
+            "closed, low-cardinality dims only"
+        );
     }
 
     /// The connection family is a set of Total/Interval counter pairs plus the state gauge and the
     /// duration sum — the operational-family pattern, spelled out.
     #[test]
     fn the_connection_family_is_the_counter_pair_pattern() {
-        let conn = family_defs().into_iter().find(|f| f.name == CONNECTION).unwrap();
+        let conn = family_defs()
+            .into_iter()
+            .find(|f| f.name == CONNECTION)
+            .unwrap();
         let names: Vec<&str> = conn.measures.iter().map(|m| m.name.as_str()).collect();
-        for base in ["connectAttempts", "connectFailures", "reconnectAttempts", "connectionDrops"] {
-            assert!(names.contains(&format!("{base}Total").as_str()), "{base}Total present");
-            assert!(names.contains(&format!("{base}Interval").as_str()), "{base}Interval present");
+        for base in [
+            "connectAttempts",
+            "connectFailures",
+            "reconnectAttempts",
+            "connectionDrops",
+        ] {
+            assert!(
+                names.contains(&format!("{base}Total").as_str()),
+                "{base}Total present"
+            );
+            assert!(
+                names.contains(&format!("{base}Interval").as_str()),
+                "{base}Interval present"
+            );
         }
         assert!(names.contains(&"connectionState"), "the state gauge");
-        assert!(names.contains(&"connectedDurationMs"), "the connected-duration sum");
+        assert!(
+            names.contains(&"connectedDurationMs"),
+            "the connected-duration sum"
+        );
     }
 
     /// The publish-shaping family: `instance`-dimensioned counter pairs for the three engine
     /// outcomes — published, coalesced, deadband-dropped.
     #[test]
     fn the_shaping_family_is_instance_dimensioned_counter_pairs() {
-        let shaping = family_defs().into_iter().find(|f| f.name == SHAPING).unwrap();
-        assert_eq!(shaping.dimensions, vec!["instance"], "shaping is a per-instance fact");
+        let shaping = family_defs()
+            .into_iter()
+            .find(|f| f.name == SHAPING)
+            .unwrap();
+        assert_eq!(
+            shaping.dimensions,
+            vec!["instance"],
+            "shaping is a per-instance fact"
+        );
         let names: Vec<&str> = shaping.measures.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(
             names,
@@ -1096,7 +1322,10 @@ mod tests {
             coalesced: 7,
             deadband_dropped: 2,
         });
-        dm.on_shaping(crate::shaping::ShapingCounters { published: 1, ..Default::default() });
+        dm.on_shaping(crate::shaping::ShapingCounters {
+            published: 1,
+            ..Default::default()
+        });
         {
             let mut inner = dm.inner.lock().unwrap();
             let values = inner.shaping.drain();
@@ -1106,12 +1335,21 @@ mod tests {
             assert_eq!(values["deadbandDroppedTotal"], 2.0);
         }
         // The emit path drains the interval; the total is monotonic.
-        dm.on_shaping(crate::shaping::ShapingCounters { published: 2, ..Default::default() });
+        dm.on_shaping(crate::shaping::ShapingCounters {
+            published: 2,
+            ..Default::default()
+        });
         dm.emit_periodic().await;
         let mut inner = dm.inner.lock().unwrap();
         let values = inner.shaping.drain();
-        assert_eq!(values["publishedTotal"], 6.0, "totals are monotonic across emits");
-        assert_eq!(values["publishedInterval"], 0.0, "the periodic emit drained the interval");
+        assert_eq!(
+            values["publishedTotal"], 6.0,
+            "totals are monotonic across emits"
+        );
+        assert_eq!(
+            values["publishedInterval"], 0.0,
+            "the periodic emit drained the interval"
+        );
     }
 
     #[test]
@@ -1127,7 +1365,10 @@ mod tests {
         let mut out2 = HashMap::new();
         p.drain_into(&mut out2, "x");
         assert_eq!(out2["xTotal"], 5.0, "total is monotonic across emits");
-        assert_eq!(out2["xInterval"], 2.0, "interval resets to only what accrued since the last emit");
+        assert_eq!(
+            out2["xInterval"], 2.0,
+            "interval resets to only what accrued since the last emit"
+        );
     }
 
     // --- the MTConnect families (HLD §9) ---------------------------------------------------------
@@ -1166,19 +1407,44 @@ mod tests {
     #[test]
     fn the_mtconnect_families_match_the_hld_table() {
         let defs = family_defs();
-        let by_name = |n: &str| defs.iter().find(|f| f.name == n).expect("family present").clone();
+        let by_name = |n: &str| {
+            defs.iter()
+                .find(|f| f.name == n)
+                .expect("family present")
+                .clone()
+        };
 
         // | MtconnectStream | agentId, result | documents, observations, heartbeats, reconnects,
         //   gaps, outOfRange, latencyMs |
         let stream = by_name("MtconnectStream");
         assert_eq!(stream.dimensions, vec!["agentId", "result"]);
         let names: Vec<&str> = stream.measures.iter().map(|m| m.name.as_str()).collect();
-        for base in ["documents", "observations", "heartbeats", "reconnects", "gaps", "outOfRange"] {
-            assert!(names.contains(&format!("{base}Total").as_str()), "{base}Total");
-            assert!(names.contains(&format!("{base}Interval").as_str()), "{base}Interval");
+        for base in [
+            "documents",
+            "observations",
+            "heartbeats",
+            "reconnects",
+            "gaps",
+            "outOfRange",
+        ] {
+            assert!(
+                names.contains(&format!("{base}Total").as_str()),
+                "{base}Total"
+            );
+            assert!(
+                names.contains(&format!("{base}Interval").as_str()),
+                "{base}Interval"
+            );
         }
-        assert!(names.contains(&"latencyMs"), "the latency sum is a single measure, not a pair");
-        assert_eq!(names.len(), 13, "six counter pairs plus the latency sum - no more");
+        assert!(
+            names.contains(&"latencyMs"),
+            "the latency sum is a single measure, not a pair"
+        );
+        assert_eq!(
+            names.len(),
+            13,
+            "six counter pairs plus the latency sum - no more"
+        );
 
         // | MtconnectProbe | agentId, result | probes, modelChanges, latencyMs |
         let probe = by_name("MtconnectProbe");
@@ -1195,7 +1461,8 @@ mod tests {
             ]
         );
 
-        // | MtconnectParse | instance, result | documentsParsed, parseErrors |
+        // | MtconnectParse | instance, result | documentsParsed, parseErrors,
+        //                                       rejectedObservations (D-R11) |
         let parse = by_name("MtconnectParse");
         assert_eq!(parse.dimensions, vec!["instance", "result"]);
         let names: Vec<&str> = parse.measures.iter().map(|m| m.name.as_str()).collect();
@@ -1205,7 +1472,9 @@ mod tests {
                 "documentsParsedTotal",
                 "documentsParsedInterval",
                 "parseErrorsTotal",
-                "parseErrorsInterval"
+                "parseErrorsInterval",
+                "rejectedObservationsTotal",
+                "rejectedObservationsInterval"
             ]
         );
 
@@ -1213,14 +1482,21 @@ mod tests {
         let allowed = ["instance", "verb", "result", "agentId"];
         for f in &defs {
             for d in &f.dimensions {
-                assert!(allowed.contains(&d.as_str()), "`{d}` is not a low-cardinality dimension");
+                assert!(
+                    allowed.contains(&d.as_str()),
+                    "`{d}` is not a low-cardinality dimension"
+                );
             }
         }
     }
 
     #[test]
     fn stream_values_put_each_counter_in_the_cell_its_outcome_belongs_to() {
-        let previous = AgentStatsSnapshot { documents: 10, observations: 40, ..Default::default() };
+        let previous = AgentStatsSnapshot {
+            documents: 10,
+            observations: 40,
+            ..Default::default()
+        };
         let total = AgentStatsSnapshot {
             documents: 14,
             documents_failed: 2,
@@ -1236,7 +1512,10 @@ mod tests {
 
         let ok = stream_values(&total, &previous, RESULT_SUCCESS);
         assert_eq!(ok["documentsTotal"], 14.0);
-        assert_eq!(ok["documentsInterval"], 4.0, "the interval is the delta since the last emit");
+        assert_eq!(
+            ok["documentsInterval"], 4.0,
+            "the interval is the delta since the last emit"
+        );
         assert_eq!(ok["observationsInterval"], 15.0);
         assert_eq!(ok["heartbeatsTotal"], 3.0);
         assert_eq!(ok["latencyMs"], 120.0);
@@ -1244,11 +1523,17 @@ mod tests {
         assert_eq!(ok["reconnectsTotal"], 0.0);
 
         let err = stream_values(&total, &previous, RESULT_ERROR);
-        assert_eq!(err["documentsTotal"], 2.0, "the error cell counts the undecodable documents");
+        assert_eq!(
+            err["documentsTotal"], 2.0,
+            "the error cell counts the undecodable documents"
+        );
         assert_eq!(err["gapsTotal"], 7.0);
         assert_eq!(err["outOfRangeTotal"], 1.0);
         assert_eq!(err["reconnectsTotal"], 1.0);
-        assert_eq!(err["latencyMs"], 9_000.0, "a failed request's latency does not flatter the mean");
+        assert_eq!(
+            err["latencyMs"], 9_000.0,
+            "a failed request's latency does not flatter the mean"
+        );
         assert_eq!(err["observationsTotal"], 0.0);
 
         // The two cells carry the SAME measure set — a fixed metric shape either way.
@@ -1259,7 +1544,11 @@ mod tests {
 
     #[test]
     fn probe_and_parse_values_split_by_outcome_and_never_go_backwards() {
-        let previous = AgentStatsSnapshot { probes: 5, probe_latency_ms: 50, ..Default::default() };
+        let previous = AgentStatsSnapshot {
+            probes: 5,
+            probe_latency_ms: 50,
+            ..Default::default()
+        };
         let total = AgentStatsSnapshot {
             probes: 7,
             probes_failed: 2,
@@ -1274,19 +1563,56 @@ mod tests {
         assert_eq!(ok["latencyMs"], 40.0);
         let err = probe_values(&total, &previous, RESULT_ERROR);
         assert_eq!(err["probesTotal"], 2.0);
-        assert_eq!(err["modelChangesTotal"], 0.0, "a failed probe cannot have seen a new model");
+        assert_eq!(
+            err["modelChangesTotal"], 0.0,
+            "a failed probe cannot have seen a new model"
+        );
         assert_eq!(err["latencyMs"], 400.0);
 
-        let parsed = ParseCounters { documents_parsed: 9, parse_errors: 2, unknown_elements: 4 };
-        let before = ParseCounters { documents_parsed: 9, parse_errors: 1, unknown_elements: 0 };
+        let parsed = ParseCounters {
+            documents_parsed: 9,
+            parse_errors: 2,
+            unknown_elements: 4,
+            rejected_observations: 5,
+        };
+        let before = ParseCounters {
+            documents_parsed: 9,
+            parse_errors: 1,
+            unknown_elements: 0,
+            rejected_observations: 2,
+        };
         let ok = parse_values(&parsed, &before, RESULT_SUCCESS);
-        assert_eq!((ok["documentsParsedTotal"], ok["documentsParsedInterval"]), (9.0, 0.0));
+        assert_eq!(
+            (ok["documentsParsedTotal"], ok["documentsParsedInterval"]),
+            (9.0, 0.0)
+        );
+        assert_eq!(
+            (
+                ok["rejectedObservationsTotal"],
+                ok["rejectedObservationsInterval"]
+            ),
+            (0.0, 0.0),
+            "a refused observation is not a success"
+        );
         let err = parse_values(&parsed, &before, RESULT_ERROR);
-        assert_eq!((err["parseErrorsTotal"], err["parseErrorsInterval"]), (2.0, 1.0));
+        assert_eq!(
+            (err["parseErrorsTotal"], err["parseErrorsInterval"]),
+            (2.0, 1.0)
+        );
+        // D-R11: observations the agent sent and this client refused, in the failure cell — the
+        // document parsed, so `parseErrors` would have been the wrong home for them.
+        assert_eq!(
+            (
+                err["rejectedObservationsTotal"],
+                err["rejectedObservationsInterval"]
+            ),
+            (5.0, 3.0)
+        );
 
         // A source that somehow reports less than last time yields 0, never a negative interval.
         let backwards = parse_values(&before, &parsed, RESULT_ERROR);
         assert_eq!(backwards["parseErrorsInterval"], 0.0);
+        assert_eq!(backwards["rejectedObservationsInterval"], 0.0);
     }
 
     #[tokio::test]
@@ -1301,11 +1627,22 @@ mod tests {
 
         agent.stats.lock().unwrap().documents = 4;
         am.emit_periodic().await;
-        assert_eq!(am.previous.lock().unwrap().documents, 4, "the baseline moved to what was emitted");
+        assert_eq!(
+            am.previous.lock().unwrap().documents,
+            4,
+            "the baseline moved to what was emitted"
+        );
 
         agent.stats.lock().unwrap().documents = 6;
         am.emit_periodic().await;
-        let values = stream_values(&agent.stats(), &AgentStatsSnapshot { documents: 4, ..Default::default() }, RESULT_SUCCESS);
+        let values = stream_values(
+            &agent.stats(),
+            &AgentStatsSnapshot {
+                documents: 4,
+                ..Default::default()
+            },
+            RESULT_SUCCESS,
+        );
         assert_eq!(values["documentsInterval"], 2.0, "only the new documents");
     }
 
@@ -1323,10 +1660,16 @@ mod tests {
         dm.define_all();
         agent.parse.lock().unwrap().record_ok(0);
         agent.parse.lock().unwrap().record_err();
+        agent.parse.lock().unwrap().record_rejected();
         dm.emit_periodic().await;
         assert_eq!(
             dm.inner.lock().unwrap().previous_parse,
-            ParseCounters { documents_parsed: 1, parse_errors: 1, unknown_elements: 0 },
+            ParseCounters {
+                documents_parsed: 1,
+                parse_errors: 1,
+                unknown_elements: 0,
+                rejected_observations: 1,
+            },
             "the emit advanced this instance's own baseline"
         );
 
@@ -1334,7 +1677,10 @@ mod tests {
         let plain = dm_no_agent();
         plain.define_all();
         plain.emit_periodic().await;
-        assert_eq!(plain.inner.lock().unwrap().previous_parse, ParseCounters::default());
+        assert_eq!(
+            plain.inner.lock().unwrap().previous_parse,
+            ParseCounters::default()
+        );
     }
 
     fn dm_no_agent() -> DeviceMetrics {
@@ -1366,6 +1712,9 @@ mod tests {
             .values()
             .filter(|&&t| Instant::now().saturating_duration_since(t) > Duration::from_secs(30))
             .count();
-        assert_eq!(count, 1, "only the signal older than staleSignalSecs is stale");
+        assert_eq!(
+            count, 1,
+            "only the signal older than staleSignalSecs is stale"
+        );
     }
 }

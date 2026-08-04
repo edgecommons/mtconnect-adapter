@@ -1,0 +1,107 @@
+RecipeFormatVersion: '2020-01-25'
+ComponentName: com.mbreissi.edgecommons.MtconnectAdapter
+ComponentVersion: 1.0.0
+ComponentDescription: The MtconnectAdapter component (GREENGRASS deployed release leg).
+ComponentPublisher: EdgeCommons
+ComponentConfiguration:
+  DefaultConfiguration:
+    ComponentConfig:
+      logging:
+        level: DEBUG
+        # No `rust_format`: the library's DEFAULT `fmt` layers, which keep the tracing fields
+        # (instance, error, permanent, wait_ms, ...) AND install the rotating file appender.
+        # (`json` would keep the fields too but is stdout-only — `logging::installs_file_appender`
+        # never installs file rotation under it.)
+        #
+        # The file appender is the evidence channel for the teardown narration. This Nucleus does
+        # not copy component stdout into a per-component log file at all, and in any case a stdout
+        # pipe is owned by the lifecycle shell rather than the component. An in-process file proves
+        # what the component actually executed, not merely what a pipe survived to carry.
+        fileLogging:
+          enabled: true
+          # Outside the component work dir on purpose: `deployment create --remove` tears the work
+          # dir down with the component, and the teardown narration is exactly what has to survive.
+          filePath: /var/tmp/mtc-leg/component.log
+          maxFileSize: 50MB
+          backupCount: 3
+      heartbeat:
+        enabled: true
+        intervalSecs: 3
+        destination: local
+        measures:
+          cpu: true
+          memory: true
+          disk: false
+      metricEmission:
+        target: log
+        namespace: edgecommons
+        targetConfig:
+          logFileName: /greengrass/v2/work/{ComponentFullName}/metric.log
+      tags:
+        appId: mtconnect-gg-leg
+        site: lab-5950x
+      component:
+        token: mtconnect-adapter
+        global:
+          agents:
+          - id: live-agent
+            url: http://192.168.1.224:5010
+            streaming: prefer
+            heartbeatMs: 3000
+            pollIntervalMs: 500
+            requestTimeoutMs: 3000
+            reconnect:
+              initialMs: 500
+              maxMs: 4000
+          defaults:
+            pollIntervalMs: 250
+            publishMode: on-change
+          healthThresholds:
+            staleSignalSecs: 6
+        instances:
+        - id: cnc-1
+          adapter: mtconnect
+          connection:
+            agentId: live-agent
+            deviceUuid: MTC-E2E-001
+          pollIntervalMs: 250
+          signals:
+          - id: x-position
+            name: X axis actual position
+            dataItemId: d1-Xabs
+            conditionBinding:
+            - d1-travel
+          - id: availability
+            name: Device availability
+            dataItemId: d1-avail
+          - id: execution
+            name: Execution state
+            dataItemId: d1-exec
+          - id: x-travel
+            name: X axis travel condition
+            dataItemId: d1-travel
+          writes:
+            allow: []
+    accessControl:
+      aws.greengrass.ipc.pubsub:
+        com.mbreissi.edgecommons.MtconnectAdapter:pubsub:1:
+          policyDescription: Allows access to publish/subscribe to all local topics.
+          operations:
+          - aws.greengrass#PublishToTopic
+          - aws.greengrass#SubscribeToTopic
+          resources:
+          - '*'
+Manifests:
+- Platform:
+    os: linux
+  Artifacts:
+  - URI: s3://BUCKET_NAME/COMPONENT_NAME/COMPONENT_VERSION/mtconnect-adapter
+  Lifecycle:
+    Install:
+      Script: chmod +x {artifacts:path}/mtconnect-adapter
+    Run:
+      # Carries the repo-root recipe's `exec` form under test: it replaces the lifecycle shell
+      # with the component, so the Nucleus's SIGTERM reaches the process that must act on it
+      # instead of its parent shell, and the stdout Copier stays attached until the component
+      # itself exits.
+      Script: 'exec {artifacts:path}/mtconnect-adapter --platform GREENGRASS -c GG_CONFIG'

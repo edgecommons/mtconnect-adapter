@@ -193,7 +193,7 @@ ConfigMap, identity from the Downward API.
 
 `.github/workflows/ci.yml` calls the org's reusable `component-ci.yml` (build/test/clippy) plus an
 in-repo `coverage` job (`cargo llvm-cov --fail-under-lines 90`, excluding only
-`supervisor.rs`/`main.rs`/`tests/live_*.rs` — see `AGENTS.md`). Add the `EDGECOMMONS_READ_TOKEN`
+`supervisor.rs`/`main.rs` and the env-gated live suites — see `AGENTS.md`). Add the `EDGECOMMONS_READ_TOKEN`
 secret if your dependency form needs it (a `pinned-rev`/`registry` git dependency does; `local` does
 not). Commit `Cargo.lock` if you have not already — `edgecommons component validate` warns if it is
 missing.
@@ -203,4 +203,6 @@ secret and is registered in `registry/components.json` — harmless either way.
 
 The env-gated live suites (`tests/live_sim.rs`, `tests/agent_integration.rs`) are not run in the
 default CI job — they self-skip without their respective environment variable, so the ordinary gate
-never depends on Docker or a live agent being reachable from the runner.
+never depends on Docker or a live agent being reachable from the runner. A CI leg or lab run that is
+*supposed* to have the live infrastructure sets `EC_REQUIRE_LIVE=1` beside it: the self-skip then
+becomes a hard failure, so a broken harness cannot masquerade as a green gate.

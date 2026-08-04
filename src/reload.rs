@@ -38,8 +38,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::app::{ChannelBudgets, DeviceConfig};
-use crate::mtconnect::config::{DeviceConfig as MtcDeviceConfig, SignalConfig};
 use crate::mtconnect::SelectionConfig;
+use crate::mtconnect::config::{DeviceConfig as MtcDeviceConfig, SignalConfig};
 
 /// The rejection code for a candidate that changes something only a restart can apply.
 pub const RESTART_REQUIRED: &str = "RESTART_REQUIRED";
@@ -63,13 +63,18 @@ pub enum Verdict {
 
 impl Verdict {
     fn reject(code: &'static str, message: impl Into<String>) -> Self {
-        Self::Reject { code, message: message.into() }
+        Self::Reject {
+            code,
+            message: message.into(),
+        }
     }
 }
 
 /// `component.global.agents` of a raw configuration document, or `null` when it declares none.
 fn agents_of(config: &Value) -> &Value {
-    config.pointer("/component/global/agents").unwrap_or(&Value::Null)
+    config
+        .pointer("/component/global/agents")
+        .unwrap_or(&Value::Null)
 }
 
 /// `component.instances` of a raw configuration document.
@@ -82,7 +87,10 @@ fn instances_of(config: &Value) -> &[Value] {
 
 /// The instance ids a raw configuration declares, in order.
 fn instance_ids_of(config: &Value) -> Vec<&str> {
-    instances_of(config).iter().filter_map(|i| i.get("id").and_then(Value::as_str)).collect()
+    instances_of(config)
+        .iter()
+        .filter_map(|i| i.get("id").and_then(Value::as_str))
+        .collect()
 }
 
 /// The pre-commit verdict on one candidate. `current` is the configuration in force (`None` on the
@@ -137,9 +145,13 @@ pub fn compile_with(
 ) -> Result<Vec<MtcDeviceConfig>, String> {
     let mut devices: Vec<DeviceConfig> = Vec::new();
     for raw in instances_of(config) {
-        let id = raw.get("id").and_then(Value::as_str).unwrap_or("<unnamed>").to_string();
-        let device: DeviceConfig = serde_json::from_value(raw.clone())
-            .map_err(|e| format!("instance `{id}`: {e}"))?;
+        let id = raw
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let device: DeviceConfig =
+            serde_json::from_value(raw.clone()).map_err(|e| format!("instance `{id}`: {e}"))?;
         devices.push(device);
     }
     let needs_agents = devices.iter().any(|d| d.adapter == crate::device::KIND);
@@ -155,8 +167,7 @@ pub fn compile_with(
         return Ok(Vec::new());
     }
     let global = agent_host(config);
-    let agents =
-        crate::mtconnect::config::parse_agents(&global).map_err(|e| e.to_string())?;
+    let agents = crate::mtconnect::config::parse_agents(&global).map_err(|e| e.to_string())?;
     let defaults = crate::app::publish_defaults_of(&global);
     crate::app::compile_mtconnect(&mut devices, &agents, defaults, budgets)
         .map_err(|e| e.to_string())
@@ -164,7 +175,10 @@ pub fn compile_with(
 
 /// `parse_agents` reads `component.global`; hand it exactly that subtree.
 fn agent_host(config: &Value) -> Value {
-    config.pointer("/component/global").cloned().unwrap_or(Value::Null)
+    config
+        .pointer("/component/global")
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 // =================================================================================================
@@ -191,7 +205,11 @@ impl InstanceSignals {
     #[must_use]
     pub fn new(signals: Vec<SignalConfig>, selection: Option<SelectionConfig>) -> Self {
         let generation = generation_of(&signals, selection.as_ref());
-        Self { generation, signals, selection }
+        Self {
+            generation,
+            signals,
+            selection,
+        }
     }
 }
 
@@ -269,10 +287,12 @@ pub fn generation_of(signals: &[SignalConfig], selection: Option<&SelectionConfi
         hasher.update(sel.channel_budget.max_bytes.to_le_bytes());
     }
     let digest = hasher.finalize();
-    digest[..8].iter().fold(String::with_capacity(16), |mut acc, b| {
-        acc.push_str(&format!("{b:02x}"));
-        acc
-    })
+    digest[..8]
+        .iter()
+        .fold(String::with_capacity(16), |mut acc, b| {
+            acc.push_str(&format!("{b:02x}"));
+            acc
+        })
 }
 
 /// The `sb/browse` view generation: the probe model's digest **and** the signal set's, because both
@@ -291,7 +311,9 @@ impl SignalSlot {
     /// The slot for one instance's starting configuration.
     #[must_use]
     pub fn new(signals: Vec<SignalConfig>, selection: Option<SelectionConfig>) -> Self {
-        Self(ArcSwap::from_pointee(InstanceSignals::new(signals, selection)))
+        Self(ArcSwap::from_pointee(InstanceSignals::new(
+            signals, selection,
+        )))
     }
 
     /// The generation in force — a whole, self-consistent snapshot.
@@ -330,7 +352,10 @@ impl SignalRegistry {
                     s.channel_budget = budgets.get(&d.id);
                     s
                 });
-                (d.id.clone(), Arc::new(SignalSlot::new(d.signals.clone(), selection)))
+                (
+                    d.id.clone(),
+                    Arc::new(SignalSlot::new(d.signals.clone(), selection)),
+                )
             })
             .collect();
         Self { slots, budgets }
@@ -420,7 +445,10 @@ mod tests {
         );
         assert!(matches!(
             classify(&added, Some(&current)),
-            Verdict::Reject { code: RESTART_REQUIRED, .. }
+            Verdict::Reject {
+                code: RESTART_REQUIRED,
+                ..
+            }
         ));
     }
 
@@ -442,7 +470,10 @@ mod tests {
         let emptied = config(agents(), json!([]));
         assert!(matches!(
             classify(&emptied, Some(&current)),
-            Verdict::Reject { code: RESTART_REQUIRED, .. }
+            Verdict::Reject {
+                code: RESTART_REQUIRED,
+                ..
+            }
         ));
     }
 
@@ -480,22 +511,37 @@ mod tests {
                 { "id": "x", "dataItemId": "Xabs", "conditionBinding": ["Xabs"] }
             ]))]),
         );
-        assert!(matches!(classify(&candidate, Some(&current)), Verdict::Reject { .. }));
+        assert!(matches!(
+            classify(&candidate, Some(&current)),
+            Verdict::Reject { .. }
+        ));
 
         // A typo'd key is a mistake, not a no-op.
         let candidate = config(
             agents(),
             json!([instance(json!([{ "id": "x", "dataItemID": "Xabs" }]))]),
         );
-        assert!(matches!(classify(&candidate, Some(&current)), Verdict::Reject { .. }));
+        assert!(matches!(
+            classify(&candidate, Some(&current)),
+            Verdict::Reject { .. }
+        ));
     }
 
     #[test]
     fn the_initial_load_has_nothing_to_compare_against_but_is_still_validated() {
-        assert_eq!(classify(&config(agents(), json!([instance(one_signal())])), None), Verdict::Accept);
+        assert_eq!(
+            classify(&config(agents(), json!([instance(one_signal())])), None),
+            Verdict::Accept
+        );
 
         let broken = config(json!([]), json!([instance(one_signal())]));
-        assert!(matches!(classify(&broken, None), Verdict::Reject { code: INVALID_CONFIG, .. }));
+        assert!(matches!(
+            classify(&broken, None),
+            Verdict::Reject {
+                code: INVALID_CONFIG,
+                ..
+            }
+        ));
 
         // A simulator-only deployment declares no agents at all, and that is fine.
         let sim = json!({ "component": { "global": {}, "instances": [
@@ -507,7 +553,10 @@ mod tests {
     #[test]
     fn the_generation_is_content_addressed_so_only_a_real_change_invalidates_cursors() {
         let compile_one = |raw: Value| -> Vec<SignalConfig> {
-            compile(&config(agents(), json!([instance(raw)]))).unwrap().remove(0).signals
+            compile(&config(agents(), json!([instance(raw)])))
+                .unwrap()
+                .remove(0)
+                .signals
         };
         let a = compile_one(one_signal());
         let same = compile_one(json!([{ "id": "x-position", "dataItemId": "Xabs" }]));
@@ -517,7 +566,8 @@ mod tests {
             "the same set is the same generation"
         );
 
-        let renamed = compile_one(json!([{ "id": "x-position", "dataItemId": "Xabs", "name": "X" }]));
+        let renamed =
+            compile_one(json!([{ "id": "x-position", "dataItemId": "Xabs", "name": "X" }]));
         assert_ne!(
             generation_of(&a, None),
             generation_of(&renamed, None),
@@ -540,10 +590,8 @@ mod tests {
         assert_ne!(generation_of(&a, None), generation_of(&cleared, None));
 
         // A publish-policy edit swaps too: the served policy is observable.
-        let policed = compile_one(
-            json!([{ "id": "x-position", "dataItemId": "Xabs",
-                     "publish": { "mode": "interval", "batchMs": 100 } }]),
-        );
+        let policed = compile_one(json!([{ "id": "x-position", "dataItemId": "Xabs",
+                     "publish": { "mode": "interval", "batchMs": 100 } }]));
         assert_ne!(generation_of(&a, None), generation_of(&policed, None));
 
         assert_eq!(generation_of(&[], None).len(), 16, "a short, stable token");
@@ -569,15 +617,19 @@ mod tests {
         assert_ne!(all, filtered);
         let capped = generation_of(&[], sel(json!({ "mode": "all", "maxSignals": 3 })).as_ref());
         assert_ne!(all, capped);
-        let unbound =
-            generation_of(&[], sel(json!({ "mode": "all", "autoConditionBinding": false })).as_ref());
+        let unbound = generation_of(
+            &[],
+            sel(json!({ "mode": "all", "autoConditionBinding": false })).as_ref(),
+        );
         assert_ne!(all, unbound);
 
         // The channel budget shapes every derived channel, so it moves the generation too - a
         // browse cursor minted against one set of channels must not page through another.
         let mut squeezed = sel(json!({ "mode": "all" })).unwrap();
-        squeezed.channel_budget =
-            crate::mtconnect::ChannelBudget { max_tokens: 1, max_bytes: 32 };
+        squeezed.channel_budget = crate::mtconnect::ChannelBudget {
+            max_tokens: 1,
+            max_bytes: 32,
+        };
         assert_ne!(all, generation_of(&[], Some(&squeezed)));
     }
 
@@ -593,7 +645,10 @@ mod tests {
             selection: Some(serde_json::from_value(json!({ "mode": "all" })).unwrap()),
         }];
         let mut budgets = ChannelBudgets::default();
-        let tight = crate::mtconnect::ChannelBudget { max_tokens: 2, max_bytes: 48 };
+        let tight = crate::mtconnect::ChannelBudget {
+            max_tokens: 2,
+            max_bytes: 48,
+        };
         budgets.insert("cnc-1", tight);
 
         let registry = SignalRegistry::new(&devices, budgets);
@@ -623,7 +678,10 @@ mod tests {
         assert_eq!(changed, vec!["cnc-1".to_string()]);
         let after = registry.slot("cnc-1").unwrap().load();
         assert_eq!(after.selection.as_ref().unwrap().max_signals, 3);
-        assert_ne!(after.generation, before.generation, "browse cursors are void");
+        assert_ne!(
+            after.generation, before.generation,
+            "browse cursors are void"
+        );
 
         // A selection whose regex does not compile is refused BEFORE it commits.
         let broken = with_selection(json!({ "mode": "include", "include": [{ "type": "(" }] }));
@@ -645,16 +703,33 @@ mod tests {
             "connection": { "endpoint": "sim://plc-1" },
             "selection": { "mode": "all" }
         }] } });
-        assert!(matches!(classify(&sim, None), Verdict::Reject { code: INVALID_CONFIG, .. }));
+        assert!(matches!(
+            classify(&sim, None),
+            Verdict::Reject {
+                code: INVALID_CONFIG,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn the_view_generation_moves_when_either_half_does() {
         let probe = "sha256:abcd";
         let g = view_generation(probe, "0011223344556677");
-        assert!(g.starts_with(probe), "the probe digest still leads the token");
-        assert_ne!(g, view_generation("sha256:beef", "0011223344556677"), "a new probe model");
-        assert_ne!(g, view_generation(probe, "ffffffffffffffff"), "a new signal set");
+        assert!(
+            g.starts_with(probe),
+            "the probe digest still leads the token"
+        );
+        assert_ne!(
+            g,
+            view_generation("sha256:beef", "0011223344556677"),
+            "a new probe model"
+        );
+        assert_ne!(
+            g,
+            view_generation(probe, "ffffffffffffffff"),
+            "a new signal set"
+        );
     }
 
     #[test]
@@ -665,9 +740,14 @@ mod tests {
         assert_eq!(before.signals.len(), 1);
 
         // The same configuration again changes nothing — cursors stay valid.
-        let unchanged = registry.apply(&config(agents(), json!([instance(one_signal())]))).unwrap();
+        let unchanged = registry
+            .apply(&config(agents(), json!([instance(one_signal())])))
+            .unwrap();
         assert!(unchanged.is_empty());
-        assert_eq!(registry.slot("cnc-1").unwrap().load().generation, before.generation);
+        assert_eq!(
+            registry.slot("cnc-1").unwrap().load().generation,
+            before.generation
+        );
 
         // A real edit swaps the whole set at once.
         let changed = registry
@@ -682,12 +762,18 @@ mod tests {
         assert_eq!(changed, vec!["cnc-1".to_string()]);
         let after = registry.slot("cnc-1").unwrap().load();
         assert_eq!(after.signals.len(), 2);
-        assert_ne!(after.generation, before.generation, "browse cursors are void");
+        assert_ne!(
+            after.generation, before.generation,
+            "browse cursors are void"
+        );
 
         // A candidate that does not compile leaves the live generation exactly where it was.
         let broken = config(agents(), json!([instance(json!([{ "id": "x" }]))]));
         assert!(registry.apply(&broken).is_err());
-        assert_eq!(registry.slot("cnc-1").unwrap().load().generation, after.generation);
+        assert_eq!(
+            registry.slot("cnc-1").unwrap().load().generation,
+            after.generation
+        );
 
         assert!(registry.slot("nope").is_none());
     }

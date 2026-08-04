@@ -47,7 +47,12 @@ impl Part {
 /// Whether this content type is a multipart stream this client reads.
 #[must_use]
 pub fn is_multipart(content_type: &str) -> bool {
-    let base = content_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+    let base = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     base == X_MIXED_REPLACE || base == MIXED
 }
 
@@ -85,7 +90,10 @@ enum SplitState {
     /// Reading the part's headers until the blank line.
     Headers,
     /// Reading the part's body.
-    Body { content_type: Option<String>, content_length: Option<usize> },
+    Body {
+        content_type: Option<String>,
+        content_length: Option<usize>,
+    },
 }
 
 /// A bounded incremental splitter for an in-flight multipart body.
@@ -147,7 +155,9 @@ impl MultipartReader {
     /// header allowance).
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), MtcError> {
         if self.buffer.len() + chunk.len() > self.max_part_bytes + MAX_PART_HEADER_BYTES {
-            return Err(MtcError::TooLarge { limit: self.max_part_bytes });
+            return Err(MtcError::TooLarge {
+                limit: self.max_part_bytes,
+            });
         }
         self.buffer.extend_from_slice(chunk);
         Ok(())
@@ -230,17 +240,24 @@ impl MultipartReader {
                         }
                         return Ok(None);
                     };
-                    let (content_type, content_length) =
-                        parse_part_headers(&self.buffer[..end])?;
+                    let (content_type, content_length) = parse_part_headers(&self.buffer[..end])?;
                     if let Some(len) = content_length {
                         if len > self.max_part_bytes {
-                            return Err(MtcError::TooLarge { limit: self.max_part_bytes });
+                            return Err(MtcError::TooLarge {
+                                limit: self.max_part_bytes,
+                            });
                         }
                     }
                     self.buffer.drain(..end + sep);
-                    self.state = SplitState::Body { content_type, content_length };
+                    self.state = SplitState::Body {
+                        content_type,
+                        content_length,
+                    };
                 }
-                SplitState::Body { content_type, content_length } => {
+                SplitState::Body {
+                    content_type,
+                    content_length,
+                } => {
                     match content_length {
                         // The declared length is trusted (a body may contain boundary-looking
                         // bytes) but was capped above.
@@ -267,16 +284,26 @@ impl MultipartReader {
                                 }
                                 return Ok(None);
                             };
-                            let end = if i > 0 && self.buffer[i - 1] == b'\r' { i - 1 } else { i };
+                            let end = if i > 0 && self.buffer[i - 1] == b'\r' {
+                                i - 1
+                            } else {
+                                i
+                            };
                             let body: Vec<u8> = self.buffer[..end].to_vec();
                             // Consume through the newline; the marker itself is re-found by Seek.
                             self.buffer.drain(..=i);
                             self.state = SplitState::Seek;
                             let len = body.len();
                             if len > self.max_part_bytes {
-                                return Err(MtcError::TooLarge { limit: self.max_part_bytes });
+                                return Err(MtcError::TooLarge {
+                                    limit: self.max_part_bytes,
+                                });
                             }
-                            return Ok(Some(Part { content_type, content_length: None, body }));
+                            return Ok(Some(Part {
+                                content_type,
+                                content_length: None,
+                                body,
+                            }));
                         }
                     }
                 }
@@ -306,9 +333,7 @@ fn find_blank_line(buf: &[u8]) -> Option<(usize, usize)> {
 
 /// Parse a part's header block into the two headers this client reads. Unknown headers are
 /// ignored; a line without a `:` is unframeable.
-fn parse_part_headers(
-    head: &[u8],
-) -> Result<(Option<String>, Option<usize>), MtcError> {
+fn parse_part_headers(head: &[u8]) -> Result<(Option<String>, Option<usize>), MtcError> {
     let text = std::str::from_utf8(head)
         .map_err(|_| MtcError::Multipart("part headers are not valid UTF-8".into()))?;
     let mut content_type = None;
@@ -319,7 +344,9 @@ fn parse_part_headers(
             continue;
         }
         let Some((name, value)) = line.split_once(':') else {
-            return Err(MtcError::Multipart(format!("malformed part header line `{line}`")));
+            return Err(MtcError::Multipart(format!(
+                "malformed part header line `{line}`"
+            )));
         };
         match name.trim().to_ascii_lowercase().as_str() {
             "content-type" => content_type = Some(value.trim().to_string()),
@@ -341,9 +368,14 @@ mod tests {
     #[test]
     fn both_observed_content_types_are_accepted() {
         // The standard's type, and the one cppagent 2.7 actually sends.
-        assert!(is_multipart("multipart/x-mixed-replace;boundary=--------------------------"));
+        assert!(is_multipart(
+            "multipart/x-mixed-replace;boundary=--------------------------"
+        ));
         assert!(is_multipart("multipart/mixed; boundary=abc"));
-        assert!(is_multipart("MULTIPART/MIXED; boundary=abc"), "case is not semantics");
+        assert!(
+            is_multipart("MULTIPART/MIXED; boundary=abc"),
+            "case is not semantics"
+        );
         assert!(!is_multipart("application/xml"));
         assert!(!is_multipart("multipart/form-data; boundary=abc"));
     }
@@ -351,16 +383,28 @@ mod tests {
     #[test]
     fn the_boundary_is_read_off_the_content_type() {
         assert_eq!(
-            boundary_from_content_type("multipart/x-mixed-replace;boundary=--------------------------"),
+            boundary_from_content_type(
+                "multipart/x-mixed-replace;boundary=--------------------------"
+            ),
             Some("--------------------------".to_string())
         );
         assert_eq!(
             boundary_from_content_type("multipart/mixed; boundary=\"quoted-boundary\""),
             Some("quoted-boundary".to_string())
         );
-        assert_eq!(boundary_from_content_type("multipart/mixed"), None, "no boundary declared");
-        assert_eq!(boundary_from_content_type("multipart/mixed; boundary="), None);
-        assert_eq!(boundary_from_content_type("application/xml; boundary=x"), None);
+        assert_eq!(
+            boundary_from_content_type("multipart/mixed"),
+            None,
+            "no boundary declared"
+        );
+        assert_eq!(
+            boundary_from_content_type("multipart/mixed; boundary="),
+            None
+        );
+        assert_eq!(
+            boundary_from_content_type("application/xml; boundary=x"),
+            None
+        );
     }
 
     #[test]
@@ -371,7 +415,10 @@ mod tests {
 
         for bad in ["application/xml", "multipart/mixed", ""] {
             assert!(
-                matches!(MultipartReader::from_content_type(bad, 1024), Err(MtcError::Multipart(_))),
+                matches!(
+                    MultipartReader::from_content_type(bad, 1024),
+                    Err(MtcError::Multipart(_))
+                ),
                 "`{bad}` cannot be framed"
             );
         }
@@ -386,14 +433,20 @@ mod tests {
         // The buffer cap is the part cap plus the bounded header allowance — one byte past it and
         // the stream is dropped rather than buffered.
         let filler = vec![b'z'; MAX_PART_HEADER_BYTES + 1];
-        assert!(matches!(r.push(&filler), Err(MtcError::TooLarge { limit: 8 })));
+        assert!(matches!(
+            r.push(&filler),
+            Err(MtcError::TooLarge { limit: 8 })
+        ));
 
         assert_eq!(r.take_buffer(), b"12345678".to_vec());
         assert!(r.buffered().is_empty(), "taking the buffer empties it");
 
         r.push(b"abc").unwrap();
         r.reset();
-        assert!(r.buffered().is_empty(), "a re-established stream starts clean");
+        assert!(
+            r.buffered().is_empty(),
+            "a re-established stream starts clean"
+        );
     }
 
     // --- the splitter -----------------------------------------------------------------------
@@ -417,7 +470,10 @@ mod tests {
 
     #[test]
     fn a_whole_body_splits_into_its_parts_under_both_content_types() {
-        for ct in ["multipart/x-mixed-replace;boundary=B", "multipart/mixed; boundary=B"] {
+        for ct in [
+            "multipart/x-mixed-replace;boundary=B",
+            "multipart/mixed; boundary=B",
+        ] {
             let mut r = MultipartReader::from_content_type(ct, 1024).unwrap();
             let mut body = part_bytes("B", "<one/>");
             body.extend_from_slice(&part_bytes("B", "<two/>"));
@@ -453,8 +509,10 @@ mod tests {
 
     #[test]
     fn preamble_and_junk_between_parts_are_skipped_never_buffered() {
-        let mut r = MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
-        r.push(b"some preamble the sender should not have written\r\n").unwrap();
+        let mut r =
+            MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
+        r.push(b"some preamble the sender should not have written\r\n")
+            .unwrap();
         r.push(&part_bytes("B", "<ok/>")).unwrap();
         r.push(b"junk between parts").unwrap();
         r.push(&part_bytes("B", "<ok2/>")).unwrap();
@@ -476,7 +534,8 @@ mod tests {
     #[test]
     fn a_declared_length_is_trusted_so_a_body_may_contain_boundary_bytes() {
         let body = "<x>--B inside</x>";
-        let mut r = MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
+        let mut r =
+            MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
         r.push(&part_bytes("B", body)).unwrap();
         let parts = drain(&mut r);
         assert_eq!(parts.len(), 1);
@@ -485,10 +544,12 @@ mod tests {
 
     #[test]
     fn a_missing_content_length_falls_back_to_boundary_delimiting() {
-        let mut r = MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
+        let mut r =
+            MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
         r.push(b"--B\r\nContent-type: text/xml\r\n\r\n<no-length/>\r\n--B\r\n")
             .unwrap();
-        r.push(b"Content-type: text/xml\r\nContent-length: 5\r\n\r\n<t/>x\r\n").unwrap();
+        r.push(b"Content-type: text/xml\r\nContent-length: 5\r\n\r\n<t/>x\r\n")
+            .unwrap();
         let parts = drain(&mut r);
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].text().unwrap(), "<no-length/>");
@@ -501,34 +562,44 @@ mod tests {
         // Declared: refused from the header alone, before any body arrives.
         let mut r = MultipartReader::from_content_type("multipart/mixed; boundary=B", 16).unwrap();
         r.push(b"--B\r\nContent-length: 1000\r\n\r\n").unwrap();
-        assert!(matches!(r.next_part(), Err(MtcError::TooLarge { limit: 16 })));
+        assert!(matches!(
+            r.next_part(),
+            Err(MtcError::TooLarge { limit: 16 })
+        ));
 
         // Undeclared: refused when the delimited body runs past the cap without a boundary.
         let mut r = MultipartReader::from_content_type("multipart/mixed; boundary=B", 16).unwrap();
         r.push(b"--B\r\nContent-type: text/xml\r\n\r\n").unwrap();
         r.push(&[b'x'; 32]).unwrap();
-        assert!(matches!(r.next_part(), Err(MtcError::TooLarge { limit: 16 })));
+        assert!(matches!(
+            r.next_part(),
+            Err(MtcError::TooLarge { limit: 16 })
+        ));
     }
 
     #[test]
     fn malformed_framing_is_an_error_not_a_guess() {
         // A marker line that continues with garbage instead of a line break or terminator.
-        let mut r = MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
+        let mut r =
+            MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
         r.push(b"--Bgarbage here").unwrap();
         assert!(matches!(r.next_part(), Err(MtcError::Multipart(_))));
 
         // A header line with no colon.
-        let mut r = MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
+        let mut r =
+            MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
         r.push(b"--B\r\nnot a header line\r\n\r\nbody").unwrap();
         assert!(matches!(r.next_part(), Err(MtcError::Multipart(_))));
 
         // An unparseable Content-length.
-        let mut r = MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
+        let mut r =
+            MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
         r.push(b"--B\r\nContent-length: lots\r\n\r\n").unwrap();
         assert!(matches!(r.next_part(), Err(MtcError::Multipart(_))));
 
         // A header block that never ends.
-        let mut r = MultipartReader::from_content_type("multipart/mixed; boundary=B", 1 << 20).unwrap();
+        let mut r =
+            MultipartReader::from_content_type("multipart/mixed; boundary=B", 1 << 20).unwrap();
         r.push(b"--B\r\n").unwrap();
         r.push(&vec![b'h'; MAX_PART_HEADER_BYTES + 2]).unwrap();
         assert!(matches!(r.next_part(), Err(MtcError::Multipart(_))));
@@ -537,8 +608,10 @@ mod tests {
     #[test]
     fn bare_lf_line_endings_are_tolerated() {
         // Some proxies rewrite CRLF; the grammar survives it.
-        let mut r = MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
-        r.push(b"--B\nContent-type: text/xml\nContent-length: 4\n\n<a/>\n").unwrap();
+        let mut r =
+            MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
+        r.push(b"--B\nContent-type: text/xml\nContent-length: 4\n\n<a/>\n")
+            .unwrap();
         let parts = drain(&mut r);
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].text().unwrap(), "<a/>");
@@ -546,14 +619,18 @@ mod tests {
 
     #[test]
     fn the_terminator_ends_the_stream_and_the_epilogue_is_ignored() {
-        let mut r = MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
+        let mut r =
+            MultipartReader::from_content_type("multipart/mixed; boundary=B", 1024).unwrap();
         r.push(&part_bytes("B", "<last/>")).unwrap();
         r.push(b"--B--\r\nepilogue nobody reads").unwrap();
         let parts = drain(&mut r);
         assert_eq!(parts.len(), 1);
         assert!(r.is_finished());
         r.push(b"more epilogue").unwrap();
-        assert!(r.next_part().unwrap().is_none(), "a finished stream yields nothing");
+        assert!(
+            r.next_part().unwrap().is_none(),
+            "a finished stream yields nothing"
+        );
         assert!(r.buffered().is_empty());
 
         // Reset clears the terminal state too (a re-established stream starts clean).
@@ -563,9 +640,15 @@ mod tests {
 
     #[test]
     fn a_part_body_is_text_only_when_it_really_is_text() {
-        let part = Part { body: b"<MTConnectStreams/>".to_vec(), ..Part::default() };
+        let part = Part {
+            body: b"<MTConnectStreams/>".to_vec(),
+            ..Part::default()
+        };
         assert_eq!(part.text().unwrap(), "<MTConnectStreams/>");
-        let part = Part { body: vec![0xff, 0xfe], ..Part::default() };
+        let part = Part {
+            body: vec![0xff, 0xfe],
+            ..Part::default()
+        };
         assert!(matches!(part.text(), Err(MtcError::Xml(_))));
         assert_eq!(Part::default().content_length, None);
         assert_eq!(Part::default().content_type, None);

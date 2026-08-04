@@ -29,11 +29,11 @@ entirely.
 | `auth` | object | none (unauthenticated) | `{"type":"basic","username":"...","secretRef":"..."}` or `{"type":"bearer","secretRef":"..."}`. The referenced value is resolved through the EdgeCommons credential vault at startup and never appears in configuration, logs, or `sb/status`. |
 | `tls.caSecretRef` | string | none | A vault reference to a PEM CA bundle to trust in addition to the platform roots. |
 | `tls.certSecretRef` / `tls.keySecretRef` | string | none | A vault-referenced PEM client certificate + key, for mutual TLS. Set together or not at all — one without the other is a config error. |
-| `heartbeatMs` | integer | `10000` | The `heartbeat` a streaming request asks the agent for, and the liveness window: silence for **twice** this long means the stream is dead even if the socket has not closed. |
+| `heartbeatMs` | integer | `10000` | The `heartbeat` a streaming request asks the agent for, and the liveness window: silence for **twice** this long means the stream is dead even if the socket has not closed. Silence past **one** `heartbeatMs` already republishes held values `UNCERTAIN` with `qualityRaw: MTC_STALE:<ageMs>` ([data-types.md](data-types.md#passive-quality--held-values-under-a-silent-agent)). |
 | `streaming` | `"prefer"` \| `"poll-only"` | `"prefer"` | `prefer` opens a multipart `/sample?interval=...` stream and falls back to polling on repeated failure; `poll-only` never streams — it reads `/current` on `pollIntervalMs`. |
 | `pollIntervalMs` | integer | `1000` | How often this agent's `/current` is read on the polling path (used directly in `poll-only` mode, and as the fallback cadence when streaming degrades). |
 | `requestTimeoutMs` | integer | `10000` | Timeout for one-shot requests (`/probe`, `/current`, a windowed `/sample`). The long-lived streaming request is bounded by `heartbeatMs` instead — liveness, not a fixed deadline. |
-| `maxDocumentBytes` | integer | `16777216` | Response/part size cap for this agent. A document (or one multipart part) larger than this is refused rather than buffered — checked against `Content-Length` up front and enforced again mid-stream for a body with none. |
+| `maxDocumentBytes` | integer | `16777216` | Response/part size cap for this agent. A document (or one multipart part) larger than this is refused rather than buffered — checked against `Content-Length` up front and enforced again mid-stream for a body with none. Independently of bytes, a document is refused past 250 000 XML elements. |
 | `reconnect.initialMs` / `reconnect.maxMs` | integer | `1000` / `60000` | Capped exponential backoff with full jitter for this agent's own connect/stream-reconnect loop — independent of any device's polling cadence. |
 
 An agent is refused at startup (`MtcError::Config`, not silently corrected) for: a non-lower-kebab
@@ -52,7 +52,7 @@ of `0`; `maxDocumentBytes` of `0`; `reconnect.maxMs` less than `reconnect.initia
 | `defaults.reconnect.*` | object | see above | Default reconnect bounds for an agent that sets none of its own. |
 | `timeouts.connectMs` | integer | `5000` | How long a connect attempt may take before it is treated as failed. |
 | `timeouts.reconnectBackoffMinMs` / `.reconnectBackoffMaxMs` | integer | `1000` / `60000` | The reconnect window; backoff is jittered within it, so a plant full of adapters does not reconnect in lockstep when an agent restarts. |
-| `healthThresholds.staleSignalSecs` | integer | `30` | A signal with no update for longer than this counts toward `southbound_health.staleSignals`. A signal that silently stops updating is otherwise indistinguishable from one that is simply not changing. |
+| `healthThresholds.staleSignalSecs` | integer | `30` | Two uses of one threshold. A signal with no value update for longer than this counts toward `southbound_health.staleSignals` — a signal that silently stops updating is otherwise indistinguishable from one that is simply not changing. And it is the limit on how long a held value may stand in for a silent agent: once the time since the agent last vouched for currency passes it (the **liveness** clock, not per-signal change age), held values republish `BAD` with `qualityRaw: MTC_STALE:<ageMs>` ([data-types.md](data-types.md#passive-quality--held-values-under-a-silent-agent)). On a streaming agent the expiry step is reached only when this is shorter than `2 × heartbeatMs`: a stream that misses two heartbeat windows is declared dead, and every held value goes `BAD` with `MTC_AGENT_UNREACHABLE` at that point. With the default `heartbeatMs` of 10 000 the link is unreachable at 20 s, so a `staleSignalSecs` above 20 never takes effect while streaming. Both outcomes are `BAD`; they differ in which `qualityRaw` names the reason. |
 
 ## `component.instances[]` (one MTConnect device each)
 
@@ -98,7 +98,10 @@ serves the instance. The rules around the three keys:
   buffered readings in arrival order. Under `mode: "interval"` only the latest reading of the
   window is kept; an empty window publishes nothing.
 - **Quality outranks the window.** A BAD or UNCERTAIN reading — an `UNAVAILABLE`, a
-  `conditionBinding` degradation — flushes its signal's window at once.
+  `conditionBinding` degradation — flushes its signal's window at once, and the synthetic
+  passive-quality transitions (`MTC_STALE`, `MTC_AGENT_UNREACHABLE` —
+  [data-types.md](data-types.md#passive-quality--held-values-under-a-silent-agent)) bypass the
+  windows entirely.
 - **Deadband gates entry, not exit.** A suppressed reading never reaches a window. The comparison
   anchor is the last **accepted** value, so a slow drift still publishes once it accumulates past
   the deadband.
@@ -317,3 +320,10 @@ exists.
 - `browse` (`sb/browse`) works from the last cached probe — before an `mtconnect`-adapter instance's
   first successful probe it answers `BROWSE_FAILED`/`MTC_NO_PROBE`; see
   [reference/data-types.md](data-types.md) and the [how-to guides](../how-to-guides.md).
+
+## Appendix — revision history
+
+| Date | Change |
+|---|---|
+| 2026-08-03 | `staleSignalSecs` documented as both the `staleSignals` threshold and the passive BAD-expiry threshold on the liveness clock; the 250 000-element document cap; the one-missed-heartbeat UNCERTAIN step; passive transitions bypass batch windows. |
+| 2026-07-28 | Initial version. |

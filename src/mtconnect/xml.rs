@@ -22,15 +22,16 @@
 //!
 //! ## Bounded
 //!
-//! Depth ([`MAX_DEPTH`]), attribute count ([`MAX_ATTRIBUTES`]) and attribute length
-//! ([`MAX_ATTR_VALUE_BYTES`]) are capped, so a hostile or broken document costs a bounded amount of
-//! memory before it is refused. The byte size of the document itself is capped upstream by
-//! `maxDocumentBytes` in [`super::client`].
+//! Depth ([`MAX_DEPTH`]), attribute count ([`MAX_ATTRIBUTES`]), attribute length
+//! ([`MAX_ATTR_VALUE_BYTES`]) and total element count ([`MAX_NODES`]) are capped, so a hostile or
+//! broken document costs a bounded amount of memory before it is refused. The byte size of the
+//! document itself is capped upstream by `maxDocumentBytes` in [`super::client`] — but bytes alone
+//! do not bound the tree, which is why [`MAX_NODES`] exists.
 
 use std::collections::BTreeMap;
 
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 
 use super::error::MtcError;
 use super::model::Category;
@@ -41,6 +42,20 @@ pub const MAX_DEPTH: usize = 64;
 pub const MAX_ATTRIBUTES: usize = 64;
 /// Maximum length of one attribute value, in bytes.
 pub const MAX_ATTR_VALUE_BYTES: usize = 64 * 1024;
+/// Maximum number of elements in one document.
+///
+/// `maxDocumentBytes` bounds the *bytes* read off the socket; it does not bound the DOM those
+/// bytes expand into. One `<a/>` costs four bytes on the wire and an [`XmlElem`] — a `String`
+/// name, a `BTreeMap`, a `String` text and a `Vec` — in memory, a 25–50× amplification. A 16 MiB
+/// document of millions of empty elements therefore stays inside the byte cap while consuming
+/// hundreds of megabytes of heap. Real MTConnect content (an observation carries identity
+/// attributes and a value) stays orders of magnitude below this ceiling.
+pub const MAX_NODES: usize = 250_000;
+
+/// The namespace-URI prefix every MTConnect schema version shares. A declaration that does not
+/// start with it is some other vocabulary (`xmlns:xsi`, a vendor extension) and carries no
+/// MTConnect version.
+const MTCONNECT_NS_PREFIX: &str = "urn:mtconnect.org:";
 
 /// The lowest MTConnect schema version this client parses.
 pub const MIN_VERSION: NsVersion = NsVersion { major: 1, minor: 3 };
@@ -84,8 +99,9 @@ impl XmlElem {
     }
 }
 
-/// A parsed document: its root element, the default-namespace version it declared (when any), and
-/// the count of general references that were **not** expanded (the XXE-inertness signal).
+/// A parsed document: its root element, the MTConnect schema version it declared (when any —
+/// default or prefixed declaration alike), and the count of general references that were **not**
+/// expanded (the XXE-inertness signal).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XmlDoc {
     pub root: XmlElem,
@@ -93,7 +109,7 @@ pub struct XmlDoc {
     pub unresolved_entities: u64,
 }
 
-/// An MTConnect schema version, taken from the default namespace URI.
+/// An MTConnect schema version, taken from the document's MTConnect namespace declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NsVersion {
     pub major: u16,
@@ -116,9 +132,13 @@ impl std::fmt::Display for NsVersion {
 }
 
 /// Extract the version from an MTConnect namespace URI
-/// (`urn:mtconnect.org:MTConnectDevices:1.3` → `1.3`). Returns `None` for anything else.
+/// (`urn:mtconnect.org:MTConnectDevices:1.3` → `1.3`). Returns `None` for anything else — including
+/// a colon-bearing URI from another vocabulary, which must never be read as an MTConnect version.
 #[must_use]
 pub fn parse_ns_version(uri: &str) -> Option<NsVersion> {
+    if !uri.starts_with(MTCONNECT_NS_PREFIX) {
+        return None;
+    }
     let tail = uri.rsplit(':').next()?;
     let mut parts = tail.split('.');
     let major = parts.next()?.parse().ok()?;
@@ -317,7 +337,11 @@ pub fn parse_devices(xml: &str) -> Result<DevicesDoc, MtcError> {
     let doc = parse_document(xml)?;
     expect_root(&doc.root, "MTConnectDevices")?;
 
-    let header = doc.root.child("Header").map(MtcHeader::from_elem).unwrap_or_default();
+    let header = doc
+        .root
+        .child("Header")
+        .map(MtcHeader::from_elem)
+        .unwrap_or_default();
     let mut unknown = doc.unresolved_entities;
     let mut devices = Vec::new();
     for child in &doc.root.children {
@@ -333,7 +357,12 @@ pub fn parse_devices(xml: &str) -> Result<DevicesDoc, MtcError> {
             _ => unknown += 1,
         }
     }
-    Ok(DevicesDoc { header, ns_version: doc.ns_version, devices, unknown_elements: unknown })
+    Ok(DevicesDoc {
+        header,
+        ns_version: doc.ns_version,
+        devices,
+        unknown_elements: unknown,
+    })
 }
 
 /// Count elements inside a `<Device>` subtree the parser does not structurally recognize.
@@ -369,7 +398,11 @@ pub fn parse_streams(xml: &str) -> Result<StreamsDoc, MtcError> {
 pub fn streams_from_doc(doc: XmlDoc) -> Result<StreamsDoc, MtcError> {
     expect_root(&doc.root, "MTConnectStreams")?;
 
-    let header = doc.root.child("Header").map(MtcHeader::from_elem).unwrap_or_default();
+    let header = doc
+        .root
+        .child("Header")
+        .map(MtcHeader::from_elem)
+        .unwrap_or_default();
     let mut unknown = doc.unresolved_entities;
     let mut device_streams = Vec::new();
 
@@ -395,7 +428,12 @@ pub fn streams_from_doc(doc: XmlDoc) -> Result<StreamsDoc, MtcError> {
         }
     }
 
-    Ok(StreamsDoc { header, ns_version: doc.ns_version, device_streams, unknown_elements: unknown })
+    Ok(StreamsDoc {
+        header,
+        ns_version: doc.ns_version,
+        device_streams,
+        unknown_elements: unknown,
+    })
 }
 
 fn collect_component_streams(e: &XmlElem, out: &mut Vec<StreamEntry>, unknown: &mut u64) {
@@ -404,7 +442,10 @@ fn collect_component_streams(e: &XmlElem, out: &mut Vec<StreamEntry>, unknown: &
             *unknown += 1;
             continue;
         }
-        let component = cs.attr("name").or_else(|| cs.attr("component")).map(str::to_string);
+        let component = cs
+            .attr("name")
+            .or_else(|| cs.attr("component"))
+            .map(str::to_string);
         for group in &cs.children {
             let category = match group.name.as_str() {
                 "Samples" => Category::Sample,
@@ -417,7 +458,11 @@ fn collect_component_streams(e: &XmlElem, out: &mut Vec<StreamEntry>, unknown: &
                 }
             };
             for obs in &group.children {
-                out.push(StreamEntry { category, elem: obs.clone(), component: component.clone() });
+                out.push(StreamEntry {
+                    category,
+                    elem: obs.clone(),
+                    component: component.clone(),
+                });
             }
         }
     }
@@ -445,7 +490,10 @@ pub fn errors_from_doc(doc: XmlDoc) -> Result<ErrorsDoc, MtcError> {
         )));
     }
 
-    let header = root.child("Header").map(MtcHeader::from_elem).unwrap_or_default();
+    let header = root
+        .child("Header")
+        .map(MtcHeader::from_elem)
+        .unwrap_or_default();
     let mut unknown = doc.unresolved_entities;
     let mut errors = Vec::new();
     let mut push = |e: &XmlElem| {
@@ -473,14 +521,22 @@ pub fn errors_from_doc(doc: XmlDoc) -> Result<ErrorsDoc, MtcError> {
         }
     }
 
-    Ok(ErrorsDoc { header, ns_version: doc.ns_version, errors, unknown_elements: unknown })
+    Ok(ErrorsDoc {
+        header,
+        ns_version: doc.ns_version,
+        errors,
+        unknown_elements: unknown,
+    })
 }
 
 fn expect_root(root: &XmlElem, want: &str) -> Result<(), MtcError> {
     if root.name == want {
         Ok(())
     } else {
-        Err(MtcError::Xml(format!("expected a `{want}` document, got `{}`", root.name)))
+        Err(MtcError::Xml(format!(
+            "expected a `{want}` document, got `{}`",
+            root.name
+        )))
     }
 }
 
@@ -492,7 +548,7 @@ fn expect_root(root: &XmlElem, want: &str) -> Result<(), MtcError> {
 /// version and counting unexpanded general references.
 ///
 /// # Errors
-/// [`MtcError::Xml`] for malformed XML, an empty document, or a depth/attribute cap breach;
+/// [`MtcError::Xml`] for malformed XML, an empty document, or a depth/attribute/node cap breach;
 /// [`MtcError::UnsupportedVersion`] when the declared namespace version is below the 1.3 floor.
 pub fn parse_document(xml: &str) -> Result<XmlDoc, MtcError> {
     let mut reader = Reader::from_str(xml);
@@ -507,24 +563,38 @@ pub fn parse_document(xml: &str) -> Result<XmlDoc, MtcError> {
     let mut root: Option<XmlElem> = None;
     let mut ns_uri: Option<String> = None;
     let mut unresolved_entities = 0u64;
+    // A running total across the whole document, not a per-level count: the amplification
+    // [`MAX_NODES`] guards against is flat, not deep, and the depth cap already bounds nesting.
+    let mut nodes = 0usize;
 
     loop {
         match reader.read_event() {
             Err(e) => return Err(MtcError::Xml(format!("{e}"))),
             Ok(Event::Eof) => break,
             Ok(Event::Start(s)) => {
-                push_element(&mut stack, element_from_start(&s, &mut ns_uri, &mut unresolved_entities)?)?;
+                push_element(
+                    &mut stack,
+                    element_from_start(&s, &mut ns_uri, &mut unresolved_entities)?,
+                    &mut nodes,
+                )?;
             }
             Ok(Event::Empty(s)) => {
                 // An empty element opens and closes in one event.
-                push_element(&mut stack, element_from_start(&s, &mut ns_uri, &mut unresolved_entities)?)?;
+                push_element(
+                    &mut stack,
+                    element_from_start(&s, &mut ns_uri, &mut unresolved_entities)?,
+                    &mut nodes,
+                )?;
                 close_element(&mut stack, &mut root);
             }
             Ok(Event::End(_)) => close_element(&mut stack, &mut root),
             Ok(Event::Text(t)) => {
                 if let Some(top) = stack.last_mut() {
                     let decoded = t.decode().map_err(|e| MtcError::Xml(format!("{e}")))?;
-                    push_text(&mut top.text, &unescape_inert(&decoded, &mut unresolved_entities));
+                    push_text(
+                        &mut top.text,
+                        &unescape_inert(&decoded, &mut unresolved_entities),
+                    );
                 }
             }
             Ok(Event::CData(c)) => {
@@ -545,7 +615,8 @@ pub fn parse_document(xml: &str) -> Result<XmlDoc, MtcError> {
                 if let Some(top) = stack.last_mut() {
                     // An unresolvable reference stays **literal** — visible for diagnosis, and
                     // never a value fetched from disk or the network.
-                    top.text.push_str(&resolved.unwrap_or_else(|| format!("&{raw};")));
+                    top.text
+                        .push_str(&resolved.unwrap_or_else(|| format!("&{raw};")));
                 }
             }
             // Declarations, DTDs, comments and processing instructions carry no data this client
@@ -555,7 +626,9 @@ pub fn parse_document(xml: &str) -> Result<XmlDoc, MtcError> {
     }
 
     if !stack.is_empty() {
-        return Err(MtcError::Xml("document ended inside an open element".into()));
+        return Err(MtcError::Xml(
+            "document ended inside an open element".into(),
+        ));
     }
     let root = root.ok_or_else(|| MtcError::Xml("document has no root element".into()))?;
 
@@ -565,12 +638,26 @@ pub fn parse_document(xml: &str) -> Result<XmlDoc, MtcError> {
             return Err(MtcError::UnsupportedVersion(v.to_string()));
         }
     }
-    Ok(XmlDoc { root, ns_version, unresolved_entities })
+    Ok(XmlDoc {
+        root,
+        ns_version,
+        unresolved_entities,
+    })
 }
 
-fn push_element(stack: &mut Vec<XmlElem>, elem: XmlElem) -> Result<(), MtcError> {
+fn push_element(
+    stack: &mut Vec<XmlElem>,
+    elem: XmlElem,
+    nodes: &mut usize,
+) -> Result<(), MtcError> {
     if stack.len() + 1 > MAX_DEPTH {
-        return Err(MtcError::Xml(format!("element nesting exceeds {MAX_DEPTH}")));
+        return Err(MtcError::Xml(format!(
+            "element nesting exceeds {MAX_DEPTH}"
+        )));
+    }
+    *nodes += 1;
+    if *nodes > MAX_NODES {
+        return Err(MtcError::Xml(format!("element count exceeds {MAX_NODES}")));
     }
     stack.push(elem);
     Ok(())
@@ -604,7 +691,9 @@ fn element_from_start(
         let attr = attr.map_err(|e| MtcError::Xml(format!("attribute: {e}")))?;
         count += 1;
         if count > MAX_ATTRIBUTES {
-            return Err(MtcError::Xml(format!("element `{name}` exceeds {MAX_ATTRIBUTES} attributes")));
+            return Err(MtcError::Xml(format!(
+                "element `{name}` exceeds {MAX_ATTRIBUTES} attributes"
+            )));
         }
         if attr.value.len() > MAX_ATTR_VALUE_BYTES {
             return Err(MtcError::Xml(format!(
@@ -613,13 +702,27 @@ fn element_from_start(
         }
         let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
         let value = unescape_inert(&String::from_utf8_lossy(&attr.value), unresolved_entities);
-        if key == "xmlns" && ns_uri.is_none() {
+        // The version floor must not be bypassable by writing the same declaration with a prefix.
+        // A DEFAULT declaration (`xmlns=`) and a PREFIXED one (`xmlns:m=`) are equally binding, and
+        // an agent that qualifies its elements — `<m:MTConnectStreams xmlns:m="…:1.1">` — is
+        // declaring exactly the version the floor exists to refuse. Foreign declarations
+        // (`xmlns:xsi=`, a vendor extension) are skipped rather than latched, so the FIRST
+        // MTConnect declaration wins wherever it appears in the attribute list.
+        if ns_uri.is_none()
+            && (key == "xmlns" || key.starts_with("xmlns:"))
+            && value.starts_with(MTCONNECT_NS_PREFIX)
+        {
             *ns_uri = Some(value.clone());
         }
         attrs.insert(key, value);
     }
 
-    Ok(XmlElem { name, attrs, text: String::new(), children: Vec::new() })
+    Ok(XmlElem {
+        name,
+        attrs,
+        text: String::new(),
+        children: Vec::new(),
+    })
 }
 
 /// The local part of a possibly-prefixed name (`m:DataItem` → `DataItem`).
@@ -678,7 +781,10 @@ fn resolve_reference(body: &str) -> Option<String> {
         "apos" => Some("'".into()),
         _ => {
             let digits = body.strip_prefix('#')?;
-            let code = match digits.strip_prefix('x').or_else(|| digits.strip_prefix('X')) {
+            let code = match digits
+                .strip_prefix('x')
+                .or_else(|| digits.strip_prefix('X'))
+            {
                 Some(hex) => u32::from_str_radix(hex, 16).ok()?,
                 None => digits.parse::<u32>().ok()?,
             };
@@ -724,12 +830,16 @@ mod tests {
             let d = doc.device("OKUMA.123456").expect("the fixture's device");
             assert_eq!(d.attr("name"), Some("OKUMA-CNC"));
             let items = d.child("DataItems").unwrap();
-            assert!(items.children_named("DataItem").any(|i| i.attr("id") == Some("avail")));
+            assert!(
+                items
+                    .children_named("DataItem")
+                    .any(|i| i.attr("id") == Some("avail"))
+            );
         }
     }
 
     #[test]
-    fn a_prefixed_document_parses_by_local_name() {
+    fn a_prefixed_document_parses_by_local_name_and_still_declares_its_version() {
         let xml = r#"<m:MTConnectDevices xmlns:m="urn:mtconnect.org:MTConnectDevices:2.7">
               <m:Header instanceId="7" version="2.7.0.12" sender="agent"/>
               <m:Devices><m:Device uuid="U" name="N" id="d"/></m:Devices>
@@ -737,8 +847,73 @@ mod tests {
         let doc = parse_devices(xml).unwrap();
         assert_eq!(doc.header.instance_id, 7);
         assert_eq!(doc.devices[0].attr("uuid"), Some("U"));
-        // No default xmlns: no version captured, and the document still parses.
-        assert_eq!(doc.ns_version, None);
+        // A PREFIXED declaration binds exactly as a default one does: the version is captured, so
+        // the 1.3 floor cannot be bypassed by qualifying the elements.
+        assert_eq!(doc.ns_version, Some(NsVersion { major: 2, minor: 7 }));
+    }
+
+    #[test]
+    fn a_prefixed_declaration_below_the_floor_is_refused_like_a_default_one() {
+        // The C-4 regression: `xmlns:m=` used to leave `ns_version` unset, and the floor check only
+        // fires on a version it has — so a 1.1 document walked straight through.
+        let old = r#"<m:MTConnectDevices xmlns:m="urn:mtconnect.org:MTConnectDevices:1.1">
+              <m:Header instanceId="1"/>
+              <m:Devices><m:Device uuid="U" name="N" id="d"/></m:Devices>
+            </m:MTConnectDevices>"#;
+        assert!(matches!(parse_devices(old), Err(MtcError::UnsupportedVersion(v)) if v == "1.1"));
+
+        // Streams and Errors documents go through the same tokenizer, so they inherit the fix.
+        let streams = r#"<m:MTConnectStreams xmlns:m="urn:mtconnect.org:MTConnectStreams:1.2">
+              <m:Header instanceId="1"/><m:Streams/>
+            </m:MTConnectStreams>"#;
+        assert!(matches!(
+            parse_streams(streams),
+            Err(MtcError::UnsupportedVersion(_))
+        ));
+    }
+
+    #[test]
+    fn the_first_mtconnect_declaration_wins_over_foreign_namespaces() {
+        // A real agent declares the schema-instance namespace first. Latching the first `xmlns:*`
+        // of ANY vocabulary would read `2001/XMLSchema-instance` as the MTConnect version.
+        let xml = r#"<MTConnectDevices xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                xmlns="urn:mtconnect.org:MTConnectDevices:2.7"
+                xsi:schemaLocation="urn:mtconnect.org:MTConnectDevices:2.7 MTConnectDevices_2.7.xsd">
+              <Header instanceId="1"/><Devices><Device uuid="U" name="N" id="d"/></Devices>
+            </MTConnectDevices>"#;
+        let doc = parse_devices(xml).unwrap();
+        assert_eq!(doc.ns_version, Some(NsVersion { major: 2, minor: 7 }));
+
+        // A document that declares NO MTConnect namespace still parses, with no version — agents in
+        // the wild do emit namespace-less documents.
+        let bare = r#"<MTConnectDevices xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+              <Header instanceId="1"/><Devices><Device uuid="U" name="N" id="d"/></Devices>
+            </MTConnectDevices>"#;
+        assert_eq!(parse_devices(bare).unwrap().ns_version, None);
+    }
+
+    #[test]
+    fn the_node_cap_bounds_the_tree_a_document_of_legal_size_can_build() {
+        // C-5: `maxDocumentBytes` bounds the wire, not the DOM. Four bytes per element on the wire
+        // becomes an XmlElem in memory, so the byte cap alone lets a document of empty elements
+        // amplify 25-50x. The node cap is what makes the tree bounded.
+        let flat = format!("<r>{}</r>", "<a/>".repeat(MAX_NODES));
+        let err = parse_document(&flat).expect_err("the node cap refuses it");
+        assert!(
+            matches!(&err, MtcError::Xml(m) if m.contains("element count exceeds")),
+            "got {err:?}"
+        );
+
+        // Exactly at the cap is fine: the refusal is for exceeding it, not reaching it.
+        let at_cap = format!("<r>{}</r>", "<a/>".repeat(MAX_NODES - 1));
+        assert_eq!(
+            parse_document(&at_cap).unwrap().root.children.len(),
+            MAX_NODES - 1
+        );
+
+        // A realistic document is orders of magnitude below the ceiling.
+        assert!(parse_devices(DEVICES_2_7).is_ok());
+        assert!(parse_streams(CURRENT_2_7).is_ok());
     }
 
     #[test]
@@ -757,18 +932,35 @@ mod tests {
     #[test]
     fn a_streams_document_demultiplexes_by_device_and_tags_each_category() {
         let doc = parse_streams(CURRENT_2_7).unwrap();
-        assert_eq!(doc.device_streams.len(), 2, "one stream serves many devices");
-        let cnc = doc.device_streams.iter().find(|d| d.uuid == "OKUMA.123456").unwrap();
-        assert!(cnc.entries.iter().any(|e| e.category == Category::Sample
-            && e.elem.attr("dataItemId") == Some("Xabs")));
-        assert!(cnc.entries.iter().any(|e| e.category == Category::Event
-            && e.elem.attr("dataItemId") == Some("avail")));
+        assert_eq!(
+            doc.device_streams.len(),
+            2,
+            "one stream serves many devices"
+        );
+        let cnc = doc
+            .device_streams
+            .iter()
+            .find(|d| d.uuid == "OKUMA.123456")
+            .unwrap();
+        assert!(
+            cnc.entries.iter().any(
+                |e| e.category == Category::Sample && e.elem.attr("dataItemId") == Some("Xabs")
+            )
+        );
+        assert!(
+            cnc.entries.iter().any(
+                |e| e.category == Category::Event && e.elem.attr("dataItemId") == Some("avail")
+            )
+        );
         let cond = cnc
             .entries
             .iter()
             .find(|e| e.category == Category::Condition)
             .expect("a Condition entry");
-        assert_eq!(cond.elem.name, "Fault", "the condition STATE is the element name");
+        assert_eq!(
+            cond.elem.name, "Fault",
+            "the condition STATE is the element name"
+        );
         assert_eq!(cond.component.as_deref(), Some("X"));
         assert!(!doc.is_heartbeat());
     }
@@ -819,10 +1011,16 @@ mod tests {
         // both an attribute and element text. Neither is expanded: the parser has no code path to
         // the filesystem, and the reference is left literal and counted.
         let doc = parse_devices(XXE).unwrap();
-        assert!(doc.unknown_elements >= 1, "the unresolved reference is counted");
+        assert!(
+            doc.unknown_elements >= 1,
+            "the unresolved reference is counted"
+        );
         let d = &doc.devices[0];
         let text = format!("{:?}", d);
-        assert!(!text.contains("root:x:0:0"), "no /etc/passwd content anywhere in the tree");
+        assert!(
+            !text.contains("root:x:0:0"),
+            "no /etc/passwd content anywhere in the tree"
+        );
         assert!(!text.contains("BEGIN PRIVATE KEY"));
         assert!(text.contains("&xxe;"), "the reference stays literal");
         // A DOCTYPE is inert, not an error: the document still parses.
@@ -863,7 +1061,11 @@ mod tests {
             </MTConnectStreams>"#;
         let s = parse_streams(streams).unwrap();
         assert_eq!(s.unknown_elements, 1, "the unknown group");
-        assert_eq!(s.device_streams[0].entries.len(), 1, "the known group still delivered");
+        assert_eq!(
+            s.device_streams[0].entries.len(),
+            1,
+            "the known group still delivered"
+        );
     }
 
     #[test]
@@ -880,7 +1082,10 @@ mod tests {
 
     #[test]
     fn malformed_documents_are_errors_not_panics() {
-        assert!(parse_document("").is_err(), "an empty body is not a document");
+        assert!(
+            parse_document("").is_err(),
+            "an empty body is not a document"
+        );
         assert!(parse_document("<a><b></a>").is_err(), "mismatched end tag");
         assert!(parse_document("<a>").is_err(), "truncated document");
         assert!(parse_document("not xml at all").is_err());
@@ -888,14 +1093,29 @@ mod tests {
 
     #[test]
     fn structural_caps_bound_a_hostile_document() {
-        let deep = format!("{}{}", "<a>".repeat(MAX_DEPTH + 2), "</a>".repeat(MAX_DEPTH + 2));
-        assert!(matches!(parse_document(&deep), Err(MtcError::Xml(_))), "depth cap");
+        let deep = format!(
+            "{}{}",
+            "<a>".repeat(MAX_DEPTH + 2),
+            "</a>".repeat(MAX_DEPTH + 2)
+        );
+        assert!(
+            matches!(parse_document(&deep), Err(MtcError::Xml(_))),
+            "depth cap"
+        );
 
-        let attrs: String = (0..MAX_ATTRIBUTES + 5).map(|i| format!(" a{i}=\"1\"")).collect();
-        assert!(parse_document(&format!("<a{attrs}/>")).is_err(), "attribute-count cap");
+        let attrs: String = (0..MAX_ATTRIBUTES + 5)
+            .map(|i| format!(" a{i}=\"1\""))
+            .collect();
+        assert!(
+            parse_document(&format!("<a{attrs}/>")).is_err(),
+            "attribute-count cap"
+        );
 
         let long = "x".repeat(MAX_ATTR_VALUE_BYTES + 1);
-        assert!(parse_document(&format!("<a v=\"{long}\"/>")).is_err(), "attribute-length cap");
+        assert!(
+            parse_document(&format!("<a v=\"{long}\"/>")).is_err(),
+            "attribute-length cap"
+        );
     }
 
     #[test]
@@ -931,6 +1151,13 @@ mod tests {
         );
         assert_eq!(parse_ns_version("http://example.com/ns"), None);
         assert_eq!(parse_ns_version("urn:x:y:not-a-version"), None);
+        // Only an MTConnect URN carries an MTConnect version: an arbitrary colon-bearing URI whose
+        // tail happens to look numeric is not one.
+        assert_eq!(parse_ns_version("urn:example:thing:2.7"), None);
+        assert_eq!(
+            parse_ns_version("http://www.w3.org/2001/XMLSchema-instance"),
+            None
+        );
     }
 
     #[test]

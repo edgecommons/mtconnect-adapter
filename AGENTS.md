@@ -9,7 +9,7 @@ validation matrix, platform/transport model); everything below is this component
 
 Connects to devices, reads signals, and publishes them onto the Unified Namespace (UNS) in the
 shape the rest of the fleet expects: `SouthboundSignalUpdate` on the `data` class, the canonical
-`southbound_health` metric plus two worked operational families, and the generic `sb/*` command
+`southbound_health` metric plus the worked operational families, and the generic `sb/*` command
 family (SOUTHBOUND.md §2.2 equivalent) on the command inbox. Ships with a simulated device backend
 (`src/device.rs`'s `SimBackend`) so it runs with no hardware. Runs on `GREENGRASS` / `HOST` /
 `KUBERNETES` via `edgecommons` — no platform branching in this component's own code.
@@ -17,10 +17,11 @@ family (SOUTHBOUND.md §2.2 equivalent) on the command inbox. Ships with a simul
 ## The seam
 
 `src/device.rs`'s `DeviceSession`/`DeviceBackend` trait pair is the one place protocol knowledge
-lives. Everything above it (`src/supervisor.rs`'s connect/poll/backoff supervisor, `src/commands.rs`'s
-`sb/*` verbs, `src/metrics.rs`'s families) is written against the trait and does not change when a
-new protocol is added. **The boundary rule:** a backend knows protocols; it does not know
-EdgeCommons topics, the UNS, envelopes, or metrics.
+lives. Everything above it (`src/driver.rs`'s connect/poll/backoff drivers behind the `Wire`
+publish/emit seam, `src/supervisor.rs`'s thin live shell that constructs and spawns them,
+`src/commands.rs`'s `sb/*` verbs, `src/metrics.rs`'s families) is written against the trait and does
+not change when a new protocol is added. **The boundary rule:** a backend knows protocols; it does
+not know EdgeCommons topics, the UNS, envelopes, or metrics.
 
 `DeviceSession` is one live connection to one device. Two methods are required — `read_signals`
 (the acquisition cycle) and `write_signal` — and the rest carry defaults, so a new backend
@@ -48,27 +49,38 @@ carries a runnable example.
 - `cargo test` covers every module against the simulator, a mocked device-control channel, and a
   fake in-process agent (canned XML documents) — no network, no broker, no live device required.
   `tests/poll_acquisition.rs` drives the polling path end to end; `tests/stream_acquisition.rs` and
-  `tests/stream_sequence.rs` drive the streaming path and the resync ladder; `tests/config_schema.rs`
+  `tests/stream_sequence.rs` drive the streaming path and the resync ladder; `src/driver.rs`'s
+  in-module suite drives the orchestration (pause/resume, generation swaps, passive quality,
+  cancellation) over fake sessions and a recording `Wire`; `tests/publish_shaping.rs` and
+  `tests/passive_quality.rs` pin the shaped and synthetic wire shapes; `tests/config_schema.rs`
   validates every shipped configuration against `config.schema.json` and through
   `mtconnect::config::validate_bindings`; `tests/fuzz_style.rs` exercises the XML parser against
   malformed/hostile input; `tests/isolation.rs` enforces the seam rule below.
 - `cargo llvm-cov --fail-under-lines 90` is the coverage gate (`.github/workflows/ci.yml`'s
   `coverage` job) — the org rule is 90% line coverage per language. The `ethernet-ip-adapter`
-  discipline is followed: the untestable live drivers are isolated in a thin `src/supervisor.rs`
-  seam (the connect/poll/reconnect loop that `.await`s a live session), and the coverage job passes
-  `--ignore-filename-regex '(supervisor\.rs|main\.rs|tests[/\\]live_.*\.rs)'` so ONLY that seam plus
-  the binary shim and the self-skipping live suite are excluded — each pinned to a reason in the
-  workflow. Every pure decision they compose (backoff, the write allow-list, connectivity, the
-  metric-family math, XML parsing, the probe model, the sequence/resync state machine) stays in
-  `app.rs`/`commands.rs`/`device.rs`/`metrics.rs`/`mtconnect/**`, in the denominator, and is
-  unit-tested. Do not lower the gate or exclude testable code to pass it — add tests.
+  discipline is followed, with the orchestration **inside** the denominator: the device drivers —
+  the connect/poll/publish/reconnect loops, the control-channel service, the shaping and
+  passive-quality wiring — live in `src/driver.rs` behind the `Wire` publish/emit seam and are
+  driven end to end by fake sessions and a recording `Wire`, so they are covered like any other
+  module. What is excluded is only what genuinely needs a live runtime: `src/supervisor.rs` (the
+  thin live shell — construction, spawning, the shutdown invocation, and `FacadeWire`, the
+  facade-backed `Wire`), `main.rs`, and the env-gated live suites — the coverage job passes
+  `--ignore-filename-regex '(supervisor\.rs|main\.rs|tests[/\\](live_.*|agent_integration|wire_gate)\.rs)'`,
+  each exclusion pinned to a reason in the workflow. Every pure decision the shell composes
+  (backoff, the write allow-list, connectivity, the metric-family math, XML parsing, the probe
+  model, the sequence/resync state machine, shaping, staleness) stays in
+  `app.rs`/`commands.rs`/`device.rs`/`driver.rs`/`metrics.rs`/`shaping.rs`/`staleness.rs`/
+  `mtconnect/**`, in the denominator, and is unit-tested. Do not lower the gate, widen the ignore
+  regex, or move testable logic into `supervisor.rs` to pass it — add tests.
 - `tests/scoped_delivery.rs` drives the `sb/*` surface end to end through a **real** `CommandInbox`
   over a recording messaging seam: both cmd wildcards, the topic instance token selecting a device
   among several, the library refusing a conflicting body `instance` before dispatch (handler not
   invoked), and `describe` advertising every verb as `"scope": "instance"`. It is the guard on the
   addressing invariant above.
 - `tests/live_sim.rs` is a **self-skipping** live suite, gated on `EC_LIVE_SIM` — it must show as
-  skipped in a normal `cargo test` and pass when pointed at a real simulator/device.
+  skipped in a normal `cargo test` and pass when pointed at a real simulator/device. `EC_REQUIRE_LIVE`
+  turns the self-skip of **both** live suites into a hard failure: set it on any run that is
+  supposed to have the live infrastructure, so a broken harness cannot masquerade as green.
 - `tests/agent_integration.rs` is a **second, separately env-gated** live suite — set `EC_MTC_AGENT`
   (and optionally `EC_MTC_AGENT_TINY`) after starting `docker compose -f
   tests/compose.mtconnect-agent.yaml up -d`, which brings up the pinned canonical test peer
@@ -78,6 +90,20 @@ carries a runnable example.
   feed both containers dial into is served in-process by the test binary itself (fixed host ports,
   reached via `host.docker.internal`), so no separate simulator process is needed. Without
   `EC_MTC_AGENT` every test in this file self-skips, so `cargo test` stays green with no Docker.
+  The `dev-one` fixture speaks **MTConnect 2.3** and declares a CONDITION data item (`d1-travel`,
+  the `Xtravel` position condition): both exist so the wire gate below can drive concurrent
+  condition activations and read a real `conditionId` off the agent — cppagent emits that attribute
+  only from 2.3 onwards. `DEV_ONE_ITEMS` names every data item the device declares, the condition
+  included, because a re-baseline that quietly omitted one is exactly the regression it guards.
+- `tests/wire_gate.rs` is the **third** env-gated live suite and the LLD §12 `wire | local MQTT` row:
+  set `EC_MTC_AGENT` **and** `EC_MQTT_BROKER=<host:port>` with both the cppagent compose harness and
+  a local broker up. It is the only suite that puts bytes on a broker: a genuine `EdgeCommons`
+  runtime (built through `EdgeCommonsBuilder::build()` — the only construction path the library
+  offers for `DataFacade`) drives `driver::run_device` over the live agent, and a **raw** MQTT
+  subscriber decodes what landed with `prost` against the generated `edgecommons.v1` schema. Do not
+  weaken it into an in-process round-trip: the point is that nothing between `build_sample` and the
+  broker is this test's own code. It reconstructs `supervisor::FacadeWire` (a private struct) with
+  the identical three public calls on the same real facade; if that seam changes, change it here too.
 - `edgecommons component validate` checks this repo's config against `config.schema.json` and warns
   if `Cargo.lock` is not committed.
 
@@ -122,6 +148,18 @@ carries a runnable example.
   entry is inspected, is advertised `unsupported` via command availability, and no panel names a
   `writeVerb`. There is no `sb/discover` either — the address space is read from the cached probe
   model, never mutated.
+- **Connectivity has one authority.** `AgentRuntime.info().connected` is the only connectivity
+  truth — sessions, the drivers, `sb/status`, the keepalive, and the lifecycle events mirror it,
+  never re-derive it. A cached probe model is not liveness; only the acquisition path's
+  ingest/mark-down pair writes the flag. Do not add a second bookkeeping path.
+- **Loss-intolerant traffic has a reserved lane.** Condition observations, lifecycle events, and
+  snapshots ride the bounded critical lane; only the coalescible data lane may drop, and every
+  drop is counted (`dropped_events`/`queue_counters()`) and logged. Do not route critical events
+  through the data lane or make a drop silent.
+- **Every spawned task's handle is retained and joined under a bounded budget.** Shutdown is the
+  staged drain in `app.rs` (devices 6 s, agents + tickers 4 s, metric flush 2 s); stragglers are
+  aborted **and named**. Do not detach a task, and do not add a task the shutdown path does not
+  join.
 
 ## Org conventions this scaffold inherits
 
@@ -135,3 +173,10 @@ carries a runnable example.
   never hand-built topics or envelopes.
 - Runtime artifacts (vaults, parameter caches, generated streams, TLS certs, logs, build output,
   local broker state) stay out of Git.
+
+## Appendix — revision history
+
+| Date | Change |
+|---|---|
+| 2026-08-03 | Coverage discipline rewritten around the `driver.rs`/`supervisor.rs` split; `EC_REQUIRE_LIVE`; three invariants added (one connectivity authority, the reserved critical lane, bounded task joins). |
+| 2026-07-28 | Initial version. |
