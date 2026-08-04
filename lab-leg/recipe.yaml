@@ -8,18 +8,22 @@ ComponentConfiguration:
     ComponentConfig:
       logging:
         level: DEBUG
-        # `json` selects the library's structured layer, which KEEPS the tracing fields
-        # (instance, error, permanent, wait_ms, ...). The `{token}` template drops them.
-        rust_format: json
-        # The Nucleus's stdout Copier closes as soon as the `sh` wrapper exits, which truncates
-        # the tail of the teardown narration. Publishing log records over IPC routes them to the
-        # independent sniffer instead, which is not tied to this component's stdout pipe.
-        # (`fileLogging` is deliberately inert when `rust_format` selects `json` — see
-        # `logging::installs_file_appender` — so it is not an option alongside structured fields.)
-        publish:
+        # No `rust_format`: the library's DEFAULT `fmt` layers, which keep the tracing fields
+        # (instance, error, permanent, wait_ms, ...) AND install the rotating file appender.
+        # (`json` would keep the fields too but is stdout-only — `logging::installs_file_appender`
+        # never installs file rotation under it.)
+        #
+        # The file appender is the evidence channel for the teardown narration. This Nucleus does
+        # not copy component stdout into a per-component log file at all, and in any case a stdout
+        # pipe is owned by the lifecycle shell rather than the component. An in-process file proves
+        # what the component actually executed, not merely what a pipe survived to carry.
+        fileLogging:
           enabled: true
-          destination: local
-          minLevel: INFO
+          # Outside the component work dir on purpose: `deployment create --remove` tears the work
+          # dir down with the component, and the teardown narration is exactly what has to survive.
+          filePath: /var/tmp/mtc-leg/component.log
+          maxFileSize: 50MB
+          backupCount: 3
       heartbeat:
         enabled: true
         intervalSecs: 3
@@ -96,4 +100,8 @@ Manifests:
     Install:
       Script: chmod +x {artifacts:path}/mtconnect-adapter
     Run:
-      Script: '{artifacts:path}/mtconnect-adapter --platform GREENGRASS -c GG_CONFIG'
+      # Carries the repo-root recipe's `exec` form under test: it replaces the lifecycle shell
+      # with the component, so the Nucleus's SIGTERM reaches the process that must act on it
+      # instead of its parent shell, and the stdout Copier stays attached until the component
+      # itself exits.
+      Script: 'exec {artifacts:path}/mtconnect-adapter --platform GREENGRASS -c GG_CONFIG'

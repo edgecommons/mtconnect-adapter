@@ -31,4 +31,7 @@ Manifests:
     Install:
       Script: chmod +x {artifacts:path}/mtc-ipc-sniffer
     Run:
-      Script: '{artifacts:path}/mtc-ipc-sniffer --platform GREENGRASS --transport IPC -c GG_CONFIG'
+      # HARNESS component — this redirect is deliberate and is NOT the shipped component form.
+      # The sniffer witnesses with `println!`, and this Nucleus does not copy component stdout into
+      # a per-component log file, so the witness is written straight to the component's work dir.
+      Script: 'exec {artifacts:path}/mtc-ipc-sniffer --platform GREENGRASS --transport IPC -c GG_CONFIG >> {work:path}/sniff.log 2>&1'
