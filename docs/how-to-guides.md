@@ -6,6 +6,8 @@ see [reference/](reference/).
 
 ---
 
+Command examples use [ec-uns-cmd](https://github.com/edgecommons/ec-uns-cmd). Set the broker, device and instance to your deployment. `--body` is a native JSON argument object; the tool encodes protobuf, subscribes before publishing, and prints the reply `result` or `error` within a deadline.
+
 ## Point the adapter at a real MTConnect agent
 
 Add one entry to `component.global.agents[]` and one `component.instances[]` entry naming it:
@@ -129,10 +131,8 @@ response shapes.
 
 Reads ride the library **command inbox** (`ecv1/{device}/mtconnect-adapter/cmd/{verb}`):
 
-```text
-publish ecv1/<device>/mtconnect-adapter/cmd/sb/read
-  {"header":{"name":"sb/read","reply_to":"app/r","correlation_id":"1"},
-   "body":{"instance":"cnc-1","signals":[{"signalId":"x-position"}]}}
+```bash
+ec-uns-cmd --broker localhost:1883 --device gw-01 --component mtconnect-adapter --instance cnc-1 sb/read --body '{"signals":[{"signalId":"x-position"}]}'
 ```
 
 The reply is always a scoped `/current` snapshot (`"mode": "current"`) taken through the agent's
@@ -159,8 +159,8 @@ health, and its own `state.instances[]` entry:
 ]
 ```
 
-With two or more devices, `instance` becomes **required** in every command body (`BAD_ARGS` if
-missing, `NO_SUCH_INSTANCE` if unrecognized) — the single-device convenience only applies when
+With two or more devices, select an instance in the topic or the body (`BAD_ARGS` if
+missing, `NO_SUCH_INSTANCE` if unrecognized; conflicting topic/body selectors are `BAD_ARGS`). The single-device convenience only applies when
 exactly one instance is configured across the whole component.
 
 ---
