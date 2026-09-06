@@ -17,6 +17,14 @@ Two things to know before you read further:
 
 ## How it fits together
 
+Current-main review (2026-09-06): the August 4 remediation merge is incorporated, including shared
+agent liveness, bounded queues, condition activation handling and acquisition recovery. Streaming,
+poll fallback, read/status/browse commands and platform packaging are implemented. The dated
+[design and validation record](DESIGN.md) distinguishes recorded HOST/Kubernetes/Greengrass
+evidence from remaining limits: third-party-agent qualification is deferred; assets, JSON
+representation and machine writes are outside the implemented contract. This review did not rerun
+those live gates. Registry `beta` is a maturity label, not a new test result.
+
 ```text
    machine tools        MTConnect agent(s)        MtconnectAdapter          UNS broker
   ──────────────  SHDR  ──────────────────  HTTP  ─────────────────  MQTT  ────────────────
@@ -94,6 +102,8 @@ ecv1/demo-thing/mtconnect-adapter/okuma/data/lavail
 
 The envelope on the X-axis position topic:
 
+Human-readable JSON projection of an EdgeCommons protobuf message. Normal MQTT and Greengrass IPC messaging carries protobuf bytes, not this JSON text.
+
 ```json
 {
   "header": { "name": "SouthboundSignalUpdate", "version": "1.0" },
@@ -163,7 +173,9 @@ it fixes an identity that must survive a machine reconfiguration, and a `dataIte
 longer has publishes a permanent BAD rather than vanishing. Use both — an explicit entry overrides
 the derived one for the same data item, field by field:
 
-```json
+Illustrative JSON fragment; omitted fields and surrounding object context are not shown. This is not a complete input document.
+
+```text
 "signals": [ { "id": "x-position", "channel": "machining/x", "dataItemId": "Xabs" } ],
 "selection": {
   "mode": "include",
@@ -177,9 +189,10 @@ so `POSITION` cannot creep into `PATH_POSITION`. See
 [`selection`](docs/reference/configuration.md#componentinstancesselection) for the derivation rules.
 
 **Publish shaping controls what reaches the bus.** A fast axis does not need every reading as its own
-message, and a noisy sensor does not need to publish at all when it has not really moved:
+message, and a noisy sensor does not need to publish at all when it has not really moved.
+This is the `publish` member of an instance configuration, not a complete input document:
 
-```json
+```text
 "publish": { "mode": "on-change", "batchMs": 1000, "deadband": 0.5 }
 ```
 

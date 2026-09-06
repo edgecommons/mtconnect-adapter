@@ -6,6 +6,10 @@ value back through the command surface, then pointed the same binary at a real M
 watched its probe/observation model come to life — browsing the device structure, reading the
 agent's own capability, and seeing a bound condition degrade a signal's quality.
 
+Command examples use [ec-uns-cmd](https://github.com/edgecommons/ec-uns-cmd), installed on `PATH`.
+`--body` is a native JSON argument object; the tool constructs protobuf, subscribes before publishing,
+and prints the reply `result` or `error` within a deadline. Topic instance addressing selects the device.
+
 ## 1. Prerequisites
 
 - A Rust toolchain (edition 2024, `rust-version = "1.85"` — matches the `edgecommons` library's MSRV).
@@ -36,10 +40,33 @@ simulator never fails to connect unless its endpoint is empty) and start polling
 
 ## 4. Watch values flow
 
-Subscribe to the UNS `data` class — one wildcard covers the whole fleet:
+Subscribe to the UNS `data` class — this filter covers instance-scope adapter data; component-scope fleet data also requires `ecv1/+/+/data/#`:
 
+Normal messaging carries protobuf bytes. In this organization workspace install the matching
+Python decoder with `pip install paho-mqtt -e ../core/libs/python`, then display a human-readable
+JSON projection with this subscriber. The here-document uses Bash; in PowerShell save its Python
+contents to a `.py` file and run `python <file>.py`.
 ```bash
-mosquitto_sub -t 'ecv1/+/+/+/data/#' -v
+python - <<'PY'
+import json
+import paho.mqtt.client as mqtt
+from edgecommons.messaging.message import Message
+
+c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+c.on_connect = lambda c, u, f, rc, p: c.subscribe("ecv1/my-thing/mtconnect-adapter/+/data/#", qos=1)
+def on_message(c, u, m):
+    message = Message.from_bytes(m.payload)
+    print(m.topic, json.dumps(message.to_diagnostic_json(), indent=2))
+c.on_message = on_message
+c.connect("localhost", 1883)
+try:
+    c.loop_forever()
+except KeyboardInterrupt:
+    pass
+finally:
+    c.unsubscribe("ecv1/my-thing/mtconnect-adapter/+/data/#")
+    c.disconnect()
+PY
 ```
 
 Every ~5 seconds you should see two `SouthboundSignalUpdate` messages on
@@ -55,8 +82,8 @@ Every ~5 seconds you should see two `SouthboundSignalUpdate` messages on
 Also try:
 
 ```bash
-mosquitto_sub -t 'ecv1/+/+/+/state' -v      # the keepalive, with per-device connectivity
-mosquitto_sub -t 'ecv1/+/+/+/metric/#' -v   # southbound_health + the operational families
+mosquitto_sub -t 'ecv1/+/+/state' -v      # the keepalive, with per-device connectivity
+mosquitto_sub -t 'ecv1/+/+/metric/#' -v   # southbound_health + the operational families
 ```
 
 The `state` keepalive's `instances[]` array carries one entry for `device-1` —
@@ -65,28 +92,23 @@ The `state` keepalive's `instances[]` array carries one entry for `device-1` —
 
 ## 5. Read a signal on demand
 
-The read/status/browse surface rides the library's command inbox
-(`ecv1/{device}/mtconnect-adapter/cmd/{verb}`). With a raw MQTT client, set `header.name` to the verb
+The read/status/browse surface rides the library's command inbox at
+`ecv1/{device}/mtconnect-adapter[/{instance}]/cmd/{verb}`. The `--instance` option below selects
+the instance topic for `device-1`. With an EdgeCommons SDK, build `header.name` from the full verb
 and `header.reply_to`/`header.correlation_id` for the reply:
 
-```text
-publish ecv1/my-thing/mtconnect-adapter/cmd/sb/read
-  {"header":{"name":"sb/read","reply_to":"app/r","correlation_id":"1"},
-   "body":{"signals":[{"signalId":"temperature-1"}]}}
-subscribe app/r  →  {"ok":true,"result":{"id":"device-1","mode":"current","reads":[
-  {"signal":{"id":"temperature-1"},"value":21.7,"quality":"GOOD","qualityRaw":"OK"}]}}
+```bash
+ec-uns-cmd --broker localhost:1883 --device my-thing --component mtconnect-adapter --instance device-1 sb/read --body '{"signals":[{"signalId":"temperature-1"}]}'
 ```
 
-Only one device is configured, so `instance` is optional in the request body — the command surface
-routes to the sole configured device automatically (add a second instance and it becomes required).
+Only one device is configured, so you can also omit `--instance`: the component-scope command
+routes to the sole configured device. With multiple devices, use `--instance` to address the
+target explicitly. The topic instance is authoritative; a conflicting `body.instance` is rejected.
 
 ## 6. Check status
 
-```text
-publish ecv1/my-thing/mtconnect-adapter/cmd/sb/status
-  {"header":{"name":"sb/status","reply_to":"app/r","correlation_id":"2"},"body":{}}
-subscribe app/r  →  {"ok":true,"result":{"id":"device-1","adapter":"sim","connected":true,
-  "state":"ONLINE","paused":false,"endpoint":"sim://device-1","metrics":{...}}}
+```bash
+ec-uns-cmd --broker localhost:1883 --device my-thing --component mtconnect-adapter --instance device-1 sb/status
 ```
 
 The reply has no `protocol` object here — that field only appears for an `mtconnect`-adapter
@@ -123,14 +145,8 @@ once-only ordering key, carried on every sample.
 
 `sb/status` now returns a `protocol` object once the agent has answered its first `/probe`:
 
-```text
-publish ecv1/my-thing/mtconnect-adapter/cnc-1/cmd/sb/status
-  {"header":{"name":"sb/status","reply_to":"app/r","correlation_id":"3"},"body":{}}
-subscribe app/r  →  {"ok":true,"result":{"id":"cnc-1","adapter":"mtconnect","connected":true,
-  "state":"ONLINE","paused":false,"endpoint":"mtconnect://127.0.0.1:5010/MTC-E2E-001",
-  "protocol":{"capability":"MTCONNECT_CLIENT","standardVersion":"2.0",
-  "agentId":"line-a-agent","agentVersion":"2.7.0.12","instanceId":..., "mode":"poll",
-  "probeDigest":"sha256:...","limitations":["READ_ONLY","XML_ONLY","NO_ASSETS"]}}}
+```bash
+ec-uns-cmd --broker localhost:1883 --device my-thing --component mtconnect-adapter --instance cnc-1 sb/status
 ```
 
 `sb/browse` walks the same device's probe tree — try it with no body for the first page, or with
@@ -147,7 +163,7 @@ published sample carry `quality: "UNCERTAIN"` or `"BAD"` with the alarm's own co
 the quality reflects the machine's own alarm state. The `x-travel-condition` signal in the same
 config publishes the condition's own state (`NORMAL`/`WARNING`/`FAULT`) directly, as its own reading.
 
-## 10. Prove it end-to-end
+## 10. Run the local suites
 
 ```bash
 cargo test

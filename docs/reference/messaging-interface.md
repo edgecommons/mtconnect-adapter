@@ -1,7 +1,7 @@
 # Reference — Messaging Interface & CLI
 
 Every topic and message this adapter publishes or accepts, and its CLI flags. Addressing follows the
-**Unified Namespace (UNS)**: `ecv1/{device}/{component}/{instance}/{class}[/channel]`. For the
+**Unified Namespace (UNS)**: `ecv1/{device}/{component}[/{instance}]/{class}[/channel]`. For the
 data/control plane model, see [explanation.md](../explanation.md); for client recipes, the
 [how-to guides](../how-to-guides.md).
 
